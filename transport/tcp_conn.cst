@@ -6,11 +6,22 @@
 // =======================================================
 
 use "std/net.cst" as net;
+use "std/mem.cst" only bins, core as mem;
 use "../core/conn.cst" as conn;
+use "../core/errno.cst" as errno;
 
 struct TcpCtx {
-    fd as i64;
-    st as i64;   // CONN_* state code
+    fd   as i64;
+    st   as i64;      // CONN_* state code
+    peer as [16]u8;   // the accepted peer's sockaddr_in, zeroed when unknown
+}
+
+// EINTR (a signal arrived) and EAGAIN (a non-blocking socket has nothing
+// right now) are both "call again", not "this connection is broken" — they
+// must not latch CONN_ERROR, or one signal would condemn a live socket.
+fn _retryable(n as i64) as i64 {
+    if (n == 0 - errno.EINTR) { return 1; }
+    return errno.would_block(n);
 }
 
 // --- the four vtable backends. ctx is *u8 reinterpreted as *TcpCtx ---
@@ -19,14 +30,14 @@ fn _tcp_read(ctx as *u8, buf as *u8, len as i64) as i64 {
     let is *TcpCtx as c = cast(*TcpCtx, ctx);
     let is i64 as n = net.recv(c.fd, buf, len);
     if (n == 0) { c.st = conn.CONN_EOF; }
-    if (n < 0)  { c.st = conn.CONN_ERROR; }
+    if (n < 0 && _retryable(n) == 0) { c.st = conn.CONN_ERROR; }
     return n;
 }
 
 fn _tcp_write(ctx as *u8, buf as *u8, len as i64) as i64 {
     let is *TcpCtx as c = cast(*TcpCtx, ctx);
     let is i64 as n = net.send(c.fd, buf, len);
-    if (n < 0) { c.st = conn.CONN_ERROR; }
+    if (n < 0 && _retryable(n) == 0) { c.st = conn.CONN_ERROR; }
     return n;
 }
 
@@ -43,14 +54,18 @@ fn _tcp_state(ctx as *u8) as i64 {
     return c.st;
 }
 
-// Wrap an already-connected/accepted fd into a heap-owned *Conn.
+// Wrap an already-connected/accepted fd into a heap-owned *Conn, recording
+// `peer` (a 16-byte sockaddr_in) as the remote address; pass null when it is
+// not known, and the peer accessors then report 0.
 // Caller owns it; release with conn.conn_free (closes fd + frees ctx + box).
 // Returns null (*Conn 0) on allocation failure.
-fn conn_from_fd(fd as i64) as *conn.Conn {
+fn conn_from_fd_peer(fd as i64, peer as *u8) as *conn.Conn {
     let is *TcpCtx as c = cast(*TcpCtx, conn.cn_alloc(sizeof(TcpCtx)));
     if (cast(i64, c) == 0) { return cast(*conn.Conn, 0); }
     c.fd = fd;
     c.st = conn.CONN_OPEN;
+    if (cast(i64, peer) != 0) { mem.core.memcpy(cast(*u8, &c.peer), peer, 16); }
+    else { mem.core.memset(cast(*u8, &c.peer), cast(i32, 0), 16); }
 
     let is *conn.Conn as k = conn.conn_new();
     if (cast(i64, k) == 0) { conn.cn_free(cast(*u8, c)); return cast(*conn.Conn, 0); }
@@ -62,8 +77,36 @@ fn conn_from_fd(fd as i64) as *conn.Conn {
     return k;
 }
 
+// Wrap an fd whose peer address is not known (a dialled client socket).
+fn conn_from_fd(fd as i64) as *conn.Conn {
+    return conn_from_fd_peer(fd, cast(*u8, 0));
+}
+
 // The raw fd behind a TCP Conn (e.g. to register with epoll/poll).
 fn conn_fd(k as *conn.Conn) as i64 {
     let is *TcpCtx as c = cast(*TcpCtx, k.ctx);
     return c.fd;
+}
+
+// --- peer address (what a server logs, rate-limits and ACLs on) ---
+
+// Remote IPv4 in host byte order, or 0 when the address was not captured.
+fn conn_peer_ip(k as *conn.Conn) as i64 {
+    let is *TcpCtx as c = cast(*TcpCtx, k.ctx);
+    let is net.Addr as a;
+    a.data = cast(*u8, &c.peer);
+    return net.addr_ip(a);
+}
+
+// Remote port in host byte order, or 0 when the address was not captured.
+fn conn_peer_port(k as *conn.Conn) as i64 {
+    let is *TcpCtx as c = cast(*TcpCtx, k.ctx);
+    let is net.Addr as a;
+    a.data = cast(*u8, &c.peer);
+    return net.addr_port(a);
+}
+
+// Format the peer as "a.b.c.d" into `buf` (needs 16 bytes). Returns length.
+fn conn_peer_str(k as *conn.Conn, buf as *u8) as i64 {
+    return net.ip4_format(conn_peer_ip(k), buf);
 }

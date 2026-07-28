@@ -7,7 +7,7 @@
 ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
-> **Early.** Phases 0 and 1 — the `Conn` abstraction and TCP — are landed and
+> **Early.** The `Conn` abstraction, TCP and the buffered reader are landed and
 > green. DNS, URL, HTTP, WebSocket, TLS, the server and `fetch()` are designed
 > and **not yet written**. The [status table](#status) is the authority on what
 > exists; the layout below marks everything else with `*`.
@@ -39,7 +39,7 @@ only `call()` sites are the four typed dispatchers in `core/conn.cst`.
 ## Layout
 
 ```
-core/        conn (the vtable) · errno · bytes (Bytes/Slice)
+core/        conn (the vtable) · errno · bytes (Bytes/Slice) · bufread (lines)
 transport/   tcp_conn (TCP→Conn) · transport (dial/listen/accept/tuning) · epoll*
 proto/       url* · dns* · headers* · http1* · websocket* · flate* · cookie*
 tls/         records · handshake · keyschedule · client (implements Conn)*
@@ -79,7 +79,8 @@ the same reason.
 | Phase | Module | State |
 |---|---|---|
 | 0 | `core/` conn · errno · bytes | ✅ green (`tests/test_conn` mock-Conn dispatch, `tests/test_bytes` growth to 1 MiB) |
-| 1 | `transport/` tcp_conn · transport | ✅ green (`examples/tcp_echo` round-trip) |
+| 0 | `core/bufread` — lines + exact counts over `Conn` | ✅ green (`tests/test_bufread`, incl. lines split one byte per read) |
+| 1 | `transport/` tcp_conn · transport · `Listener` · peer addr · deadlines | ✅ green (`examples/tcp_echo` round-trip) |
 | 1 | epoll reactor + IPv6 addrs | ⏳ next |
 | 2 | url · dns | ⏳ |
 | 3 | http/1.1 client (+headers, chunked, cookies, redirects) | ⏳ |

@@ -10,24 +10,28 @@
 // Exit 0 = pass; non-zero = the numbered step that failed.
 // =======================================================
 
-use "std/net.cst" as net;
 use "std/io.cst" as io;
 use "../core/conn.cst" as conn;
 use "../transport/transport.cst" as tp;
+use "../transport/tcp_conn.cst" as tcpc;
 
 fn main() as i32 {
     tp.init();
 
     let is i64 as port = 18080;
 
-    let is i64 as srv = tp.listen(net.INADDR_LOOPBACK, port);
-    if (srv < 0) { io.printf("listen failed: %ld\n", srv); return 1; }
+    let is tp.ListenResult as lr with mut = tp.listen_loopback(port);
+    if (lr.ok < 0) { io.printf("listen failed: %ld\n", lr.ok); return 1; }
 
     let is *conn.Conn as cli = tp.dial("127.0.0.1", port);
-    if (cast(i64, cli) == 0) { io.printf("dial failed\n"); net.close(srv); return 2; }
+    if (cast(i64, cli) == 0) { io.printf("dial failed\n"); tp.listener_close(&lr.l); return 2; }
 
-    let is *conn.Conn as ser = tp.accept_conn(srv);
+    let is *conn.Conn as ser = tp.accept_conn(&lr.l);
     if (cast(i64, ser) == 0) { io.printf("accept failed\n"); return 3; }
+
+    // The accepted Conn carries the peer address, so a server can log it.
+    if (tcpc.conn_peer_ip(ser) != 2130706433) { io.printf("peer ip wrong\n"); return 10; }
+    if (tcpc.conn_peer_port(ser) == 0) { io.printf("peer port missing\n"); return 11; }
 
     // client → server
     let is i64 as w = conn.conn_write_all(cli, "ping", 4);
@@ -47,10 +51,13 @@ fn main() as i32 {
     if (buf2[0] != 112) { return 8; }   // 'p'
     if (buf2[3] != 103) { return 9; }   // 'g'
 
-    io.printf("tcp_echo ok: echoed %ld bytes through Conn\n", n2);
+    let is [16]u8 as ip;
+    tcpc.conn_peer_str(ser, cast(*u8, &ip));
+    io.printf("tcp_echo ok: echoed %ld bytes through Conn (peer %s:%ld)\n",
+              n2, cast(*u8, &ip), tcpc.conn_peer_port(ser));
 
     conn.conn_free(cli);
     conn.conn_free(ser);
-    net.close(srv);
+    tp.listener_close(&lr.l);
     return 0;
 }
