@@ -29,12 +29,12 @@ target "tcp_echo"  { src "examples/tcp_echo.cst"  out "build/tcp_echo" }
 // then each case builds and exits 0. The first catches a module that only
 // happens to compile as part of a test binary.
 script "test" {
-    "caustic tests/run.cst -o build/run"
+    "caustic-mk build run"
     "./build/run"
 }
 
 script "test-opt" {
-    "caustic tests/run.cst -o build/run"
+    "caustic-mk build run"
     "./build/run ${OPT}"
 }
 
