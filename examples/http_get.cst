@@ -1,0 +1,126 @@
+// =======================================================
+// caustic-net/examples/http_get.cst
+// A real HTTP/1.1 exchange over a real socket, in one process.
+//
+// The http1 tests drive a mock Conn, which proves the parser but
+// not that the layers compose. This runs the actual stack —
+// transport -> tcp_conn -> Conn vtable -> bufread -> http1 — over
+// loopback, with the client and the server BOTH built from this
+// library. Nothing here is faked.
+//
+// Works single-threaded: a blocking connect() to a loopback
+// listener completes via the kernel accept backlog before accept(),
+// and every message is small enough to fit the socket buffers, so
+// no side ever blocks waiting for the other.
+//
+// Exit 0 = pass; non-zero = the numbered step that failed.
+// =======================================================
+
+use "std/io.cst" as io;
+use "../core/conn.cst"    as conn;
+use "../core/bufread.cst" as bufread;
+use "../core/bytes.cst"   as bytes;
+use "../transport/transport.cst" as tp;
+use "../proto/url.cst"    as url;
+use "../proto/http1.cst"  as http;
+
+fn eq(a as *u8, b as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (a[i] != 0 && b[i] != 0) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    if (a[i] != b[i]) { return 0; }
+    return 1;
+}
+
+fn main() as i32 {
+    tp.init();
+    let is i64 as port = 18081;
+
+    let is tp.ListenResult as lr with mut = tp.listen_loopback(port);
+    if (lr.ok < 0) { io.printf("listen failed: %ld\n", lr.ok); return 1; }
+
+    // --- client: parse a URL and send a real request through the Conn ---
+    let is url.Url as u = url.url_parse("http://127.0.0.1:18081/hello?x=1");
+    if (u.ok != 0) { io.printf("url parse failed\n"); return 2; }
+    if (u.port != 18081) { return 3; }
+
+    let is *conn.Conn as cli = tp.dial("127.0.0.1", port);
+    if (cast(i64, cli) == 0) { io.printf("dial failed\n"); tp.listener_close(&lr.l); return 4; }
+
+    let is *conn.Conn as srv = tp.accept_conn(&lr.l);
+    if (cast(i64, srv) == 0) { io.printf("accept failed\n"); return 5; }
+
+    let is bytes.Bytes as req with mut = bytes.bytes_new(512);
+    if (http.req_for_url(&req, "GET", &u, 0) < 0) { return 6; }
+    if (http.req_header(&req, "Accept", "text/plain") < 0) { return 7; }
+    if (http.req_end(&req) < 0) { return 8; }
+    if (http.req_send(cli, &req) != req.len) { io.printf("send failed\n"); return 9; }
+    bytes.bytes_free(&req);
+
+    // --- server: read the request head off the wire with the same reader ---
+    let is [4096]u8 as sstore;
+    let is bufread.BufReader as sbr;
+    bufread.br_init(&sbr, srv, cast(*u8, &sstore), 4096);
+
+    let is [1024]u8 as line;
+    let is i64 as n with mut = bufread.br_read_line(&sbr, cast(*u8, &line), 1024);
+    if (n < 0) { io.printf("server read_line: %ld\n", n); return 10; }
+    if (eq(cast(*u8, &line), "GET /hello?x=1 HTTP/1.1") == 0) {
+        io.printf("bad request line: %s\n", cast(*u8, &line));
+        return 11;
+    }
+
+    // Drain the request headers, checking that Host survived the round trip.
+    let is i64 as saw_host with mut = 0;
+    while (1 == 1) {
+        n = bufread.br_read_line(&sbr, cast(*u8, &line), 1024);
+        if (n < 0) { return 12; }
+        if (n == 0) { break; }
+        if (eq(cast(*u8, &line), "Host: 127.0.0.1:18081") == 1) { saw_host = 1; }
+    }
+    if (saw_host == 0) { io.printf("Host header missing\n"); return 13; }
+
+    // --- server: answer with a CHUNKED body, the framing most likely to break ---
+    let is *u8 as resp =
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n";
+    let is i64 as rlen with mut = 0;
+    while (resp[rlen] != 0) { rlen = rlen + 1; }
+    if (conn.conn_write_all(srv, resp, rlen) != rlen) { return 14; }
+    conn.conn_close(srv);
+
+    // --- client: parse the response through the real stack ---
+    let is [4096]u8 as cstore;
+    let is bufread.BufReader as cbr;
+    bufread.br_init(&cbr, cli, cast(*u8, &cstore), 4096);
+
+    let is http.Response as r;
+    let is [2048]u8 as hdrbuf;
+    let is i64 as rc = http.resp_read_head(&cbr, &r, cast(*u8, &hdrbuf), 2048);
+    if (rc < 0) { io.printf("resp_read_head: %s\n", http.http_err_name(rc)); return 15; }
+    if (r.status != 200) { io.printf("status %ld\n", r.status); return 16; }
+    if (r.chunked != 1) { return 17; }
+
+    let is [256]u8 as ctype;
+    if (http.resp_header(&r, "content-type", cast(*u8, &ctype), 256) < 0) { return 18; }
+    if (eq(cast(*u8, &ctype), "text/plain") == 0) { return 19; }
+
+    let is http.BodyReader as bd;
+    http.body_init(&bd, &cbr, &r, 0);
+    let is bytes.Bytes as body with mut = bytes.bytes_new(64);
+    let is i64 as got = http.body_read_all(&bd, &body, 65536);
+    if (got < 0) { io.printf("body: %s\n", http.http_err_name(got)); return 20; }
+    if (got != 11) { io.printf("body len %ld\n", got); return 21; }
+    if (bytes.bytes_push(&body, cast(u8, 0)) < 0) { return 22; }
+    if (eq(body.ptr, "hello world") == 0) { io.printf("body: %s\n", body.ptr); return 23; }
+
+    io.printf("http_get ok: %ld %s, %ld chunked bytes reassembled -> \"%s\"\n",
+              r.status, cast(*u8, &ctype), got, body.ptr);
+
+    bytes.bytes_free(&body);
+    conn.conn_free(cli);
+    conn.conn_free(srv);
+    tp.listener_close(&lr.l);
+    return 0;
+}

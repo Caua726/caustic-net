@@ -3,14 +3,16 @@
 **A networking stack in [Caustic](https://github.com/Caua726/Caustic) — sockets up to `fetch()`, with no libc and no OpenSSL.**
 
 ![version](https://img.shields.io/badge/version-0.1.0-blue)
-![status](https://img.shields.io/badge/status-early%20%C2%B7%20phases%200--2%20landed-yellow)
+![status](https://img.shields.io/badge/status-early%20%C2%B7%20phases%200--3%20landed-yellow)
 ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
-> **Early.** The `Conn` abstraction, TCP, the buffered reader and URL parsing
-> are landed and green. DNS, HTTP, WebSocket, TLS, the server and `fetch()` are
-> designed and **not yet written**. The [status table](#status) is the authority
-> on what exists; the layout below marks everything else with `*`.
+> **Early.** The `Conn` abstraction, TCP, the buffered reader, URL parsing and
+> the HTTP/1.1 client are landed and green — `examples/http_get` runs a real
+> request over a real socket and reassembles a chunked response. DNS, WebSocket,
+> TLS, the server and `fetch()` are designed and **not yet written**. The
+> [status table](#status) is the authority on what exists; the layout below
+> marks everything else with `*`.
 
 The plan is a stack built on the Caustic standard library's `std/net.cst`
 (TCP/UDP/poll floor), with everything above it written here in Caustic —
@@ -41,7 +43,7 @@ only `call()` sites are the four typed dispatchers in `core/conn.cst`.
 ```
 core/        conn (the vtable) · errno · bytes (Bytes/Slice) · bufread (lines)
 transport/   tcp_conn (TCP→Conn) · transport (dial/listen/accept/tuning) · epoll*
-proto/       url · http1* · dns* · websocket* · flate* · cookie*
+proto/       url · http1 · dns* · websocket* · flate* · cookie*
 tls/         records · handshake · keyschedule · client (implements Conn)*
 server/      router · threaded · reactor*
 client/      fetch (url→dns→connect→tls→http→redirect→decompress)*
@@ -84,7 +86,8 @@ the same reason.
 | 1 | epoll reactor + IPv6 addrs | ⏳ next |
 | 2 | `proto/url` | ✅ green (`tests/test_url`) |
 | 2 | dns | ⏳ (UDP `sendto` is broken on the Windows target upstream) |
-| 3 | http/1.1 client (+headers, chunked, cookies, redirects) | ⏳ |
+| 3 | `proto/http1` client — request build, head parse, body framing | ✅ green (`tests/test_http1`, `examples/http_get` over a real socket) |
+| 3 | cookies · redirects · keep-alive pooling | ⏳ |
 | 4 | server (reactor + thread-per-conn) | ⏳ |
 | 5 | websocket (sha1 + base64) | ⏳ |
 | 6 | flate (gzip/deflate inflate) | ⏳ |
@@ -99,7 +102,7 @@ resolves from the install path, so `use "std/net.cst"` just works.
 ```sh
 caustic-mk run test        # compile-check the library, then build and run every case
 caustic-mk run test-opt    # the same, through the optimizing backend
-caustic-mk build tcp_echo  # the example, to run by hand
+caustic-mk build http_get  # the end-to-end example, to run by hand
 ```
 
 Green is exit 0. The runner is `tests/run.cst`, written in Caustic, so it

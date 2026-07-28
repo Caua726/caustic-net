@@ -1,0 +1,272 @@
+// =======================================================
+// caustic-net/tests/test_http1.cst
+// Covers proto/http1.cst.
+//
+// Every response here is replayed TWICE: once one byte per read,
+// once whole. A parser that only works when a header line lands
+// intact in a single read passes the second and fails the first,
+// and that difference is exactly what a real network produces.
+//
+// Exit 0 = all pass. Non-zero = the numbered check that failed.
+// =======================================================
+
+use "std/mem.cst" only bins, core as mem;
+use "../core/conn.cst"    as conn;
+use "../core/bufread.cst" as bufread;
+use "../core/bytes.cst"   as bytes;
+use "../proto/http1.cst"  as http;
+use "../proto/url.cst"    as url;
+
+struct MockCtx {
+    buf   as *u8;
+    len   as i64;
+    rpos  as i64;
+    chunk as i64;
+    st    as i64;
+}
+
+fn _mock_read(ctx as *u8, out as *u8, n as i64) as i64 {
+    let is *MockCtx as m = cast(*MockCtx, ctx);
+    let is i64 as avail = m.len - m.rpos;
+    if (avail <= 0) { return 0; }
+    let is i64 as k with mut = n;
+    if (k > avail) { k = avail; }
+    if (m.chunk > 0 && k > m.chunk) { k = m.chunk; }
+    mem.core.memcpy(out, cast(*u8, cast(i64, m.buf) + m.rpos), k);
+    m.rpos = m.rpos + k;
+    return k;
+}
+fn _mock_write(ctx as *u8, in as *u8, n as i64) as i64 { return n; }
+fn _mock_close(ctx as *u8) as i64 { return 0; }
+fn _mock_state(ctx as *u8) as i64 { return conn.CONN_OPEN; }
+
+fn mock(c as *conn.Conn, m as *MockCtx, data as *u8, len as i64, chunk as i64) as void {
+    m.buf = data; m.len = len; m.rpos = 0; m.chunk = chunk; m.st = conn.CONN_OPEN;
+    c.ctx = cast(*u8, m);
+    c.read = fn_ptr(_mock_read);   c.write = fn_ptr(_mock_write);
+    c.close = fn_ptr(_mock_close); c.state = fn_ptr(_mock_state);
+}
+
+fn eq(a as *u8, b as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (a[i] != 0 && b[i] != 0) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    if (a[i] != b[i]) { return 0; }
+    return 1;
+}
+
+fn slen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+// Parse one response at a given read-chunk size and hand back the body.
+// Returns 0 ok, or the (negative) error; `out` gets the body, NUL-terminated.
+fn run_resp(script as *u8, chunk as i64, r as *http.Response,
+            hdrbuf as *u8, out as *u8, outmax as i64, blen as *i64) as i64 {
+    let is conn.Conn as c;
+    let is MockCtx as m;
+    let is [8192]u8 as storage;
+    let is bufread.BufReader as br;
+
+    mock(&c, &m, script, slen(script), chunk);
+    bufread.br_init(&br, &c, cast(*u8, &storage), 8192);
+
+    let is i64 as rc = http.resp_read_head(&br, r, hdrbuf, 4096);
+    if (rc < 0) { return rc; }
+
+    let is http.BodyReader as bd;
+    http.body_init(&bd, &br, r, 0);
+
+    let is i64 as total with mut = 0;
+    while (1 == 1) {
+        let is i64 as k = http.body_read(&bd, cast(*u8, cast(i64, out) + total), outmax - total - 1);
+        if (k < 0) { return k; }
+        if (k == 0) { break; }
+        total = total + k;
+    }
+    out[total] = cast(u8, 0);
+    *blen = total;
+    return 0;
+}
+
+fn main() as i32 {
+    let is http.Response as r;
+    let is [4096]u8 as hdrbuf;
+    let is [4096]u8 as body;
+    let is [512]u8 as val;
+    let is i64 as blen with mut = 0;
+
+    // ================= Content-Length =================
+    let is *u8 as s1 = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 11\r\n\r\nhello world";
+
+    // Byte-at-a-time first: every line spans many reads.
+    if (run_resp(s1, 1, &r, cast(*u8, &hdrbuf), cast(*u8, &body), 4096, &blen) != 0) { return 1; }
+    if (r.status != 200) { return 2; }
+    if (r.minor != 1) { return 3; }
+    if (r.content_length != 11) { return 4; }
+    if (r.chunked != 0) { return 5; }
+    if (blen != 11) { return 6; }
+    if (eq(cast(*u8, &body), "hello world") == 0) { return 7; }
+    if (http.resp_header(&r, "Content-Type", cast(*u8, &val), 512) != 10) { return 8; }
+    if (eq(cast(*u8, &val), "text/plain") == 0) { return 9; }
+    // Header lookup is case-insensitive, per RFC 9110.
+    if (http.resp_header(&r, "cOnTeNt-TyPe", cast(*u8, &val), 512) != 10) { return 10; }
+    if (http.resp_has_header(&r, "Nope") != 0) { return 11; }
+    if (http.resp_header(&r, "Nope", cast(*u8, &val), 512) != 0 - 1) { return 12; }
+
+    // Now the same bytes in ONE read. Result must be identical.
+    if (run_resp(s1, 0, &r, cast(*u8, &hdrbuf), cast(*u8, &body), 4096, &blen) != 0) { return 13; }
+    if (r.status != 200 || blen != 11) { return 14; }
+    if (eq(cast(*u8, &body), "hello world") == 0) { return 15; }
+
+    // ...and split at 3 bytes, which lands mid-token on most lines.
+    if (run_resp(s1, 3, &r, cast(*u8, &hdrbuf), cast(*u8, &body), 4096, &blen) != 0) { return 16; }
+    if (blen != 11 || eq(cast(*u8, &body), "hello world") == 0) { return 17; }
+
+    // ================= chunked =================
+    // Three chunks, hex sizes, one with a chunk extension, then the 0 chunk.
+    let is *u8 as s2 = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n1;ext=1\r\n \r\n5\r\nworld\r\n0\r\n\r\n";
+    if (run_resp(s2, 1, &r, cast(*u8, &hdrbuf), cast(*u8, &body), 4096, &blen) != 0) { return 18; }
+    if (r.chunked != 1) { return 19; }
+    if (r.content_length != 0 - 1) { return 20; }
+    if (blen != 11) { return 21; }
+    if (eq(cast(*u8, &body), "hello world") == 0) { return 22; }
+
+    if (run_resp(s2, 0, &r, cast(*u8, &hdrbuf), cast(*u8, &body), 4096, &blen) != 0) { return 23; }
+    if (blen != 11 || eq(cast(*u8, &body), "hello world") == 0) { return 24; }
+
+    // A hex size above 9 must be read as hex, not decimal: 0x10 == 16 bytes.
+    let is *u8 as s3 = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10\r\n0123456789abcdef\r\n0\r\n\r\n";
+    if (run_resp(s3, 1, &r, cast(*u8, &hdrbuf), cast(*u8, &body), 4096, &blen) != 0) { return 25; }
+    if (blen != 16) { return 26; }
+    if (eq(cast(*u8, &body), "0123456789abcdef") == 0) { return 27; }
+
+    // Trailers after the last chunk are consumed, not treated as body.
+    let is *u8 as s4 = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\nX-Trailer: v\r\n\r\n";
+    if (run_resp(s4, 1, &r, cast(*u8, &hdrbuf), cast(*u8, &body), 4096, &blen) != 0) { return 28; }
+    if (blen != 2 || eq(cast(*u8, &body), "hi") == 0) { return 29; }
+
+    // ================= EOF-delimited =================
+    // No Content-Length and no chunked: the body runs to the close.
+    let is *u8 as s5 = "HTTP/1.1 200 OK\r\nServer: x\r\n\r\nunbounded body";
+    if (run_resp(s5, 1, &r, cast(*u8, &hdrbuf), cast(*u8, &body), 4096, &blen) != 0) { return 30; }
+    if (r.content_length != 0 - 1 || r.chunked != 0) { return 31; }
+    if (blen != 14 || eq(cast(*u8, &body), "unbounded body") == 0) { return 32; }
+
+    // ================= bodyless statuses =================
+    // 204 has no body even though a length is present.
+    let is *u8 as s6 = "HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\n";
+    if (run_resp(s6, 1, &r, cast(*u8, &hdrbuf), cast(*u8, &body), 4096, &blen) != 0) { return 33; }
+    if (r.status != 204 || blen != 0) { return 34; }
+
+    // 304 likewise.
+    let is *u8 as s7 = "HTTP/1.1 304 Not Modified\r\nContent-Length: 9\r\n\r\n";
+    if (run_resp(s7, 1, &r, cast(*u8, &hdrbuf), cast(*u8, &body), 4096, &blen) != 0) { return 35; }
+    if (r.status != 304 || blen != 0) { return 36; }
+
+    // Content-Length: 0 is an empty body, not an EOF-delimited one.
+    let is *u8 as s8 = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    if (run_resp(s8, 1, &r, cast(*u8, &hdrbuf), cast(*u8, &body), 4096, &blen) != 0) { return 37; }
+    if (blen != 0) { return 38; }
+
+    // ================= request smuggling =================
+    // chunked AND Content-Length together is refused, not silently resolved.
+    let is *u8 as s9 = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+    if (run_resp(s9, 1, &r, cast(*u8, &hdrbuf), cast(*u8, &body), 4096, &blen)
+        != http.HTTP_ERR_SMUGGLE) { return 39; }
+
+    // ================= malformed heads are refused =================
+    if (run_resp("HTTP/1.1 20 OK\r\n\r\n", 1, &r, cast(*u8, &hdrbuf),
+                 cast(*u8, &body), 4096, &blen) != http.HTTP_ERR_STATUS) { return 40; }
+    if (run_resp("HTTP/1.1 999 X\r\n\r\n", 1, &r, cast(*u8, &hdrbuf),
+                 cast(*u8, &body), 4096, &blen) != http.HTTP_ERR_STATUS) { return 41; }
+    if (run_resp("ICY 200 OK\r\n\r\n", 1, &r, cast(*u8, &hdrbuf),
+                 cast(*u8, &body), 4096, &blen) != http.HTTP_ERR_STATUS) { return 42; }
+    // A space before the colon is header injection bait; reject the line.
+    if (run_resp("HTTP/1.1 200 OK\r\nBad Header : v\r\n\r\n", 1, &r, cast(*u8, &hdrbuf),
+                 cast(*u8, &body), 4096, &blen) != http.HTTP_ERR_HEADER) { return 43; }
+    // A header with no colon at all.
+    if (run_resp("HTTP/1.1 200 OK\r\nnocolon\r\n\r\n", 1, &r, cast(*u8, &hdrbuf),
+                 cast(*u8, &body), 4096, &blen) != http.HTTP_ERR_HEADER) { return 44; }
+    // A non-numeric Content-Length.
+    if (run_resp("HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\n", 1, &r, cast(*u8, &hdrbuf),
+                 cast(*u8, &body), 4096, &blen) != http.HTTP_ERR_HEADER) { return 45; }
+
+    // "chunkedx" must NOT be read as the chunked token.
+    let is *u8 as s10 = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunkedx\r\n\r\nraw";
+    if (run_resp(s10, 1, &r, cast(*u8, &hdrbuf), cast(*u8, &body), 4096, &blen) != 0) { return 46; }
+    if (r.chunked != 0) { return 47; }
+    if (eq(cast(*u8, &body), "raw") == 0) { return 48; }
+
+    // ...but "gzip, chunked" must be, since chunked is the last encoding.
+    let is *u8 as s11 = "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n";
+    if (run_resp(s11, 1, &r, cast(*u8, &hdrbuf), cast(*u8, &body), 4096, &blen) != 0) { return 49; }
+    if (r.chunked != 1 || blen != 2) { return 50; }
+
+    // Connection: close is picked up.
+    let is *u8 as s12 = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nby";
+    if (run_resp(s12, 1, &r, cast(*u8, &hdrbuf), cast(*u8, &body), 4096, &blen) != 0) { return 51; }
+    if (r.close != 1) { return 52; }
+
+    // ================= request building =================
+    let is url.Url as u = url.url_parse("https://example.com/a/b?q=1");
+    if (u.ok != 0) { return 53; }
+    let is bytes.Bytes as req with mut = bytes.bytes_new(256);
+    if (http.req_for_url(&req, "GET", &u, 1) < 0) { return 54; }
+    if (http.req_header_int(&req, "Content-Length", 0) < 0) { return 55; }
+    if (http.req_end(&req) < 0) { return 56; }
+    if (bytes.bytes_push(&req, cast(u8, 0)) < 0) { return 57; }
+    if (eq(req.ptr, "GET /a/b?q=1 HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n") == 0) {
+        return 58;
+    }
+    bytes.bytes_free(&req);
+
+    // A non-default port must appear in the Host header of the request.
+    let is url.Url as u2 = url.url_parse("http://example.com:8080/");
+    let is bytes.Bytes as req2 with mut = bytes.bytes_new(256);
+    if (http.req_for_url(&req2, "POST", &u2, 0) < 0) { return 59; }
+    if (http.req_end(&req2) < 0) { return 60; }
+    if (bytes.bytes_push(&req2, cast(u8, 0)) < 0) { return 61; }
+    if (eq(req2.ptr, "POST / HTTP/1.1\r\nHost: example.com:8080\r\nConnection: close\r\n\r\n") == 0) {
+        return 62;
+    }
+    bytes.bytes_free(&req2);
+
+    // ================= body_read_all + limit =================
+    let is conn.Conn as c;
+    let is MockCtx as m;
+    let is [8192]u8 as storage;
+    let is bufread.BufReader as br;
+    mock(&c, &m, s1, slen(s1), 1);
+    bufread.br_init(&br, &c, cast(*u8, &storage), 8192);
+    if (http.resp_read_head(&br, &r, cast(*u8, &hdrbuf), 4096) != 0) { return 63; }
+    let is http.BodyReader as bd;
+    http.body_init(&bd, &br, &r, 0);
+    let is bytes.Bytes as acc with mut = bytes.bytes_new(16);
+    if (http.body_read_all(&bd, &acc, 0) != 11) { return 64; }
+    if (acc.len != 11) { return 65; }
+    if (acc.ptr[0] != 104) { return 66; }   // 'h'
+    bytes.bytes_free(&acc);
+
+    // A body over the cap is refused rather than buffered.
+    mock(&c, &m, s1, slen(s1), 1);
+    bufread.br_init(&br, &c, cast(*u8, &storage), 8192);
+    http.resp_read_head(&br, &r, cast(*u8, &hdrbuf), 4096);
+    http.body_init(&bd, &br, &r, 0);
+    let is bytes.Bytes as acc2 with mut = bytes.bytes_new(16);
+    if (http.body_read_all(&bd, &acc2, 5) != http.HTTP_ERR_SPACE) { return 67; }
+    bytes.bytes_free(&acc2);
+
+    // ================= HEAD has no body despite Content-Length =================
+    mock(&c, &m, s1, slen(s1), 1);
+    bufread.br_init(&br, &c, cast(*u8, &storage), 8192);
+    if (http.resp_read_head(&br, &r, cast(*u8, &hdrbuf), 4096) != 0) { return 68; }
+    http.body_init(&bd, &br, &r, 1);                   // head_request = 1
+    if (http.body_read(&bd, cast(*u8, &body), 4096) != 0) { return 69; }
+
+    return 0;
+}

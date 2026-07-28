@@ -16,3 +16,4 @@ use "core/bufread.cst" as bufread;
 use "transport/tcp_conn.cst" as tcp;
 use "transport/transport.cst" as transport;
 use "proto/url.cst" as url;
+use "proto/http1.cst" as http1;
