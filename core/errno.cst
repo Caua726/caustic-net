@@ -1,0 +1,61 @@
+// =======================================================
+// caustic-net/core/errno.cst
+// errno constants + names. I/O in caustic-net returns a
+// negative i64 = -errno (same convention as std/net.cst).
+// Plus two non-errno sentinels for non-blocking/TLS layers.
+// =======================================================
+
+// Linux x86_64 errno values (positive; I/O returns them negated).
+let is i64 as EINTR        with imut = 4;
+let is i64 as EBADF        with imut = 9;
+let is i64 as EAGAIN       with imut = 11;   // == EWOULDBLOCK on Linux
+let is i64 as EWOULDBLOCK  with imut = 11;
+let is i64 as EFAULT       with imut = 14;
+let is i64 as EINVAL       with imut = 22;
+let is i64 as EPIPE        with imut = 32;
+let is i64 as ENETUNREACH  with imut = 101;
+let is i64 as ECONNRESET   with imut = 104;
+let is i64 as ENOTCONN     with imut = 107;
+let is i64 as ETIMEDOUT    with imut = 110;
+let is i64 as ECONNREFUSED with imut = 111;
+let is i64 as EHOSTUNREACH with imut = 113;
+let is i64 as EINPROGRESS  with imut = 115;
+
+// caustic-net sentinels (outside the errno range so they never collide).
+let is i64 as WANT_READ  with imut = 0 - 1000;
+let is i64 as WANT_WRITE with imut = 0 - 1001;
+
+// True when a (negative) return value maps to errno `e`.
+fn is_errno(ret as i64, e as i64) as i64 {
+    if (ret == 0 - e) { return 1; }
+    return 0;
+}
+
+// True when a non-blocking op would block (EAGAIN/EWOULDBLOCK/EINPROGRESS).
+fn would_block(ret as i64) as i64 {
+    if (ret == 0 - EAGAIN) { return 1; }
+    if (ret == 0 - EINPROGRESS) { return 1; }
+    return 0;
+}
+
+// Human-readable name for a negative -errno return (best effort).
+fn err_name(ret as i64) as *u8 {
+    let is i64 as e with mut = ret;
+    if (e < 0) { e = 0 - e; }
+    if (e == EINTR)        { return "EINTR"; }
+    if (e == EBADF)        { return "EBADF"; }
+    if (e == EAGAIN)       { return "EAGAIN"; }
+    if (e == EFAULT)       { return "EFAULT"; }
+    if (e == EINVAL)       { return "EINVAL"; }
+    if (e == EPIPE)        { return "EPIPE"; }
+    if (e == ENETUNREACH)  { return "ENETUNREACH"; }
+    if (e == ECONNRESET)   { return "ECONNRESET"; }
+    if (e == ENOTCONN)     { return "ENOTCONN"; }
+    if (e == ETIMEDOUT)    { return "ETIMEDOUT"; }
+    if (e == ECONNREFUSED) { return "ECONNREFUSED"; }
+    if (e == EHOSTUNREACH) { return "EHOSTUNREACH"; }
+    if (e == EINPROGRESS)  { return "EINPROGRESS"; }
+    if (ret == WANT_READ)  { return "WANT_READ"; }
+    if (ret == WANT_WRITE) { return "WANT_WRITE"; }
+    return "EUNKNOWN";
+}

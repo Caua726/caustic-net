@@ -1,0 +1,93 @@
+// =======================================================
+// caustic-net/core/bytes.cst
+// Bytes  — growable, owned heap buffer (parsers/builders accumulate here).
+// Slice  — borrowed view (ptr+len), no ownership (zero-copy header values).
+// The hot path (conn_read/write) uses raw *u8+len and never touches Bytes.
+// =======================================================
+
+use "std/mem.cst" only bins, core as mem;
+
+struct Bytes {
+    ptr as *u8;
+    len as i64;
+    cap as i64;
+}
+
+struct Slice {
+    ptr as *u8;
+    len as i64;
+}
+
+let is mem.Bins as _bins with mut;
+let is i32 as _ready with mut = 0;
+
+fn _b_alloc(size as i64) as *u8 {
+    if (_ready == 0) { _bins = mem.bins.bins_new(65536); _ready = 1; }
+    return mem.bins.bins_alloc(&_bins, size);
+}
+
+fn _b_free(ptr as *u8) as void {
+    if (_ready == 1) { mem.bins.bins_free(&_bins, ptr); }
+}
+
+// New buffer with capacity `cap` (>=1). len starts at 0.
+fn bytes_new(cap as i64) as Bytes {
+    let is i64 as c with mut = cap;
+    if (c < 1) { c = 16; }
+    let is Bytes as b;
+    b.ptr = _b_alloc(c);
+    b.len = 0;
+    b.cap = c;
+    return b;
+}
+
+// Ensure room for at least `extra` more bytes; grows (doubling) if needed.
+fn bytes_reserve(b as *Bytes, extra as i64) as i64 {
+    let is i64 as need = b.len + extra;
+    if (need <= b.cap) { return 0; }
+    let is i64 as ncap with mut = b.cap;
+    while (ncap < need) { ncap = ncap * 2; }
+    let is *u8 as np = _b_alloc(ncap);
+    if (cast(i64, np) == 0) { return 0 - 1; }
+    if (b.len > 0) { mem.core.memcpy(np, b.ptr, b.len); }
+    _b_free(b.ptr);
+    b.ptr = np;
+    b.cap = ncap;
+    return 0;
+}
+
+// Append `n` bytes from `src`. Returns 0 ok, <0 on alloc failure.
+fn bytes_append(b as *Bytes, src as *u8, n as i64) as i64 {
+    if (n <= 0) { return 0; }
+    if (bytes_reserve(b, n) < 0) { return 0 - 1; }
+    mem.core.memcpy(cast(*u8, cast(i64, b.ptr) + b.len), src, n);
+    b.len = b.len + n;
+    return 0;
+}
+
+// Append a single byte.
+fn bytes_push(b as *Bytes, byte as u8) as i64 {
+    if (bytes_reserve(b, 1) < 0) { return 0 - 1; }
+    b.ptr[b.len] = byte;
+    b.len = b.len + 1;
+    return 0;
+}
+
+// A borrowed view of [off, off+n) inside b. No copy, no bounds growth.
+fn bytes_slice(b as *Bytes, off as i64, n as i64) as Slice {
+    let is Slice as s;
+    s.ptr = cast(*u8, cast(i64, b.ptr) + off);
+    s.len = n;
+    return s;
+}
+
+fn bytes_reset(b as *Bytes) as void {
+    b.len = 0;
+}
+
+fn bytes_free(b as *Bytes) as void {
+    if (cast(i64, b.ptr) != 0) { _b_free(b.ptr); }
+    b.ptr = cast(*u8, 0);
+    b.len = 0;
+    b.cap = 0;
+}

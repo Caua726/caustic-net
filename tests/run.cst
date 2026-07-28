@@ -1,0 +1,157 @@
+// =======================================================
+// tests/run.cst — the test runner, in Caustic.
+//
+// Builds and runs every test and example; a case passes iff its binary exits 0.
+// Exits 0 only if all of them do.
+//
+// Portable: only the std portability facades (process / io / os / env), never a
+// per-OS module — which matters here more than in most repositories, because
+// the library it tests is the one that has to work on both targets.
+//
+// Run from the repo root:  caustic-mk run test
+// =======================================================
+
+use "std/process.cst" as proc;
+use "std/io.cst"       as io;
+use "std/os.cst"       as os;
+use "std/env.cst"      as env;
+use "std/string.cst"   as str;
+
+// An optimization level to build every case with, or none for the default.
+let is *u8 as OPT with mut = cast(*u8, 0);
+
+fn app(buf as *u8, pos as i64, s as *u8) as i64 {
+    let is i64 as p with mut = pos;
+    let is i64 as i with mut = 0;
+    while (s[i] != 0) { buf[p] = s[i]; p = p + 1; i = i + 1; }
+    return p;
+}
+fn slen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+fn label(name as *u8) as void {
+    io.write_str(1, "[test] ");
+    io.write_str(1, name);
+    let is i64 as pad with mut = 14 - slen(name);
+    while (pad > 0) { io.write_str(1, " "); pad = pad - 1; }
+}
+
+// Resolve `file` against $PATH into out (proc.capture runs via execve, which
+// needs a real path). Tries a bare name and a .exe suffix. Returns 1 if found.
+fn which(file as *u8, out as *u8) as i32 {
+    let is *u8 as path = env.getenv("PATH");
+    if (cast(i64, path) == 0) { return 0; }
+    let is i64 as i with mut = 0;
+    while (path[i] != 0) {
+        let is i64 as start = i;
+        while (path[i] != 0 && path[i] != 58 && path[i] != 59) { i = i + 1; }   // ':' or ';'
+        let is i64 as q with mut = 0;
+        let is i64 as k with mut = start;
+        while (k < i) { out[q] = path[k]; q = q + 1; k = k + 1; }
+        out[q] = cast(u8, 47); q = q + 1;                                       // '/'
+        q = app(out, q, file);
+        out[q] = cast(u8, 0);
+        if (io.exists(out) == 1) { return 1; }
+        out[q] = cast(u8, 46); out[q + 1] = cast(u8, 101);
+        out[q + 2] = cast(u8, 120); out[q + 3] = cast(u8, 101); out[q + 4] = cast(u8, 0);   // ".exe"
+        if (io.exists(out) == 1) { return 1; }
+        if (path[i] != 0) { i = i + 1; }
+    }
+    return 0;
+}
+
+// Send this process's stderr to the null device, so children inherit a quiet
+// stderr. proc.capture already swallows a child's stdout (and on Windows its
+// stderr too); this covers the one case it doesn't: a child's stderr on POSIX.
+fn silence_stderr() as void {
+    let is *u8 as nul with mut = "/dev/null";
+    if (os.current() == os.OS_WINDOWS) { return; }   // Windows: capture redirects both streams
+    io._close_fd(2);
+    io._open_write(nul);
+}
+
+fn run_case(cc as *u8, name as *u8, src as *u8) as i32 {
+    let is [512]u8 as out;
+    let is i64 as p with mut = app(cast(*u8, &out), 0, "build/");
+    p = app(cast(*u8, &out), p, name);
+    out[p] = cast(u8, 0);
+
+    label(name);
+    io.unlink(cast(*u8, &out));
+
+    let is [6]i64 as cav;
+    let is i64 as n with mut = 0;
+    cav[n] = cast(i64, "caustic"); n = n + 1;
+    if (cast(i64, OPT) != 0) { cav[n] = cast(i64, OPT); n = n + 1; }
+    cav[n] = cast(i64, src); n = n + 1;
+    cav[n] = cast(i64, "-o"); n = n + 1;
+    cav[n] = cast(i64, cast(*u8, &out)); n = n + 1;
+    cav[n] = 0;
+    let is str.String as _log = proc.capture(cc, cast(*u8, &cav));
+
+    if (io.exists(cast(*u8, &out)) == 0) { io.write_str(1, "COMPILE FAIL\n"); return 1; }
+
+    let is [2]i64 as rav;
+    rav[0] = cast(i64, cast(*u8, &out)); rav[1] = 0;
+    let is i64 as rpid = proc.spawnp(cast(*u8, &out), cast(*u8, &rav));
+    let is i32 as rc = proc.wait_pid(rpid);
+    if (rc == 0) { io.write_str(1, "PASS\n"); return 0; }
+    io.write_str(1, "FAIL (exit "); io.write_int(1, cast(i64, rc)); io.write_str(1, ")\n");
+    return 1;
+}
+
+// The library itself has no main, so it is checked with `-c`: does every module
+// still compile the way a consumer takes it. `caustic -c foo.cst` always emits
+// `foo.cst.s`, so the artifact's existence is the exit status.
+fn compile_lib(cc as *u8, src as *u8) as i32 {
+    let is [512]u8 as art;
+    let is i64 as p with mut = app(cast(*u8, &art), 0, src);
+    p = app(cast(*u8, &art), p, ".s");
+    art[p] = cast(u8, 0);
+
+    label("library");
+    io.unlink(cast(*u8, &art));
+
+    let is [5]i64 as cav;
+    cav[0] = cast(i64, "caustic"); cav[1] = cast(i64, "-q");
+    cav[2] = cast(i64, "-c"); cav[3] = cast(i64, src); cav[4] = 0;
+    let is str.String as _log = proc.capture(cc, cast(*u8, &cav));
+
+    if (io.exists(cast(*u8, &art)) == 0) { io.write_str(1, "COMPILE FAIL\n"); return 1; }
+    io.unlink(cast(*u8, &art));
+    io.write_str(1, "ok\n");
+    return 0;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    let is [4096]u8 as cc;
+    if (which("caustic", cast(*u8, &cc)) == 0) { io.write_str(1, "caustic not found in PATH\n"); return 2; }
+    let is *u8 as ccp = cast(*u8, &cc);
+
+    let is i64 as ai with mut = 1;
+    while (ai < env.argc()) {
+        let is *u8 as a = env.argv(ai);
+        if (a[0] == 45 && a[1] == 79) { OPT = a; }              // "-O…"
+        else {
+            io.write_str(1, "usage: run [-O0|-O1|-O2]\n");
+            return 2;
+        }
+        ai = ai + 1;
+    }
+    if (cast(i64, OPT) != 0) {
+        io.write_str(1, "optimization: "); io.write_str(1, OPT); io.write_str(1, "\n");
+    }
+    silence_stderr();
+
+    let is i64 as fail with mut = 0;
+    fail = fail + cast(i64, compile_lib(ccp, "caustic_net.cst"));
+    fail = fail + cast(i64, run_case(ccp, "test_conn", "tests/test_conn.cst"));
+    fail = fail + cast(i64, run_case(ccp, "tcp_echo",  "examples/tcp_echo.cst"));
+
+    if (fail == 0) { io.write_str(1, "all green\n"); return 0; }
+    io.write_str(1, "FAILURES: "); io.write_int(1, fail); io.write_str(1, "\n");
+    return 1;
+}

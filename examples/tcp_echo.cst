@@ -1,0 +1,56 @@
+// =======================================================
+// caustic-net/examples/tcp_echo.cst
+// Single-process loopback echo over the Conn abstraction.
+// listen → (blocking) dial → accept → send/echo/recv, all via
+// conn_read/conn_write_all. Proves the TCP Conn round-trips bytes.
+//
+// Works single-threaded: a blocking connect() to a loopback
+// listener completes via the kernel accept backlog before accept().
+//
+// Exit 0 = pass; non-zero = the numbered step that failed.
+// =======================================================
+
+use "std/net.cst" as net;
+use "std/io.cst" as io;
+use "../core/conn.cst" as conn;
+use "../transport/transport.cst" as tp;
+
+fn main() as i32 {
+    tp.init();
+
+    let is i64 as port = 18080;
+
+    let is i64 as srv = tp.listen(net.INADDR_LOOPBACK, port);
+    if (srv < 0) { io.printf("listen failed: %ld\n", srv); return 1; }
+
+    let is *conn.Conn as cli = tp.dial("127.0.0.1", port);
+    if (cast(i64, cli) == 0) { io.printf("dial failed\n"); net.close(srv); return 2; }
+
+    let is *conn.Conn as ser = tp.accept_conn(srv);
+    if (cast(i64, ser) == 0) { io.printf("accept failed\n"); return 3; }
+
+    // client → server
+    let is i64 as w = conn.conn_write_all(cli, "ping", 4);
+    if (w != 4) { io.printf("write_all got %ld\n", w); return 4; }
+
+    let is [64]u8 as buf;
+    let is i64 as n = conn.conn_read(ser, cast(*u8, &buf), 64);
+    if (n != 4) { io.printf("server read got %ld\n", n); return 5; }
+
+    // server echoes back
+    let is i64 as we = conn.conn_write_all(ser, cast(*u8, &buf), n);
+    if (we != 4) { return 6; }
+
+    let is [64]u8 as buf2;
+    let is i64 as n2 = conn.conn_read(cli, cast(*u8, &buf2), 64);
+    if (n2 != 4) { io.printf("client read got %ld\n", n2); return 7; }
+    if (buf2[0] != 112) { return 8; }   // 'p'
+    if (buf2[3] != 103) { return 9; }   // 'g'
+
+    io.printf("tcp_echo ok: echoed %ld bytes through Conn\n", n2);
+
+    conn.conn_free(cli);
+    conn.conn_free(ser);
+    net.close(srv);
+    return 0;
+}

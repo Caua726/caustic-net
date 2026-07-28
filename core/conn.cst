@@ -1,0 +1,112 @@
+// =======================================================
+// caustic-net/core/conn.cst
+// The Conn abstraction — a generic byte stream behind a
+// function-pointer vtable. Plain TCP and TLS both implement
+// the SAME Conn, so HTTP/WS/fetch never know which is underneath.
+//
+// The vtable is a struct of fn_ptr-as-*u8 fields + an opaque
+// ctx. call() on a stored *u8 pointer is an untyped indirect
+// call (verified pattern: std/sort.cst stores `cmp as *u8` and
+// does `call(cmp, ...)`), so every call() lives in exactly the
+// four typed dispatchers below — nowhere else.
+// =======================================================
+
+use "std/mem.cst" only bins, core as mem;
+
+// --- Connection state codes (returned by the `state` vtable slot) ---
+let is i64 as CONN_OPEN   with imut = 0;   // usable
+let is i64 as CONN_EOF    with imut = 1;   // peer closed cleanly (read returned 0)
+let is i64 as CONN_CLOSED with imut = 2;   // we closed it
+let is i64 as CONN_ERROR  with imut = 3;   // an I/O error occurred
+
+// Vtable contract (each backend takes the opaque ctx first):
+//   read : fn(ctx as *u8, buf as *u8, len as i64) as i64   // >0 n, 0 EOF, <0 -errno
+//   write: fn(ctx as *u8, buf as *u8, len as i64) as i64   // >0 n, <0 -errno
+//   close: fn(ctx as *u8) as i64                           // 0 ok, <0 -errno
+//   state: fn(ctx as *u8) as i64                           // CONN_* code
+struct Conn {
+    ctx   as *u8;   // opaque backend context (*TcpCtx, *TlsConn, mock, ...)
+    read  as *u8;   // fn_ptr(backend read)
+    write as *u8;   // fn_ptr(backend write)
+    close as *u8;   // fn_ptr(backend close)
+    state as *u8;   // fn_ptr(backend state)
+}
+
+// --- The only four call() sites. Typed surface for everyone else. ---
+
+fn conn_read(c as *Conn, buf as *u8, len as i64) as i64 {
+    return call(c.read, c.ctx, buf, len);
+}
+
+fn conn_write(c as *Conn, buf as *u8, len as i64) as i64 {
+    return call(c.write, c.ctx, buf, len);
+}
+
+fn conn_close(c as *Conn) as i64 {
+    return call(c.close, c.ctx);
+}
+
+fn conn_state(c as *Conn) as i64 {
+    return call(c.state, c.ctx);
+}
+
+// --- Loop helpers (mirror net.send_all / net.recv_all over the vtable) ---
+
+// Write every byte. Returns total sent, or <0 on error, or partial on EOF.
+fn conn_write_all(c as *Conn, buf as *u8, len as i64) as i64 {
+    let is i64 as sent with mut = 0;
+    while (sent < len) {
+        let is i64 as n = conn_write(c, cast(*u8, cast(i64, buf) + sent), len - sent);
+        if (n < 0) { return n; }
+        if (n == 0) {
+            if (sent > 0) { return sent; }
+            return 0 - 1;
+        }
+        sent = sent + n;
+    }
+    return sent;
+}
+
+// Read exactly len bytes. Returns len, or got<len on EOF, or <0 on error.
+fn conn_read_exact(c as *Conn, buf as *u8, len as i64) as i64 {
+    let is i64 as got with mut = 0;
+    while (got < len) {
+        let is i64 as n = conn_read(c, cast(*u8, cast(i64, buf) + got), len - got);
+        if (n < 0) { return n; }
+        if (n == 0) { return got; }
+        got = got + n;
+    }
+    return got;
+}
+
+// =======================================================
+// Shared allocator for Conn boxes and their backend contexts.
+// Every Conn-producer (tcp_conn, tls, ...) allocates through
+// cn_alloc so conn_free can release ctx + box with one heap.
+// =======================================================
+let is mem.Bins as _bins with mut;
+let is i32 as _ready with mut = 0;
+
+fn cn_alloc(size as i64) as *u8 {
+    if (_ready == 0) { _bins = mem.bins.bins_new(65536); _ready = 1; }
+    return mem.bins.bins_alloc(&_bins, size);
+}
+
+fn cn_free(ptr as *u8) as void {
+    if (_ready == 1) { mem.bins.bins_free(&_bins, ptr); }
+}
+
+// Allocate a zeroed Conn box.
+fn conn_new() as *Conn {
+    let is *Conn as c = cast(*Conn, cn_alloc(sizeof(Conn)));
+    mem.core.memset(cast(*u8, c), cast(i32, 0), sizeof(Conn));
+    return c;
+}
+
+// Close (idempotent at the backend) and free the box + its ctx.
+fn conn_free(c as *Conn) as void {
+    if (cast(i64, c) == 0) { return; }
+    conn_close(c);
+    if (cast(i64, c.ctx) != 0) { cn_free(c.ctx); }
+    cn_free(cast(*u8, c));
+}

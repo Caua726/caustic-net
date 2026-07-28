@@ -1,0 +1,16 @@
+// =======================================================
+// caustic-net — pure-Caustic networking library (facade)
+//
+// Re-exports the public modules so a consumer can:
+//   use "caustic-net/caustic_net.cst" as cnet;
+//   cnet.conn.conn_read(...);  cnet.transport.dial(...);
+//
+// Compile-check the whole library with:  caustic -c caustic_net.cst
+// Modules land phase by phase (see ROADMAP / plan); this list grows.
+// =======================================================
+
+use "core/conn.cst" as conn;
+use "core/errno.cst" as errno;
+use "core/bytes.cst" as bytes;
+use "transport/tcp_conn.cst" as tcp;
+use "transport/transport.cst" as transport;

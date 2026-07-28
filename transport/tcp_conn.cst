@@ -1,0 +1,69 @@
+// =======================================================
+// caustic-net/transport/tcp_conn.cst
+// The plain-TCP implementation of Conn. Wraps an fd and
+// delegates read/write/close to std/net.cst send/recv/close.
+// This is the reference pattern every Conn-producer copies.
+// =======================================================
+
+use "std/net.cst" as net;
+use "../core/conn.cst" as conn;
+
+struct TcpCtx {
+    fd as i64;
+    st as i64;   // CONN_* state code
+}
+
+// --- the four vtable backends. ctx is *u8 reinterpreted as *TcpCtx ---
+
+fn _tcp_read(ctx as *u8, buf as *u8, len as i64) as i64 {
+    let is *TcpCtx as c = cast(*TcpCtx, ctx);
+    let is i64 as n = net.recv(c.fd, buf, len);
+    if (n == 0) { c.st = conn.CONN_EOF; }
+    if (n < 0)  { c.st = conn.CONN_ERROR; }
+    return n;
+}
+
+fn _tcp_write(ctx as *u8, buf as *u8, len as i64) as i64 {
+    let is *TcpCtx as c = cast(*TcpCtx, ctx);
+    let is i64 as n = net.send(c.fd, buf, len);
+    if (n < 0) { c.st = conn.CONN_ERROR; }
+    return n;
+}
+
+fn _tcp_close(ctx as *u8) as i64 {
+    let is *TcpCtx as c = cast(*TcpCtx, ctx);
+    if (c.st == conn.CONN_CLOSED) { return 0; }
+    net.close(c.fd);
+    c.st = conn.CONN_CLOSED;
+    return 0;
+}
+
+fn _tcp_state(ctx as *u8) as i64 {
+    let is *TcpCtx as c = cast(*TcpCtx, ctx);
+    return c.st;
+}
+
+// Wrap an already-connected/accepted fd into a heap-owned *Conn.
+// Caller owns it; release with conn.conn_free (closes fd + frees ctx + box).
+// Returns null (*Conn 0) on allocation failure.
+fn conn_from_fd(fd as i64) as *conn.Conn {
+    let is *TcpCtx as c = cast(*TcpCtx, conn.cn_alloc(sizeof(TcpCtx)));
+    if (cast(i64, c) == 0) { return cast(*conn.Conn, 0); }
+    c.fd = fd;
+    c.st = conn.CONN_OPEN;
+
+    let is *conn.Conn as k = conn.conn_new();
+    if (cast(i64, k) == 0) { conn.cn_free(cast(*u8, c)); return cast(*conn.Conn, 0); }
+    k.ctx   = cast(*u8, c);
+    k.read  = fn_ptr(_tcp_read);
+    k.write = fn_ptr(_tcp_write);
+    k.close = fn_ptr(_tcp_close);
+    k.state = fn_ptr(_tcp_state);
+    return k;
+}
+
+// The raw fd behind a TCP Conn (e.g. to register with epoll/poll).
+fn conn_fd(k as *conn.Conn) as i64 {
+    let is *TcpCtx as c = cast(*TcpCtx, k.ctx);
+    return c.fd;
+}

@@ -1,0 +1,6 @@
+build/
+.caustic/
+# Compiler output, and only compiler output: `caustic -c foo.cst` always emits
+# `foo.cst.s`, so that suffix is the exact discriminator.
+*.cst.s
+*.cst.s.o

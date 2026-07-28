@@ -1,0 +1,66 @@
+// =======================================================
+// caustic-net/transport/transport.cst
+// Connection/listener primitives that return *Conn. Thin layer
+// over std/net.cst that hands callers the polymorphic Conn so
+// they never see fds. Socket tuning passes through to net.
+// =======================================================
+
+use "std/net.cst" as net;
+use "./tcp_conn.cst" as tcpc;
+use "../core/conn.cst" as conn;
+
+// One-time WSAStartup on Windows; no-op on Linux. Safe to call repeatedly.
+fn init() as i32 {
+    return net.init();
+}
+
+// --- connect ---
+
+// Blocking connect to "a.b.c.d":port. Returns *Conn, or null on failure.
+fn dial(ip_str as *u8, port as i64) as *conn.Conn {
+    let is i64 as fd = net.dial(ip_str, port);
+    if (fd < 0) { return cast(*conn.Conn, 0); }
+    return tcpc.conn_from_fd(fd);
+}
+
+// Blocking connect to a host-byte-order IPv4 + port. Returns *Conn or null.
+fn connect_ip4(ip as i64, port as i64) as *conn.Conn {
+    let is [16]u8 as buf;
+    let is net.Addr as a = net.addr_init(cast(*u8, &buf), ip, port);
+    let is i64 as fd = net.tcp_connect(a);
+    if (fd < 0) { return cast(*conn.Conn, 0); }
+    return tcpc.conn_from_fd(fd);
+}
+
+// --- listen / accept ---
+
+// Bind+listen on a host-byte-order IPv4 + port. Returns server fd or <0.
+fn listen(ip as i64, port as i64) as i64 {
+    let is [16]u8 as buf;
+    let is net.Addr as a = net.addr_init(cast(*u8, &buf), ip, port);
+    return net.tcp_listen(a);
+}
+
+// Listen on 0.0.0.0:port.
+fn listen_any(port as i64) as i64 {
+    return listen(net.INADDR_ANY, port);
+}
+
+// Accept one connection, returning it as a *Conn (or null on error).
+fn accept_conn(server_fd as i64) as *conn.Conn {
+    let is i64 as fd = net.tcp_accept(server_fd, cast(*u8, 0));
+    if (fd < 0) { return cast(*conn.Conn, 0); }
+    return tcpc.conn_from_fd(fd);
+}
+
+// --- socket tuning (pass-throughs; operate on the fd behind a Conn) ---
+
+fn set_nodelay(k as *conn.Conn) as i64   { return net.set_nodelay(tcpc.conn_fd(k)); }
+fn set_keepalive(k as *conn.Conn) as i64 { return net.set_keepalive(tcpc.conn_fd(k)); }
+fn set_nonblock(k as *conn.Conn) as i64  { return net.set_nonblock(tcpc.conn_fd(k)); }
+fn set_recv_timeout(k as *conn.Conn, secs as i64) as i64 { return net.set_recv_timeout(tcpc.conn_fd(k), secs); }
+fn set_send_timeout(k as *conn.Conn, secs as i64) as i64 { return net.set_send_timeout(tcpc.conn_fd(k), secs); }
+
+// Wait for readability/writability on the fd behind a Conn (poll, ms timeout).
+fn wait_readable(k as *conn.Conn, timeout_ms as i64) as i64 { return net.wait_readable(tcpc.conn_fd(k), timeout_ms); }
+fn wait_writable(k as *conn.Conn, timeout_ms as i64) as i64 { return net.wait_writable(tcpc.conn_fd(k), timeout_ms); }

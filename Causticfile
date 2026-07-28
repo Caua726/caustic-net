@@ -1,0 +1,53 @@
+name "caustic-net"
+version "0.1.0"
+author "Cauã Alvarenga Neves"
+
+// caustic-net — build and test surface.
+//
+//   caustic-mk run test        the library compile-check, then every case
+//   caustic-mk run test-opt    the same, through the optimizing backend
+//   caustic-mk build tcp_echo  the example, to run by hand
+//   caustic-mk run clean       build artifacts
+//
+// There are no dependencies yet. The floor is the standard library's
+// std/net.cst (TCP/UDP/poll) and everything above it is written here. When the
+// TLS track lands it will `depend` on caustic-crypto rather than carry its own
+// copy of the primitives — a second, unaudited implementation of X25519 inside
+// the same author's own ecosystem would be the worst of both worlds.
+
+env_default "OPT" "-O1"
+
+// ── Targets ──────────────────────────────────────────────────────────
+
+target "run"       { src "tests/run.cst"          out "build/run" }
+target "test_conn" { src "tests/test_conn.cst"    out "build/test_conn" }
+target "tcp_echo"  { src "examples/tcp_echo.cst"  out "build/tcp_echo" }
+
+// ── Scripts ──────────────────────────────────────────────────────────
+
+// Two layers: the library compiles with `-c`, the way a consumer takes it, and
+// then each case builds and exits 0. The first catches a module that only
+// happens to compile as part of a test binary.
+script "test" {
+    "caustic tests/run.cst -o build/run"
+    "./build/run"
+}
+
+script "test-opt" {
+    "caustic tests/run.cst -o build/run"
+    "./build/run ${OPT}"
+}
+
+script "clean" {
+    "rm -rf .caustic build"
+    "echo 'clean: build artifacts removed'"
+}
+
+// Deep clean: also the compiler output that no build regenerates. The
+// discriminator is exact — `caustic -c foo.cst` always emits `foo.cst.s`.
+script "distclean" {
+    "caustic-mk run clean"
+    "find . -name '*.cst.s' -delete"
+    "find . -name '*.cst.s.o' -delete"
+    "echo 'distclean: generated assembly and objects removed too'"
+}
