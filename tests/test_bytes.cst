@@ -1,0 +1,84 @@
+// =======================================================
+// caustic-net/tests/test_bytes.cst
+// Covers core/bytes.cst — the buffer every parser and builder
+// above the transport accumulates into.
+//
+// The cases that matter are the ones a response body hits:
+// growth past the small-allocator ceiling, a failed allocation
+// that must stay inert rather than lie about its capacity, and
+// a zeroed Bytes that must not spin in the doubling loop.
+//
+// Exit 0 = all pass. Non-zero = the numbered check that failed.
+// =======================================================
+
+use "std/mem.cst" only core as mem;
+use "../core/bytes.cst" as bytes;
+
+fn main() as i32 {
+    // 1/2/3: construct, append, read back
+    let is bytes.Bytes as b with mut = bytes.bytes_new(16);
+    if (cast(i64, b.ptr) == 0) { return 1; }
+    if (bytes.bytes_append(&b, "hello", 5) != 0) { return 2; }
+    if (b.len != 5) { return 3; }
+    if (b.ptr[0] != 104) { return 4; }        // 'h'
+    if (b.ptr[4] != 111) { return 5; }        // 'o'
+
+    // 6/7: push a byte, and append a NUL-terminated string
+    if (bytes.bytes_push(&b, cast(u8, 33)) != 0) { return 6; }   // '!'
+    if (b.len != 6 || b.ptr[5] != 33) { return 7; }
+    if (bytes.bytes_append_str(&b, " world") != 0) { return 8; }
+    if (b.len != 12) { return 9; }
+    if (b.ptr[11] != 100) { return 10; }      // 'd'
+
+    // 11/12/13: a slice is clamped to the filled region, never a wild pointer
+    let is bytes.Slice as s = bytes.bytes_slice(&b, 6, 5);
+    if (s.len != 5 || s.ptr[0] != 32) { return 11; }             // ' '
+    let is bytes.Slice as over = bytes.bytes_slice(&b, 10, 999);
+    if (over.len != 2) { return 12; }                            // clamped to len
+    let is bytes.Slice as past = bytes.bytes_slice(&b, 99, 1);
+    if (past.len != 0 || cast(i64, past.ptr) != 0) { return 13; }
+
+    // 14/15/16: growth past the small-allocator ceiling. `bins` refuses any
+    // single request over its top bin, so a body-sized buffer has to come
+    // from pages instead — this is the case that used to fail at 32 KiB.
+    let is [1024]u8 as chunk;
+    mem.core.memset(cast(*u8, &chunk), cast(i32, 88), 1024);     // 'X'
+    let is bytes.Bytes as big with mut = bytes.bytes_new(64);
+    let is i64 as written with mut = 0;
+    while (written < 1048576) {                                  // 1 MiB
+        if (bytes.bytes_append(&big, cast(*u8, &chunk), 1024) != 0) { return 14; }
+        written = written + 1024;
+    }
+    if (big.len != 1048576) { return 15; }
+    if (big.ptr[0] != 88 || big.ptr[1048575] != 88) { return 16; }   // survived every realloc
+    bytes.bytes_free(&big);
+    if (cast(i64, big.ptr) != 0 || big.cap != 0) { return 17; }
+
+    // 18/19: a request no allocator can serve must yield an INERT buffer —
+    // ptr null and cap 0 together. A null ptr with a nonzero cap would let the
+    // next append skip the grow path and memcpy through null.
+    let is bytes.Bytes as huge with mut = bytes.bytes_new(0 - 1);
+    if (cast(i64, huge.ptr) != 0) {
+        // A negative capacity is clamped to the 16-byte floor, so this
+        // allocation is expected to succeed; it must still be coherent.
+        if (huge.cap < 16) { return 18; }
+        bytes.bytes_free(&huge);
+    }
+
+    // 20/21: a zeroed Bytes — one that was memset rather than built by
+    // bytes_new, e.g. a struct field — must grow, not spin doubling 0 * 2.
+    let is bytes.Bytes as zeroed with mut;
+    mem.core.memset(cast(*u8, &zeroed), cast(i32, 0), sizeof(bytes.Bytes));
+    if (bytes.bytes_append(&zeroed, "recovered", 9) != 0) { return 20; }
+    if (zeroed.len != 9 || zeroed.ptr[0] != 114) { return 21; }  // 'r'
+    bytes.bytes_free(&zeroed);
+
+    // 22/23: reset keeps the allocation but drops the contents
+    bytes.bytes_reset(&b);
+    if (b.len != 0 || cast(i64, b.ptr) == 0) { return 22; }
+    if (bytes.bytes_append(&b, "again", 5) != 0) { return 23; }
+    if (b.len != 5) { return 24; }
+    bytes.bytes_free(&b);
+
+    return 0;
+}

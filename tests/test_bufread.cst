@@ -1,0 +1,202 @@
+// =======================================================
+// caustic-net/tests/test_bufread.cst
+// Covers core/bufread.cst — the layer that turns a byte stream
+// into lines and exact counts.
+//
+// The mock Conn hands back at most `chunk` bytes per read, so the
+// tests can force the case that actually breaks naive parsers: a
+// header line split across two reads, and several lines arriving
+// in one. A reader that only works when a line lands whole in a
+// single read passes nothing here.
+//
+// Exit 0 = all pass. Non-zero = the numbered check that failed.
+// =======================================================
+
+use "std/mem.cst" only bins, core as mem;
+use "../core/conn.cst" as conn;
+use "../core/bufread.cst" as br;
+
+// A Conn that replays a fixed script, `chunk` bytes at a time.
+struct MockCtx {
+    buf   as *u8;
+    len   as i64;
+    rpos  as i64;
+    chunk as i64;
+    st    as i64;
+}
+
+fn _mock_read(ctx as *u8, out as *u8, n as i64) as i64 {
+    let is *MockCtx as m = cast(*MockCtx, ctx);
+    let is i64 as avail = m.len - m.rpos;
+    if (avail <= 0) { return 0; }
+    let is i64 as k with mut = n;
+    if (k > avail) { k = avail; }
+    if (m.chunk > 0 && k > m.chunk) { k = m.chunk; }
+    mem.core.memcpy(out, cast(*u8, cast(i64, m.buf) + m.rpos), k);
+    m.rpos = m.rpos + k;
+    return k;
+}
+
+fn _mock_write(ctx as *u8, in as *u8, n as i64) as i64 { return n; }
+fn _mock_close(ctx as *u8) as i64 {
+    let is *MockCtx as m = cast(*MockCtx, ctx);
+    m.st = conn.CONN_CLOSED;
+    return 0;
+}
+fn _mock_state(ctx as *u8) as i64 {
+    let is *MockCtx as m = cast(*MockCtx, ctx);
+    return m.st;
+}
+
+fn mock_conn(c as *conn.Conn, m as *MockCtx, data as *u8, len as i64, chunk as i64) as void {
+    m.buf = data; m.len = len; m.rpos = 0; m.chunk = chunk; m.st = conn.CONN_OPEN;
+    c.ctx   = cast(*u8, m);
+    c.read  = fn_ptr(_mock_read);
+    c.write = fn_ptr(_mock_write);
+    c.close = fn_ptr(_mock_close);
+    c.state = fn_ptr(_mock_state);
+}
+
+fn eq(a as *u8, b as *u8, n as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn main() as i32 {
+    let is conn.Conn as c;
+    let is MockCtx as m;
+    let is [4096]u8 as storage;
+    let is [512]u8 as line;
+    let is br.BufReader as r;
+
+    // ---- A response head, delivered ONE BYTE AT A TIME. Every line here
+    // ---- spans many reads, which is the whole point.
+    let is *u8 as head = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX: y\r\n\r\nhello";
+    mock_conn(&c, &m, head, 49, 1);
+    br.br_init(&r, &c, cast(*u8, &storage), 4096);
+
+    let is i64 as n with mut = br.br_read_line(&r, cast(*u8, &line), 512);
+    if (n != 15) { return 1; }
+    if (eq(cast(*u8, &line), "HTTP/1.1 200 OK", 15) == 0) { return 2; }
+
+    n = br.br_read_line(&r, cast(*u8, &line), 512);
+    if (n != 17) { return 3; }
+    if (eq(cast(*u8, &line), "Content-Length: 5", 17) == 0) { return 4; }
+
+    n = br.br_read_line(&r, cast(*u8, &line), 512);
+    if (n != 4) { return 5; }
+
+    // The blank line that ends a header block must come back as length 0,
+    // not as EOF and not as a line containing "\r".
+    n = br.br_read_line(&r, cast(*u8, &line), 512);
+    if (n != 0) { return 6; }
+
+    // ---- The body follows in the same stream, read by exact count.
+    let is [16]u8 as body;
+    if (br.br_read_exact(&r, cast(*u8, &body), 5) != 5) { return 7; }
+    if (eq(cast(*u8, &body), "hello", 5) == 0) { return 8; }
+
+    // Stream is drained: another line is EOF, not a hang or a stray byte.
+    if (br.br_read_line(&r, cast(*u8, &line), 512) != br.BR_EOF) { return 9; }
+    if (br.br_eof(&r) != 1) { return 10; }
+
+    // ---- Same script, but everything arrives in ONE read. The parse must be
+    // ---- identical — several lines already sitting in the buffer.
+    mock_conn(&c, &m, head, 49, 0);
+    br.br_init(&r, &c, cast(*u8, &storage), 4096);
+    if (br.br_read_line(&r, cast(*u8, &line), 512) != 15) { return 11; }
+    if (br.br_read_line(&r, cast(*u8, &line), 512) != 17) { return 12; }
+    if (br.br_read_line(&r, cast(*u8, &line), 512) != 4)  { return 13; }
+    if (br.br_read_line(&r, cast(*u8, &line), 512) != 0)  { return 14; }
+
+    // ---- A bare LF terminator (no CR) is still a line.
+    mock_conn(&c, &m, "a\nbb\nccc\n", 9, 2);
+    br.br_init(&r, &c, cast(*u8, &storage), 4096);
+    if (br.br_read_line(&r, cast(*u8, &line), 512) != 1) { return 15; }
+    if (br.br_read_line(&r, cast(*u8, &line), 512) != 2) { return 16; }
+    if (br.br_read_line(&r, cast(*u8, &line), 512) != 3) { return 17; }
+    if (br.br_read_line(&r, cast(*u8, &line), 512) != br.BR_EOF) { return 18; }
+
+    // ---- A last line that ends at EOF instead of a newline still comes back,
+    // ---- and br_eof marks it as unterminated.
+    mock_conn(&c, &m, "x\ntail", 6, 3);
+    br.br_init(&r, &c, cast(*u8, &storage), 4096);
+    if (br.br_read_line(&r, cast(*u8, &line), 512) != 1) { return 19; }
+    n = br.br_read_line(&r, cast(*u8, &line), 512);
+    if (n != 4) { return 20; }
+    if (eq(cast(*u8, &line), "tail", 4) == 0) { return 21; }
+
+    // ---- A line longer than the buffer is REFUSED, not grown. This is the
+    // ---- header-flood guard: an unbounded peer must not force allocation.
+    let is [64]u8 as small;
+    let is [512]u8 as flood;
+    let is i64 as i with mut = 0;
+    while (i < 512) { flood[i] = cast(u8, 65); i = i + 1; }   // 512 'A', no newline
+    mock_conn(&c, &m, cast(*u8, &flood), 512, 0);
+    br.br_init(&r, &c, cast(*u8, &small), 64);
+    if (br.br_read_line(&r, cast(*u8, &line), 512) != br.BR_TOO_LONG) { return 22; }
+
+    // A line that fits the buffer but not the caller's `out` is also refused.
+    mock_conn(&c, &m, "0123456789\n", 11, 0);
+    br.br_init(&r, &c, cast(*u8, &storage), 4096);
+    if (br.br_read_line(&r, cast(*u8, &line), 4) != br.BR_TOO_LONG) { return 23; }
+
+    // ---- peek looks without consuming; the next read sees the same bytes.
+    let is [8]u8 as pk;
+    mock_conn(&c, &m, "abcdef", 6, 2);
+    br.br_init(&r, &c, cast(*u8, &storage), 4096);
+    if (br.br_peek(&r, cast(*u8, &pk), 4) != 4) { return 24; }
+    if (eq(cast(*u8, &pk), "abcd", 4) == 0) { return 25; }
+    if (br.br_buffered(&r) < 4) { return 26; }
+    let is [8]u8 as rd;
+    if (br.br_read_exact(&r, cast(*u8, &rd), 6) != 6) { return 27; }
+    if (eq(cast(*u8, &rd), "abcdef", 6) == 0) { return 28; }
+
+    // ---- discard drops an unwanted body without copying it.
+    mock_conn(&c, &m, "SKIP THISkeep", 13, 3);
+    br.br_init(&r, &c, cast(*u8, &storage), 4096);
+    if (br.br_discard(&r, 9) != 9) { return 29; }
+    if (br.br_read_exact(&r, cast(*u8, &rd), 4) != 4) { return 30; }
+    if (eq(cast(*u8, &rd), "keep", 4) == 0) { return 31; }
+    // Discarding past the end reports the short count rather than hanging.
+    if (br.br_discard(&r, 99) != 0) { return 32; }
+
+    // ---- byte-at-a-time, and EOF reported as BR_EOF not 0.
+    mock_conn(&c, &m, "hi", 2, 1);
+    br.br_init(&r, &c, cast(*u8, &storage), 4096);
+    if (br.br_byte(&r) != 104) { return 33; }   // 'h'
+    if (br.br_byte(&r) != 105) { return 34; }   // 'i'
+    if (br.br_byte(&r) != br.BR_EOF) { return 35; }
+
+    // ---- read_exact past the end returns the short count, not an error.
+    mock_conn(&c, &m, "abc", 3, 1);
+    br.br_init(&r, &c, cast(*u8, &storage), 4096);
+    if (br.br_read_exact(&r, cast(*u8, &rd), 8) != 3) { return 36; }
+
+    // ---- A line is NUL-terminated, so it is usable as a string. The buffer is
+    // ---- poisoned first: without the terminator the caller reads the poison
+    // ---- and a header line that never arrived looks perfectly plausible.
+    let is [16]u8 as poison;
+    let is i64 as pi with mut = 0;
+    while (pi < 16) { poison[pi] = cast(u8, 88); pi = pi + 1; }   // 'X'
+    mock_conn(&c, &m, "ab\n", 3, 1);
+    br.br_init(&r, &c, cast(*u8, &storage), 4096);
+    if (br.br_read_line(&r, cast(*u8, &poison), 16) != 2) { return 37; }
+    if (poison[2] != 0) { return 38; }
+
+    // The terminator has to fit: a 3-character line does NOT go in 3 bytes.
+    mock_conn(&c, &m, "abc\n", 4, 1);
+    br.br_init(&r, &c, cast(*u8, &storage), 4096);
+    if (br.br_read_line(&r, cast(*u8, &poison), 3) != br.BR_TOO_LONG) { return 39; }
+    // ...but it does go in 4.
+    mock_conn(&c, &m, "abc\n", 4, 1);
+    br.br_init(&r, &c, cast(*u8, &storage), 4096);
+    if (br.br_read_line(&r, cast(*u8, &poison), 4) != 3) { return 40; }
+    if (poison[3] != 0) { return 41; }
+
+    return 0;
+}

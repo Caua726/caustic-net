@@ -6,6 +6,7 @@
 // =======================================================
 
 use "std/net.cst" as net;
+use "std/mem.cst" only bins, core as mem;
 use "./tcp_conn.cst" as tcpc;
 use "../core/conn.cst" as conn;
 
@@ -34,23 +35,68 @@ fn connect_ip4(ip as i64, port as i64) as *conn.Conn {
 
 // --- listen / accept ---
 
-// Bind+listen on a host-byte-order IPv4 + port. Returns server fd or <0.
-fn listen(ip as i64, port as i64) as i64 {
+// A bound, listening socket. A struct rather than a bare fd so that closing a
+// listener goes through this module like everything else — callers above the
+// transport never handle a descriptor.
+struct Listener {
+    fd as i64;
+}
+
+// Bind+listen on a host-byte-order IPv4 + port.
+// `ok` is 0 on success; on failure it carries the negative -errno from bind or
+// listen, and `fd` is that same value.
+struct ListenResult {
+    l  as Listener;
+    ok as i64;
+}
+
+fn listen(ip as i64, port as i64) as ListenResult {
     let is [16]u8 as buf;
     let is net.Addr as a = net.addr_init(cast(*u8, &buf), ip, port);
-    return net.tcp_listen(a);
+    let is i64 as fd = net.tcp_listen(a);
+    let is ListenResult as r;
+    r.l.fd = fd;
+    r.ok = 0;
+    if (fd < 0) { r.ok = fd; }
+    return r;
 }
 
 // Listen on 0.0.0.0:port.
-fn listen_any(port as i64) as i64 {
+fn listen_any(port as i64) as ListenResult {
     return listen(net.INADDR_ANY, port);
 }
 
-// Accept one connection, returning it as a *Conn (or null on error).
-fn accept_conn(server_fd as i64) as *conn.Conn {
-    let is i64 as fd = net.tcp_accept(server_fd, cast(*u8, 0));
+// Listen on 127.0.0.1:port — a service that must not leave the machine.
+fn listen_loopback(port as i64) as ListenResult {
+    return listen(net.INADDR_LOOPBACK, port);
+}
+
+// Accept one connection, returning it as a *Conn (or null on error). The
+// peer's address is captured into the Conn, so a server can log or ACL on it
+// (tcpc.conn_peer_ip / conn_peer_port).
+fn accept_conn(l as *Listener) as *conn.Conn {
+    let is [16]u8 as peer;
+    mem.core.memset(cast(*u8, &peer), cast(i32, 0), 16);
+    let is i64 as fd = net.tcp_accept(l.fd, cast(*u8, &peer));
     if (fd < 0) { return cast(*conn.Conn, 0); }
-    return tcpc.conn_from_fd(fd);
+    return tcpc.conn_from_fd_peer(fd, cast(*u8, &peer));
+}
+
+// Stop accepting and release the socket. Idempotent.
+fn listener_close(l as *Listener) as void {
+    if (l.fd < 0) { return; }
+    net.close(l.fd);
+    l.fd = 0 - 1;
+}
+
+// The raw fd behind a Listener (to register it with a poller).
+fn listener_fd(l as *Listener) as i64 {
+    return l.fd;
+}
+
+// Wait until a Listener has a connection ready (poll, ms timeout).
+fn listener_wait(l as *Listener, timeout_ms as i64) as i64 {
+    return net.wait_readable(l.fd, timeout_ms);
 }
 
 // --- socket tuning (pass-throughs; operate on the fd behind a Conn) ---

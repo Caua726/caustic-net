@@ -1,0 +1,509 @@
+// =======================================================
+// caustic-net/proto/http1.cst
+// HTTP/1.1 client — request building, response head parsing,
+// and the three body framings a server may choose.
+//
+// Everything reads through core/bufread.cst over a *Conn, so this
+// module is identical over TLS: it never learns which it is on.
+//
+// Body framing is the part that goes wrong quietly. A response is
+// delimited by exactly one of:
+//   Transfer-Encoding: chunked   — size-prefixed chunks, 0 ends it
+//   Content-Length: N            — exactly N bytes
+//   neither                      — until the connection closes
+// chunked WINS over Content-Length when both are present; trusting
+// the length instead is the classic request-smuggling bug, so a
+// response carrying both is rejected outright here.
+// =======================================================
+
+use "../core/conn.cst"    as conn;
+use "../core/bufread.cst" as bufread;
+use "../core/bytes.cst"   as bytes;
+use "./url.cst"           as url;
+
+// Sentinels, past url.cst's -1200 block.
+let is i64 as HTTP_ERR_STATUS  with imut = 0 - 1300;   // malformed status line
+let is i64 as HTTP_ERR_HEADER  with imut = 0 - 1301;   // malformed header line
+let is i64 as HTTP_ERR_SPACE   with imut = 0 - 1302;   // header block too large
+let is i64 as HTTP_ERR_CHUNK   with imut = 0 - 1303;   // malformed chunk framing
+let is i64 as HTTP_ERR_SMUGGLE with imut = 0 - 1304;   // chunked AND Content-Length
+
+// Body framing modes.
+let is i64 as BODY_NONE    with imut = 0;   // no body is possible (204, HEAD, ...)
+let is i64 as BODY_LENGTH  with imut = 1;
+let is i64 as BODY_CHUNKED with imut = 2;
+let is i64 as BODY_EOF     with imut = 3;
+
+let is i64 as MAX_LINE with imut = 8192;
+
+// =======================================================
+// Request building
+//
+// Accumulates into a Bytes, then goes out in one write — a request
+// dribbled header-by-header costs a packet each and trips Nagle.
+// =======================================================
+
+fn _slen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+fn _lower(c as u8) as u8 {
+    if (c >= 65 && c <= 90) { return cast(u8, cast(i64, c) + 32); }
+    return c;
+}
+
+// "METHOD target HTTP/1.1\r\n"
+fn req_begin(b as *bytes.Bytes, method as *u8, target as *u8) as i64 {
+    if (bytes.bytes_append_str(b, method) < 0) { return HTTP_ERR_SPACE; }
+    if (bytes.bytes_push(b, cast(u8, 32)) < 0) { return HTTP_ERR_SPACE; }
+    if (bytes.bytes_append_str(b, target) < 0) { return HTTP_ERR_SPACE; }
+    if (bytes.bytes_append_str(b, " HTTP/1.1\r\n") < 0) { return HTTP_ERR_SPACE; }
+    return 0;
+}
+
+// "Name: value\r\n"
+fn req_header(b as *bytes.Bytes, name as *u8, value as *u8) as i64 {
+    if (bytes.bytes_append_str(b, name) < 0) { return HTTP_ERR_SPACE; }
+    if (bytes.bytes_append_str(b, ": ") < 0) { return HTTP_ERR_SPACE; }
+    if (bytes.bytes_append_str(b, value) < 0) { return HTTP_ERR_SPACE; }
+    if (bytes.bytes_append_str(b, "\r\n") < 0) { return HTTP_ERR_SPACE; }
+    return 0;
+}
+
+fn _append_int(b as *bytes.Bytes, v as i64) as i64 {
+    if (v == 0) { return bytes.bytes_push(b, cast(u8, 48)); }
+    let is [24]u8 as d;
+    let is i64 as n with mut = 0;
+    let is i64 as x with mut = v;
+    if (x < 0) {
+        if (bytes.bytes_push(b, cast(u8, 45)) < 0) { return 0 - 1; }
+        x = 0 - x;
+    }
+    while (x > 0) { d[n] = cast(u8, 48 + (x % 10)); n = n + 1; x = x / 10; }
+    while (n > 0) {
+        n = n - 1;
+        if (bytes.bytes_push(b, d[n]) < 0) { return 0 - 1; }
+    }
+    return 0;
+}
+
+fn req_header_int(b as *bytes.Bytes, name as *u8, value as i64) as i64 {
+    if (bytes.bytes_append_str(b, name) < 0) { return HTTP_ERR_SPACE; }
+    if (bytes.bytes_append_str(b, ": ") < 0) { return HTTP_ERR_SPACE; }
+    if (_append_int(b, value) < 0) { return HTTP_ERR_SPACE; }
+    if (bytes.bytes_append_str(b, "\r\n") < 0) { return HTTP_ERR_SPACE; }
+    return 0;
+}
+
+// The blank line that ends the head.
+fn req_end(b as *bytes.Bytes) as i64 {
+    if (bytes.bytes_append_str(b, "\r\n") < 0) { return HTTP_ERR_SPACE; }
+    return 0;
+}
+
+// Build a complete request head for `u`. Sets the two headers a 1.1 server is
+// entitled to expect — Host (mandatory) and Connection — and leaves the Bytes
+// open so a caller can add more before req_end.
+fn req_for_url(b as *bytes.Bytes, method as *u8, u as *url.Url, keepalive as i64) as i64 {
+    let is [2048]u8 as target;
+    let is [512]u8 as host;
+    if (url.url_request_target(u, cast(*u8, &target), 2048) < 0) { return HTTP_ERR_SPACE; }
+    if (url.url_host_header(u, cast(*u8, &host), 512) < 0) { return HTTP_ERR_SPACE; }
+
+    let is i64 as rc with mut = req_begin(b, method, cast(*u8, &target));
+    if (rc < 0) { return rc; }
+    rc = req_header(b, "Host", cast(*u8, &host));
+    if (rc < 0) { return rc; }
+    if (keepalive == 1) { rc = req_header(b, "Connection", "keep-alive"); }
+    else { rc = req_header(b, "Connection", "close"); }
+    return rc;
+}
+
+// Write an accumulated request head (and optional body) to the connection.
+fn req_send(c as *conn.Conn, b as *bytes.Bytes) as i64 {
+    return conn.conn_write_all(c, b.ptr, b.len);
+}
+
+// =======================================================
+// Response head
+// =======================================================
+
+struct Response {
+    ok     as i64;   // 0 parsed, else HTTP_ERR_*
+    status as i64;   // 100..599
+    minor  as i64;   // the x in HTTP/1.x
+
+    hdr     as *u8;  // header lines, each NUL-terminated, back to back
+    hdr_len as i64;  // bytes used in hdr
+    nhdr    as i64;  // how many lines
+
+    content_length as i64;   // -1 when absent
+    chunked        as i64;
+    close          as i64;   // 1 when the server said Connection: close
+}
+
+// Compare a header line's NAME (up to ':') against `name`, case-insensitively.
+fn _name_eq(line as *u8, name as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (name[i] != 0) {
+        if (line[i] == 0) { return 0; }
+        if (_lower(line[i]) != _lower(name[i])) { return 0; }
+        i = i + 1;
+    }
+    if (line[i] != 58) { return 0; }                    // must end exactly at ':'
+    return 1;
+}
+
+// Pointer to a header line's value: past ':' and any leading spaces/tabs.
+fn _value_of(line as *u8) as *u8 {
+    let is i64 as i with mut = 0;
+    while (line[i] != 0 && line[i] != 58) { i = i + 1; }
+    if (line[i] == 58) { i = i + 1; }
+    while (line[i] == 32 || line[i] == 9) { i = i + 1; }
+    return cast(*u8, cast(i64, line) + i);
+}
+
+// Case-insensitive "does this value contain `tok` as a token".
+fn _value_has(v as *u8, tok as *u8) as i64 {
+    let is i64 as tn = _slen(tok);
+    let is i64 as i with mut = 0;
+    while (v[i] != 0) {
+        let is i64 as k with mut = 0;
+        while (k < tn && v[i + k] != 0 && _lower(v[i + k]) == _lower(tok[k])) { k = k + 1; }
+        if (k == tn) {
+            // token must be delimited, so "chunkedx" does not match "chunked"
+            let is u8 as after = v[i + k];
+            if (after == 0 || after == 44 || after == 32 || after == 9 || after == 59) {
+                if (i == 0) { return 1; }
+                let is u8 as before = v[i - 1];
+                if (before == 44 || before == 32 || before == 9) { return 1; }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _parse_int(s as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    let is i64 as v with mut = 0;
+    let is i64 as any with mut = 0;
+    while (s[i] == 32 || s[i] == 9) { i = i + 1; }
+    while (s[i] >= 48 && s[i] <= 57) {
+        v = v * 10 + (cast(i64, s[i]) - 48);
+        if (v < 0) { return 0 - 1; }                    // overflow
+        any = 1;
+        i = i + 1;
+    }
+    if (any == 0) { return 0 - 1; }
+    return v;
+}
+
+// Read the status line and every header into `hdrbuf`.
+// Returns 0 on success, or a negative HTTP_ERR_* / -errno.
+fn resp_read_head(br as *bufread.BufReader, r as *Response,
+                  hdrbuf as *u8, hdrmax as i64) as i64 {
+    r.ok = 0; r.status = 0; r.minor = 1;
+    r.hdr = hdrbuf; r.hdr_len = 0; r.nhdr = 0;
+    r.content_length = 0 - 1; r.chunked = 0; r.close = 0;
+
+    let is [8192]u8 as line;
+
+    // --- status line: "HTTP/1.x SSS reason" ---
+    let is i64 as n with mut = bufread.br_read_line(br, cast(*u8, &line), MAX_LINE);
+    if (n < 0) { r.ok = n; return n; }
+    if (n < 12) { r.ok = HTTP_ERR_STATUS; return HTTP_ERR_STATUS; }
+    if (line[0] != 72 || line[1] != 84 || line[2] != 84 || line[3] != 80) {   // "HTTP"
+        r.ok = HTTP_ERR_STATUS; return HTTP_ERR_STATUS;
+    }
+    if (line[4] != 47 || line[5] != 49 || line[6] != 46) {                    // "/1."
+        r.ok = HTTP_ERR_STATUS; return HTTP_ERR_STATUS;
+    }
+    if (line[7] < 48 || line[7] > 57) { r.ok = HTTP_ERR_STATUS; return HTTP_ERR_STATUS; }
+    r.minor = cast(i64, line[7]) - 48;
+    if (line[8] != 32) { r.ok = HTTP_ERR_STATUS; return HTTP_ERR_STATUS; }
+    let is i64 as i with mut = 9;
+    if (line[i] < 48 || line[i] > 57) { r.ok = HTTP_ERR_STATUS; return HTTP_ERR_STATUS; }
+    let is i64 as st with mut = 0;
+    while (i < n && line[i] >= 48 && line[i] <= 57) {
+        st = st * 10 + (cast(i64, line[i]) - 48);
+        i = i + 1;
+    }
+    if (st < 100 || st > 599) { r.ok = HTTP_ERR_STATUS; return HTTP_ERR_STATUS; }
+    r.status = st;
+
+    // --- headers, until the blank line ---
+    while (1 == 1) {
+        n = bufread.br_read_line(br, cast(*u8, &line), MAX_LINE);
+        if (n < 0) { r.ok = n; return n; }
+        if (n == 0) { break; }                          // end of the head
+
+        // A header must have a name, a colon, and no space before the colon.
+        let is i64 as colon with mut = 0 - 1;
+        let is i64 as k with mut = 0;
+        while (k < n) {
+            if (line[k] == 58) { colon = k; break; }
+            k = k + 1;
+        }
+        if (colon <= 0) { r.ok = HTTP_ERR_HEADER; return HTTP_ERR_HEADER; }
+        if (line[colon - 1] == 32 || line[colon - 1] == 9) {
+            r.ok = HTTP_ERR_HEADER; return HTTP_ERR_HEADER;
+        }
+
+        if (r.hdr_len + n + 1 > hdrmax) { r.ok = HTTP_ERR_SPACE; return HTTP_ERR_SPACE; }
+        let is i64 as w with mut = 0;
+        while (w < n) { hdrbuf[r.hdr_len + w] = line[w]; w = w + 1; }
+        hdrbuf[r.hdr_len + n] = cast(u8, 0);
+
+        let is *u8 as stored = cast(*u8, cast(i64, hdrbuf) + r.hdr_len);
+        r.hdr_len = r.hdr_len + n + 1;
+        r.nhdr = r.nhdr + 1;
+
+        if (_name_eq(stored, "Content-Length") == 1) {
+            let is i64 as cl = _parse_int(_value_of(stored));
+            if (cl < 0) { r.ok = HTTP_ERR_HEADER; return HTTP_ERR_HEADER; }
+            r.content_length = cl;
+        }
+        if (_name_eq(stored, "Transfer-Encoding") == 1) {
+            if (_value_has(_value_of(stored), "chunked") == 1) { r.chunked = 1; }
+        }
+        if (_name_eq(stored, "Connection") == 1) {
+            if (_value_has(_value_of(stored), "close") == 1) { r.close = 1; }
+        }
+    }
+
+    // Both framings at once is how a request is smuggled past a proxy that
+    // trusts one while the origin trusts the other. Refuse the response.
+    if (r.chunked == 1 && r.content_length >= 0) {
+        r.ok = HTTP_ERR_SMUGGLE;
+        return HTTP_ERR_SMUGGLE;
+    }
+    return 0;
+}
+
+// Copy the value of `name` into out. Returns its length, -1 when absent, or
+// HTTP_ERR_SPACE. On a repeated header this returns the FIRST occurrence.
+fn resp_header(r as *Response, name as *u8, out as *u8, max as i64) as i64 {
+    let is i64 as off with mut = 0;
+    let is i64 as seen with mut = 0;
+    while (seen < r.nhdr) {
+        let is *u8 as line = cast(*u8, cast(i64, r.hdr) + off);
+        if (_name_eq(line, name) == 1) {
+            let is *u8 as v = _value_of(line);
+            let is i64 as vn = _slen(v);
+            if (vn + 1 > max) { return HTTP_ERR_SPACE; }
+            let is i64 as i with mut = 0;
+            while (i < vn) { out[i] = v[i]; i = i + 1; }
+            out[vn] = cast(u8, 0);
+            return vn;
+        }
+        off = off + _slen(line) + 1;
+        seen = seen + 1;
+    }
+    return 0 - 1;
+}
+
+fn resp_has_header(r as *Response, name as *u8) as i64 {
+    let is i64 as off with mut = 0;
+    let is i64 as seen with mut = 0;
+    while (seen < r.nhdr) {
+        let is *u8 as line = cast(*u8, cast(i64, r.hdr) + off);
+        if (_name_eq(line, name) == 1) { return 1; }
+        off = off + _slen(line) + 1;
+        seen = seen + 1;
+    }
+    return 0;
+}
+
+// The i'th header line, as stored ("Name: value"). Null when out of range.
+fn resp_header_at(r as *Response, idx as i64) as *u8 {
+    if (idx < 0 || idx >= r.nhdr) { return cast(*u8, 0); }
+    let is i64 as off with mut = 0;
+    let is i64 as seen with mut = 0;
+    while (seen < idx) {
+        off = off + _slen(cast(*u8, cast(i64, r.hdr) + off)) + 1;
+        seen = seen + 1;
+    }
+    return cast(*u8, cast(i64, r.hdr) + off);
+}
+
+// =======================================================
+// Body
+// =======================================================
+
+struct BodyReader {
+    br   as *bufread.BufReader;
+    mode as i64;
+    left as i64;   // LENGTH: bytes remaining. CHUNKED: bytes left in this chunk.
+    done as i64;
+}
+
+// Decide the framing. `head_request` is 1 when the request was HEAD, whose
+// response carries Content-Length but no body at all.
+fn body_init(bd as *BodyReader, br as *bufread.BufReader,
+             r as *Response, head_request as i64) as void {
+    bd.br = br;
+    bd.left = 0;
+    bd.done = 0;
+
+    // 1xx, 204 and 304 are defined to have no body regardless of headers.
+    if (head_request == 1 || r.status == 204 || r.status == 304 ||
+        (r.status >= 100 && r.status < 200)) {
+        bd.mode = BODY_NONE;
+        bd.done = 1;
+        return;
+    }
+    if (r.chunked == 1) { bd.mode = BODY_CHUNKED; return; }
+    if (r.content_length >= 0) {
+        bd.mode = BODY_LENGTH;
+        bd.left = r.content_length;
+        if (bd.left == 0) { bd.done = 1; }
+        return;
+    }
+    bd.mode = BODY_EOF;
+}
+
+// Read the CRLF that terminates a chunk. Anything else is a framing error.
+fn _expect_blank(br as *bufread.BufReader) as i64 {
+    let is [8]u8 as t;
+    let is i64 as n = bufread.br_read_line(br, cast(*u8, &t), 8);
+    if (n < 0) { return n; }
+    if (n != 0) { return HTTP_ERR_CHUNK; }
+    return 0;
+}
+
+// Parse a chunk-size line: hex digits, optionally followed by ";extension".
+fn _chunk_size(line as *u8, n as i64) as i64 {
+    let is i64 as i with mut = 0;
+    let is i64 as v with mut = 0;
+    let is i64 as any with mut = 0;
+    while (i < n) {
+        let is u8 as c = line[i];
+        let is i64 as d with mut = 0 - 1;
+        if (c >= 48 && c <= 57)  { d = cast(i64, c) - 48; }
+        if (c >= 65 && c <= 70)  { d = cast(i64, c) - 55; }
+        if (c >= 97 && c <= 102) { d = cast(i64, c) - 87; }
+        if (d < 0) { break; }
+        v = v * 16 + d;
+        if (v < 0) { return HTTP_ERR_CHUNK; }           // overflow
+        any = 1;
+        i = i + 1;
+    }
+    if (any == 0) { return HTTP_ERR_CHUNK; }
+    // Only a chunk extension or trailing whitespace may follow the size.
+    while (i < n && (line[i] == 32 || line[i] == 9)) { i = i + 1; }
+    if (i < n && line[i] != 59) { return HTTP_ERR_CHUNK; }   // ';'
+    return v;
+}
+
+// Read up to `n` body bytes. Returns bytes read, 0 at the end of the body, or
+// a negative error. A short read is normal.
+fn body_read(bd as *BodyReader, out as *u8, n as i64) as i64 {
+    if (n <= 0) { return 0; }
+    if (bd.done == 1) { return 0; }
+
+    if (bd.mode == BODY_NONE) { return 0; }
+
+    if (bd.mode == BODY_EOF) {
+        let is i64 as k = bufread.br_read(bd.br, out, n);
+        if (k <= 0) { bd.done = 1; }
+        return k;
+    }
+
+    if (bd.mode == BODY_LENGTH) {
+        let is i64 as want with mut = n;
+        if (want > bd.left) { want = bd.left; }
+        let is i64 as k = bufread.br_read(bd.br, out, want);
+        if (k < 0) { return k; }
+        if (k == 0) { bd.done = 1; return 0; }          // truncated by EOF
+        bd.left = bd.left - k;
+        if (bd.left == 0) { bd.done = 1; }
+        return k;
+    }
+
+    // --- chunked ---
+    if (bd.left == 0) {
+        let is [8192]u8 as line;
+        let is i64 as ln = bufread.br_read_line(bd.br, cast(*u8, &line), MAX_LINE);
+        if (ln < 0) { return ln; }
+        let is i64 as sz = _chunk_size(cast(*u8, &line), ln);
+        if (sz < 0) { return sz; }
+        if (sz == 0) {
+            // Last chunk. Trailers may follow, ending at a blank line.
+            while (1 == 1) {
+                let is i64 as tn = bufread.br_read_line(bd.br, cast(*u8, &line), MAX_LINE);
+                if (tn < 0) { return tn; }
+                if (tn == 0) { break; }
+            }
+            bd.done = 1;
+            return 0;
+        }
+        bd.left = sz;
+    }
+
+    let is i64 as want with mut = n;
+    if (want > bd.left) { want = bd.left; }
+    let is i64 as k = bufread.br_read(bd.br, out, want);
+    if (k < 0) { return k; }
+    if (k == 0) { return HTTP_ERR_CHUNK; }              // EOF mid-chunk
+    bd.left = bd.left - k;
+    if (bd.left == 0) {
+        let is i64 as rc = _expect_blank(bd.br);        // the CRLF after the chunk
+        if (rc < 0) { return rc; }
+    }
+    return k;
+}
+
+// Drain the whole body into `b`, refusing to exceed `limit` bytes.
+// Returns the total, or a negative error. `limit` <= 0 means no cap, which a
+// client should only use against a server it trusts.
+fn body_read_all(bd as *BodyReader, b as *bytes.Bytes, limit as i64) as i64 {
+    let is [4096]u8 as chunk;
+    let is i64 as total with mut = 0;
+    while (1 == 1) {
+        let is i64 as k = body_read(bd, cast(*u8, &chunk), 4096);
+        if (k < 0) { return k; }
+        if (k == 0) { return total; }
+        if (limit > 0 && total + k > limit) { return HTTP_ERR_SPACE; }
+        if (bytes.bytes_append(b, cast(*u8, &chunk), k) < 0) { return HTTP_ERR_SPACE; }
+        total = total + k;
+    }
+    return total;
+}
+
+// Throw the body away — what a redirect handler does before reusing the
+// connection. Returns bytes discarded, or a negative error.
+fn body_drain(bd as *BodyReader) as i64 {
+    let is [4096]u8 as chunk;
+    let is i64 as total with mut = 0;
+    while (1 == 1) {
+        let is i64 as k = body_read(bd, cast(*u8, &chunk), 4096);
+        if (k < 0) { return k; }
+        if (k == 0) { return total; }
+        total = total + k;
+    }
+    return total;
+}
+
+// Whether this response leaves the connection reusable: the body must have
+// been fully consumed, the server must not have said close, and an
+// EOF-delimited body always ends the connection by definition.
+fn conn_reusable(r as *Response, bd as *BodyReader) as i64 {
+    if (r.close == 1) { return 0; }
+    if (bd.mode == BODY_EOF) { return 0; }
+    if (bd.done != 1) { return 0; }
+    if (r.minor == 0) { return 0; }                     // HTTP/1.0 defaults to close
+    return 1;
+}
+
+fn http_err_name(e as i64) as *u8 {
+    if (e == 0)                { return "HTTP_OK"; }
+    if (e == HTTP_ERR_STATUS)  { return "HTTP_ERR_STATUS"; }
+    if (e == HTTP_ERR_HEADER)  { return "HTTP_ERR_HEADER"; }
+    if (e == HTTP_ERR_SPACE)   { return "HTTP_ERR_SPACE"; }
+    if (e == HTTP_ERR_CHUNK)   { return "HTTP_ERR_CHUNK"; }
+    if (e == HTTP_ERR_SMUGGLE) { return "HTTP_ERR_SMUGGLE"; }
+    return "HTTP_ERR_UNKNOWN";
+}

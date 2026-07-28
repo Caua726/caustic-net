@@ -148,8 +148,13 @@ fn main(argc as i64, argv as *u8) as i32 {
 
     let is i64 as fail with mut = 0;
     fail = fail + cast(i64, compile_lib(ccp, "caustic_net.cst"));
-    fail = fail + cast(i64, run_case(ccp, "test_conn", "tests/test_conn.cst"));
-    fail = fail + cast(i64, run_case(ccp, "tcp_echo",  "examples/tcp_echo.cst"));
+    fail = fail + cast(i64, run_case(ccp, "test_conn",    "tests/test_conn.cst"));
+    fail = fail + cast(i64, run_case(ccp, "test_bytes",   "tests/test_bytes.cst"));
+    fail = fail + cast(i64, run_case(ccp, "test_bufread", "tests/test_bufread.cst"));
+    fail = fail + cast(i64, run_case(ccp, "test_url",     "tests/test_url.cst"));
+    fail = fail + cast(i64, run_case(ccp, "test_http1",   "tests/test_http1.cst"));
+    fail = fail + cast(i64, run_case(ccp, "tcp_echo",     "examples/tcp_echo.cst"));
+    fail = fail + cast(i64, run_case(ccp, "http_get",     "examples/http_get.cst"));
 
     if (fail == 0) { io.write_str(1, "all green\n"); return 0; }
     io.write_str(1, "FAILURES: "); io.write_int(1, fail); io.write_str(1, "\n");

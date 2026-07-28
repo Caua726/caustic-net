@@ -3,14 +3,16 @@
 **A networking stack in [Caustic](https://github.com/Caua726/Caustic) — sockets up to `fetch()`, with no libc and no OpenSSL.**
 
 ![version](https://img.shields.io/badge/version-0.1.0-blue)
-![status](https://img.shields.io/badge/status-early%20%C2%B7%20phases%200--1%20landed-yellow)
+![status](https://img.shields.io/badge/status-early%20%C2%B7%20phases%200--3%20landed-yellow)
 ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
-> **Early.** Phases 0 and 1 — the `Conn` abstraction and TCP — are landed and
-> green. DNS, URL, HTTP, WebSocket, TLS, the server and `fetch()` are designed
-> and **not yet written**. The [status table](#status) is the authority on what
-> exists; the layout below marks everything else with `*`.
+> **Early.** The `Conn` abstraction, TCP, the buffered reader, URL parsing and
+> the HTTP/1.1 client are landed and green — `examples/http_get` runs a real
+> request over a real socket and reassembles a chunked response. DNS, WebSocket,
+> TLS, the server and `fetch()` are designed and **not yet written**. The
+> [status table](#status) is the authority on what exists; the layout below
+> marks everything else with `*`.
 
 The plan is a stack built on the Caustic standard library's `std/net.cst`
 (TCP/UDP/poll floor), with everything above it written here in Caustic —
@@ -39,9 +41,9 @@ only `call()` sites are the four typed dispatchers in `core/conn.cst`.
 ## Layout
 
 ```
-core/        conn (the vtable) · errno · bytes (Bytes/Slice)
+core/        conn (the vtable) · errno · bytes (Bytes/Slice) · bufread (lines)
 transport/   tcp_conn (TCP→Conn) · transport (dial/listen/accept/tuning) · epoll*
-proto/       url* · dns* · headers* · http1* · websocket* · flate* · cookie*
+proto/       url · http1 · dns* · websocket* · flate* · cookie*
 tls/         records · handshake · keyschedule · client (implements Conn)*
 server/      router · threaded · reactor*
 client/      fetch (url→dns→connect→tls→http→redirect→decompress)*
@@ -67,6 +69,10 @@ the same reason.
 - **Memory:** manual, via the stdlib `bins` allocator per module; `Conn` boxes +
   backend contexts share one heap (`core/conn.cst` `cn_alloc`/`cn_free`), freed by
   `conn_free`. Hot path (`conn_read`/`conn_write`) is zero-alloc raw `*u8+len`.
+  `Bytes` is the exception: `bins` refuses any single request above its top bin,
+  so a buffer past `SMALL_MAX` (16 KiB) is page-allocated instead. `cap` is
+  always the exact size handed to the allocator, which is how a free knows
+  which of the two owns the pointer.
 - **Naming:** `snake_case` fns, `PascalCase` structs, `_prefix` private, vtable
   backends named `_<proto>_<op>`, `SCREAMING` constants `with imut`.
 
@@ -74,11 +80,14 @@ the same reason.
 
 | Phase | Module | State |
 |---|---|---|
-| 0 | `core/` conn · errno · bytes | ✅ green (`tests/test_conn` mock-Conn dispatch) |
-| 1 | `transport/` tcp_conn · transport | ✅ green (`examples/tcp_echo` round-trip) |
+| 0 | `core/` conn · errno · bytes | ✅ green (`tests/test_conn` mock-Conn dispatch, `tests/test_bytes` growth to 1 MiB) |
+| 0 | `core/bufread` — lines + exact counts over `Conn` | ✅ green (`tests/test_bufread`, incl. lines split one byte per read) |
+| 1 | `transport/` tcp_conn · transport · `Listener` · peer addr · deadlines | ✅ green (`examples/tcp_echo` round-trip) |
 | 1 | epoll reactor + IPv6 addrs | ⏳ next |
-| 2 | url · dns | ⏳ |
-| 3 | http/1.1 client (+headers, chunked, cookies, redirects) | ⏳ |
+| 2 | `proto/url` | ✅ green (`tests/test_url`) |
+| 2 | dns | ⏳ (UDP `sendto` is broken on the Windows target upstream) |
+| 3 | `proto/http1` client — request build, head parse, body framing | ✅ green (`tests/test_http1`, `examples/http_get` over a real socket) |
+| 3 | cookies · redirects · keep-alive pooling | ⏳ |
 | 4 | server (reactor + thread-per-conn) | ⏳ |
 | 5 | websocket (sha1 + base64) | ⏳ |
 | 6 | flate (gzip/deflate inflate) | ⏳ |
@@ -93,7 +102,7 @@ resolves from the install path, so `use "std/net.cst"` just works.
 ```sh
 caustic-mk run test        # compile-check the library, then build and run every case
 caustic-mk run test-opt    # the same, through the optimizing backend
-caustic-mk build tcp_echo  # the example, to run by hand
+caustic-mk build http_get  # the end-to-end example, to run by hand
 ```
 
 Green is exit 0. The runner is `tests/run.cst`, written in Caustic, so it

@@ -1,0 +1,185 @@
+// =======================================================
+// caustic-net/tests/test_url.cst
+// Covers proto/url.cst.
+//
+// The interesting cases are the ones that make naive splitters
+// produce a wrong HOST, because a wrong host is a request sent to
+// the wrong machine: userinfo containing '@', an IPv6 literal full
+// of colons that are not a port separator, and a port that
+// overflows u16.
+//
+// Exit 0 = all pass. Non-zero = the numbered check that failed.
+// =======================================================
+
+use "../proto/url.cst" as url;
+
+fn eq(a as *u8, b as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (a[i] != 0 && b[i] != 0) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    if (a[i] != b[i]) { return 0; }
+    return 1;
+}
+
+fn main() as i32 {
+    let is [256]u8 as b;
+
+    // ---- 1: the ordinary case, every part present
+    let is url.Url as u with mut =
+        url.url_parse("https://user:pw@example.com:8443/a/b?x=1&y=2#frag");
+    if (u.ok != 0) { return 1; }
+    if (url.url_scheme(&u, cast(*u8, &b), 256) < 0) { return 2; }
+    if (eq(cast(*u8, &b), "https") == 0) { return 3; }
+    url.url_host(&u, cast(*u8, &b), 256);
+    if (eq(cast(*u8, &b), "example.com") == 0) { return 4; }
+    if (u.port != 8443) { return 5; }
+    if (u.tls != 1) { return 6; }
+    url.url_user(&u, cast(*u8, &b), 256);
+    if (eq(cast(*u8, &b), "user:pw") == 0) { return 7; }
+    url.url_path(&u, cast(*u8, &b), 256);
+    if (eq(cast(*u8, &b), "/a/b") == 0) { return 8; }
+    url.url_query(&u, cast(*u8, &b), 256);
+    if (eq(cast(*u8, &b), "x=1&y=2") == 0) { return 9; }
+    url.url_fragment(&u, cast(*u8, &b), 256);
+    if (eq(cast(*u8, &b), "frag") == 0) { return 10; }
+
+    // The request line carries path+query and NEVER the fragment.
+    url.url_request_target(&u, cast(*u8, &b), 256);
+    if (eq(cast(*u8, &b), "/a/b?x=1&y=2") == 0) { return 11; }
+
+    // ---- 12: no path at all defaults to "/" — a bare origin is still a GET /
+    u = url.url_parse("http://example.com");
+    if (u.ok != 0) { return 12; }
+    if (u.port != 80) { return 13; }
+    if (u.tls != 0) { return 14; }
+    url.url_path(&u, cast(*u8, &b), 256);
+    if (eq(cast(*u8, &b), "/") == 0) { return 15; }
+    url.url_request_target(&u, cast(*u8, &b), 256);
+    if (eq(cast(*u8, &b), "/") == 0) { return 16; }
+    // Default port must be OMITTED from the Host header.
+    url.url_host_header(&u, cast(*u8, &b), 256);
+    if (eq(cast(*u8, &b), "example.com") == 0) { return 17; }
+
+    // ---- 18: a NON-default port must be present in the Host header
+    u = url.url_parse("http://example.com:8080/");
+    if (u.ok != 0) { return 18; }
+    url.url_host_header(&u, cast(*u8, &b), 256);
+    if (eq(cast(*u8, &b), "example.com:8080") == 0) { return 19; }
+    // 443 is default for https but NOT for http, so it must show.
+    u = url.url_parse("http://example.com:443/");
+    url.url_host_header(&u, cast(*u8, &b), 256);
+    if (eq(cast(*u8, &b), "example.com:443") == 0) { return 20; }
+    // ...and the same number IS the default under https, so it must not.
+    u = url.url_parse("https://example.com:443/");
+    url.url_host_header(&u, cast(*u8, &b), 256);
+    if (eq(cast(*u8, &b), "example.com") == 0) { return 21; }
+
+    // ---- 22: userinfo containing '@'. The LAST '@' delimits, so the host is
+    // ---- "real.host" — splitting on the first '@' would send this to "b".
+    u = url.url_parse("http://a@b:c@real.host/p");
+    if (u.ok != 0) { return 22; }
+    url.url_host(&u, cast(*u8, &b), 256);
+    if (eq(cast(*u8, &b), "real.host") == 0) { return 23; }
+    url.url_user(&u, cast(*u8, &b), 256);
+    if (eq(cast(*u8, &b), "a@b:c") == 0) { return 24; }
+
+    // ---- 25: IPv6 literal. Colons inside the brackets are NOT a port.
+    u = url.url_parse("http://[2001:db8::1]/x");
+    if (u.ok != 0) { return 25; }
+    if (u.ip6 != 1) { return 26; }
+    url.url_host(&u, cast(*u8, &b), 256);            // host has NO brackets...
+    if (eq(cast(*u8, &b), "2001:db8::1") == 0) { return 27; }
+    if (u.port != 80) { return 28; }
+    url.url_host_header(&u, cast(*u8, &b), 256);     // ...but the header does
+    if (eq(cast(*u8, &b), "[2001:db8::1]") == 0) { return 29; }
+
+    // IPv6 WITH an explicit port: only the colon after ']' counts.
+    u = url.url_parse("https://[::1]:8443/");
+    if (u.ok != 0) { return 30; }
+    url.url_host(&u, cast(*u8, &b), 256);
+    if (eq(cast(*u8, &b), "::1") == 0) { return 31; }
+    if (u.port != 8443) { return 32; }
+    url.url_host_header(&u, cast(*u8, &b), 256);
+    if (eq(cast(*u8, &b), "[::1]:8443") == 0) { return 33; }
+
+    // ---- 34: scheme case-insensitivity — HTTPS:// is still TLS on 443
+    u = url.url_parse("HTTPS://Example.COM/");
+    if (u.ok != 0) { return 34; }
+    if (u.tls != 1 || u.port != 443) { return 35; }
+    if (url.url_scheme_is(&u, "https") != 1) { return 36; }
+    if (url.url_host_is(&u, "example.com") != 1) { return 37; }
+
+    // ---- 38: query present but empty, and a fragment with no query
+    u = url.url_parse("http://h/p?");
+    if (u.ok != 0 || u.query_len != 0) { return 38; }
+    url.url_request_target(&u, cast(*u8, &b), 256);
+    if (eq(cast(*u8, &b), "/p") == 0) { return 39; }
+    u = url.url_parse("http://h/p#only-frag");
+    if (u.ok != 0) { return 40; }
+    url.url_request_target(&u, cast(*u8, &b), 256);
+    if (eq(cast(*u8, &b), "/p") == 0) { return 41; }
+
+    // ---- 42: malformed inputs must be REFUSED, not silently half-parsed
+    if (url.url_parse("").ok            != url.URL_ERR_EMPTY)  { return 42; }
+    if (url.url_parse("example.com").ok != url.URL_ERR_SCHEME) { return 43; }
+    if (url.url_parse("http:/x").ok     != url.URL_ERR_SCHEME) { return 44; }
+    if (url.url_parse("1http://x").ok   != url.URL_ERR_SCHEME) { return 45; }
+    if (url.url_parse("http:///p").ok   != url.URL_ERR_HOST)   { return 46; }
+    if (url.url_parse("http://[::1/p").ok != url.URL_ERR_HOST) { return 47; }
+    // A port that overflows u16 is a hard error, not a truncation.
+    if (url.url_parse("http://h:99999/").ok != url.URL_ERR_PORT) { return 48; }
+    if (url.url_parse("http://h:80x/").ok   != url.URL_ERR_PORT) { return 49; }
+    if (url.url_parse("http://h:/").ok      != url.URL_ERR_PORT) { return 50; }
+    // 65535 is the largest legal port and must still pass.
+    u = url.url_parse("http://h:65535/");
+    if (u.ok != 0 || u.port != 65535) { return 51; }
+
+    // ---- 52: a buffer too small reports it instead of overflowing
+    let is [4]u8 as tiny;
+    u = url.url_parse("http://averylonghostname.example/");
+    if (u.ok != 0) { return 52; }
+    if (url.url_host(&u, cast(*u8, &tiny), 4) != url.URL_ERR_SPACE) { return 53; }
+    // A host that exactly fills the buffer (3 chars + NUL) still fits.
+    u = url.url_parse("http://abc/");
+    if (url.url_host(&u, cast(*u8, &tiny), 4) != 3) { return 54; }
+
+    // ---- 55: percent-decoding
+    let is [64]u8 as dec;
+    let is i64 as dn with mut = url.pct_decode("a%20b%2Fc", 9, cast(*u8, &dec), 64);
+    if (dn != 5) { return 55; }
+    if (eq(cast(*u8, &dec), "a b/c") == 0) { return 56; }
+    // %ZZ is not hex, so it stays literal rather than killing the parse.
+    dn = url.pct_decode("100%ZZ", 6, cast(*u8, &dec), 64);
+    if (dn != 6) { return 57; }
+    if (eq(cast(*u8, &dec), "100%ZZ") == 0) { return 58; }
+    // A '%' at the very end has no room for two digits — also literal.
+    dn = url.pct_decode("ab%", 3, cast(*u8, &dec), 64);
+    if (dn != 3) { return 59; }
+    if (eq(cast(*u8, &dec), "ab%") == 0) { return 60; }
+    // Lowercase hex decodes the same as uppercase.
+    dn = url.pct_decode("%2f%2F", 6, cast(*u8, &dec), 64);
+    if (dn != 2) { return 61; }
+    if (eq(cast(*u8, &dec), "//") == 0) { return 62; }
+
+    // ---- 63: percent-encoding a query component. '&' and '=' are separators
+    // ---- and MUST be escaped, or one value smuggles in extra parameters.
+    let is [64]u8 as enc;
+    let is i64 as en with mut = url.pct_encode("a b&c=d", 7, cast(*u8, &enc), 64);
+    if (eq(cast(*u8, &enc), "a%20b%26c%3Dd") == 0) { return 63; }
+    if (en != 13) { return 64; }
+    // Unreserved characters pass through untouched.
+    en = url.pct_encode("Az0-._~", 7, cast(*u8, &enc), 64);
+    if (eq(cast(*u8, &enc), "Az0-._~") == 0) { return 65; }
+    // Round trip.
+    let is [64]u8 as back;
+    url.pct_decode(cast(*u8, &enc), en, cast(*u8, &back), 64);
+    if (eq(cast(*u8, &back), "Az0-._~") == 0) { return 66; }
+
+    // A too-small output buffer is reported, not overrun.
+    let is [4]u8 as small;
+    if (url.pct_encode("a b&c", 5, cast(*u8, &small), 4) != url.URL_ERR_SPACE) { return 67; }
+
+    return 0;
+}

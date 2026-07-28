@@ -38,3 +38,9 @@ jobs:
 
       - name: Test
         run: caustic-mk run test
+
+      # The optimizing backend is a second code generator, not a flag: it has
+      # regressed the same source before. The Causticfile offers it, so CI has
+      # to be the thing that keeps the offer true.
+      - name: Test (optimizing backend)
+        run: caustic-mk run test-opt

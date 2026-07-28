@@ -12,6 +12,8 @@
 // =======================================================
 
 use "std/mem.cst" only bins, core as mem;
+use "std/time.cst" as time;
+use "./errno.cst" as errno;
 
 // --- Connection state codes (returned by the `state` vtable slot) ---
 let is i64 as CONN_OPEN   with imut = 0;   // usable
@@ -52,11 +54,47 @@ fn conn_state(c as *Conn) as i64 {
 
 // --- Loop helpers (mirror net.send_all / net.recv_all over the vtable) ---
 
+// A signal delivered mid-syscall surfaces as -EINTR and means nothing was
+// transferred, so the loops below retry rather than abort a whole message.
+// std/net does not retry, so this is the only place it happens.
+let is i64 as _EINTR with imut = 4;
+
+// --- Deadlines ---
+//
+// An absolute monotonic millisecond stamp; 0 means "no deadline". A deadline
+// bounds a whole multi-read operation, which a per-socket timeout cannot: a
+// peer that dribbles one byte per SO_RCVTIMEO window keeps a plain
+// conn_read_exact alive forever, and that is exactly the slow-loris shape.
+//
+// It is checked BETWEEN reads, so it can only fire if the individual reads
+// return. Pair it with tp.set_recv_timeout(conn, secs) on a blocking socket:
+// the socket timeout makes each read return -EAGAIN, and the deadline decides
+// whether to try again or give up.
+
+fn deadline_in(ms as i64) as i64 {
+    return time.now_ms() + ms;
+}
+
+fn deadline_expired(d as i64) as i64 {
+    if (d <= 0) { return 0; }
+    if (time.now_ms() >= d) { return 1; }
+    return 0;
+}
+
+// Milliseconds left, or -1 when there is no deadline. Never negative.
+fn deadline_remaining(d as i64) as i64 {
+    if (d <= 0) { return 0 - 1; }
+    let is i64 as left = d - time.now_ms();
+    if (left < 0) { return 0; }
+    return left;
+}
+
 // Write every byte. Returns total sent, or <0 on error, or partial on EOF.
 fn conn_write_all(c as *Conn, buf as *u8, len as i64) as i64 {
     let is i64 as sent with mut = 0;
     while (sent < len) {
         let is i64 as n = conn_write(c, cast(*u8, cast(i64, buf) + sent), len - sent);
+        if (n == 0 - _EINTR) { continue; }
         if (n < 0) { return n; }
         if (n == 0) {
             if (sent > 0) { return sent; }
@@ -72,11 +110,54 @@ fn conn_read_exact(c as *Conn, buf as *u8, len as i64) as i64 {
     let is i64 as got with mut = 0;
     while (got < len) {
         let is i64 as n = conn_read(c, cast(*u8, cast(i64, buf) + got), len - got);
+        if (n == 0 - _EINTR) { continue; }
         if (n < 0) { return n; }
         if (n == 0) { return got; }
         got = got + n;
     }
     return got;
+}
+
+// --- Deadline-bounded forms ---
+//
+// `deadline` is an absolute stamp from deadline_in(), or 0 for none (in which
+// case these behave exactly like the plain forms above). Returns -ETIMEDOUT
+// once the deadline passes with the transfer incomplete.
+//
+// -EAGAIN is retried only when there IS a deadline, because that is the
+// socket-timeout case and the deadline is what eventually stops it. With no
+// deadline it is handed back, so a non-blocking caller still drives readiness
+// itself instead of spinning here.
+
+fn conn_read_exact_by(c as *Conn, buf as *u8, len as i64, deadline as i64) as i64 {
+    let is i64 as got with mut = 0;
+    while (got < len) {
+        if (deadline_expired(deadline) == 1) { return 0 - errno.ETIMEDOUT; }
+        let is i64 as n = conn_read(c, cast(*u8, cast(i64, buf) + got), len - got);
+        if (n == 0 - _EINTR) { continue; }
+        if (n == 0 - errno.EAGAIN && deadline > 0) { continue; }
+        if (n < 0) { return n; }
+        if (n == 0) { return got; }
+        got = got + n;
+    }
+    return got;
+}
+
+fn conn_write_all_by(c as *Conn, buf as *u8, len as i64, deadline as i64) as i64 {
+    let is i64 as sent with mut = 0;
+    while (sent < len) {
+        if (deadline_expired(deadline) == 1) { return 0 - errno.ETIMEDOUT; }
+        let is i64 as n = conn_write(c, cast(*u8, cast(i64, buf) + sent), len - sent);
+        if (n == 0 - _EINTR) { continue; }
+        if (n == 0 - errno.EAGAIN && deadline > 0) { continue; }
+        if (n < 0) { return n; }
+        if (n == 0) {
+            if (sent > 0) { return sent; }
+            return 0 - 1;
+        }
+        sent = sent + n;
+    }
+    return sent;
 }
 
 // =======================================================
