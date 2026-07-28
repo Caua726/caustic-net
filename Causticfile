@@ -23,6 +23,7 @@ target "run"        { src "tests/run.cst"          out "build/run" }
 target "test_conn"  { src "tests/test_conn.cst"    out "build/test_conn" }
 target "test_bytes" { src "tests/test_bytes.cst"   out "build/test_bytes" }
 target "test_bufread" { src "tests/test_bufread.cst" out "build/test_bufread" }
+target "test_url"   { src "tests/test_url.cst"     out "build/test_url" }
 target "tcp_echo"   { src "examples/tcp_echo.cst"  out "build/tcp_echo" }
 
 // ── Scripts ──────────────────────────────────────────────────────────

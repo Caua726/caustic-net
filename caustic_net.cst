@@ -15,3 +15,4 @@ use "core/bytes.cst" as bytes;
 use "core/bufread.cst" as bufread;
 use "transport/tcp_conn.cst" as tcp;
 use "transport/transport.cst" as transport;
+use "proto/url.cst" as url;

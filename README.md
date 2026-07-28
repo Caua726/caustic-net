@@ -3,14 +3,14 @@
 **A networking stack in [Caustic](https://github.com/Caua726/Caustic) — sockets up to `fetch()`, with no libc and no OpenSSL.**
 
 ![version](https://img.shields.io/badge/version-0.1.0-blue)
-![status](https://img.shields.io/badge/status-early%20%C2%B7%20phases%200--1%20landed-yellow)
+![status](https://img.shields.io/badge/status-early%20%C2%B7%20phases%200--2%20landed-yellow)
 ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
-> **Early.** The `Conn` abstraction, TCP and the buffered reader are landed and
-> green. DNS, URL, HTTP, WebSocket, TLS, the server and `fetch()` are designed
-> and **not yet written**. The [status table](#status) is the authority on what
-> exists; the layout below marks everything else with `*`.
+> **Early.** The `Conn` abstraction, TCP, the buffered reader and URL parsing
+> are landed and green. DNS, HTTP, WebSocket, TLS, the server and `fetch()` are
+> designed and **not yet written**. The [status table](#status) is the authority
+> on what exists; the layout below marks everything else with `*`.
 
 The plan is a stack built on the Caustic standard library's `std/net.cst`
 (TCP/UDP/poll floor), with everything above it written here in Caustic —
@@ -41,7 +41,7 @@ only `call()` sites are the four typed dispatchers in `core/conn.cst`.
 ```
 core/        conn (the vtable) · errno · bytes (Bytes/Slice) · bufread (lines)
 transport/   tcp_conn (TCP→Conn) · transport (dial/listen/accept/tuning) · epoll*
-proto/       url* · dns* · headers* · http1* · websocket* · flate* · cookie*
+proto/       url · http1* · dns* · websocket* · flate* · cookie*
 tls/         records · handshake · keyschedule · client (implements Conn)*
 server/      router · threaded · reactor*
 client/      fetch (url→dns→connect→tls→http→redirect→decompress)*
@@ -82,7 +82,8 @@ the same reason.
 | 0 | `core/bufread` — lines + exact counts over `Conn` | ✅ green (`tests/test_bufread`, incl. lines split one byte per read) |
 | 1 | `transport/` tcp_conn · transport · `Listener` · peer addr · deadlines | ✅ green (`examples/tcp_echo` round-trip) |
 | 1 | epoll reactor + IPv6 addrs | ⏳ next |
-| 2 | url · dns | ⏳ |
+| 2 | `proto/url` | ✅ green (`tests/test_url`) |
+| 2 | dns | ⏳ (UDP `sendto` is broken on the Windows target upstream) |
 | 3 | http/1.1 client (+headers, chunked, cookies, redirects) | ⏳ |
 | 4 | server (reactor + thread-per-conn) | ⏳ |
 | 5 | websocket (sha1 + base64) | ⏳ |
