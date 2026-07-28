@@ -3,9 +3,10 @@ name: test
 # Caustic is not on any package index, so CI installs the toolchain the way a
 # person does: the published Linux release, unpacked, on PATH.
 #
-# The second step exists because the released caustic-mk predates the fix that
-# lets a `depend` be imported under the name it was declared with. Delete it
-# once a release ships that; nothing else here depends on building from source.
+# This used to build caustic-mk from source as well, because the released one
+# passed only the per-dependency `--path` and not the deps root, so a module
+# could not be imported under the name it was declared with. v0.1.6 ships the
+# fix, and the suite is green on the release alone, so the extra step is gone.
 
 on:
   push:
@@ -27,14 +28,6 @@ jobs:
             --pattern 'caustic-x86_64-linux.tar.gz' --output caustic.tar.gz
           tar xzf caustic.tar.gz
           echo "$PWD/caustic-x86_64-linux/bin" >> "$GITHUB_PATH"
-
-      - name: Build a current caustic-mk
-        run: |
-          git clone --depth 1 --recurse-submodules \
-            https://github.com/Caua726/Caustic "$RUNNER_TEMP/caustic-src"
-          ( cd "$RUNNER_TEMP/caustic-src" && caustic-mk build caustic-mk )
-          cp "$RUNNER_TEMP/caustic-src/caustic-mk" \
-             "$GITHUB_WORKSPACE/caustic-x86_64-linux/bin/caustic-mk"
 
       - name: Test
         run: caustic-mk run test
