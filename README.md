@@ -67,6 +67,10 @@ the same reason.
 - **Memory:** manual, via the stdlib `bins` allocator per module; `Conn` boxes +
   backend contexts share one heap (`core/conn.cst` `cn_alloc`/`cn_free`), freed by
   `conn_free`. Hot path (`conn_read`/`conn_write`) is zero-alloc raw `*u8+len`.
+  `Bytes` is the exception: `bins` refuses any single request above its top bin,
+  so a buffer past `SMALL_MAX` (16 KiB) is page-allocated instead. `cap` is
+  always the exact size handed to the allocator, which is how a free knows
+  which of the two owns the pointer.
 - **Naming:** `snake_case` fns, `PascalCase` structs, `_prefix` private, vtable
   backends named `_<proto>_<op>`, `SCREAMING` constants `with imut`.
 
@@ -74,7 +78,7 @@ the same reason.
 
 | Phase | Module | State |
 |---|---|---|
-| 0 | `core/` conn · errno · bytes | ✅ green (`tests/test_conn` mock-Conn dispatch) |
+| 0 | `core/` conn · errno · bytes | ✅ green (`tests/test_conn` mock-Conn dispatch, `tests/test_bytes` growth to 1 MiB) |
 | 1 | `transport/` tcp_conn · transport | ✅ green (`examples/tcp_echo` round-trip) |
 | 1 | epoll reactor + IPv6 addrs | ⏳ next |
 | 2 | url · dns | ⏳ |
