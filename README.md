@@ -122,8 +122,6 @@ Ordered so that each tier is independently useful and unblocks the next. Items m
 *(dep)* are wiring an existing sibling library in, not writing an implementation.
 
 **A · Finish the HTTP core.** Small, and it unblocks disproportionately.
-`resp_header` multi-value iteration (Set-Cookie repeats, so cookies need it) ·
-`url_resolve` for relative URLs (a 302 `Location` is usually relative) ·
 HTTP-date (RFC 7231) · cookie jar + public suffix list ·
 redirect policy · keep-alive pooling · `Content-Encoding` *(dep: caustic-compact)* ·
 IDN hostnames *(dep: caustic-unicode)*
@@ -155,10 +153,11 @@ crypto in `caustic-crypto` applies.
 
 ### Known gaps in what has landed
 
+01 and 02 are closed: `resp_header_next`/`resp_header_count` walk repeated
+headers, and `url_resolve` resolves a relative reference per RFC 3986 §5.2.
+
 | | Gap | Consequence |
 |---|---|---|
-| 01 | `resp_header` returns only the first occurrence | `Set-Cookie` repeats — blocks cookies |
-| 02 | `url_parse` requires `scheme://` | a relative `Location` cannot be resolved — blocks redirects |
 | 03 | `http1` threads no deadline through | `Conn` has `conn_read_exact_by`; http1 ignores it |
 | 04 | No connection pool | `conn_reusable()` answers correctly, nothing reuses |
 | 05 | Response-side parsing only | the server needs the request-shaped equivalent |

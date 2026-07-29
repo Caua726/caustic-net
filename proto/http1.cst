@@ -317,6 +317,59 @@ fn resp_has_header(r as *Response, name as *u8) as i64 {
     return 0;
 }
 
+// How many lines carry `name`.
+//
+// A repeated header is not a malformed one. Most can be folded into a single
+// comma-separated value, but Set-Cookie cannot — RFC 6265 §3 says one cookie
+// per line, and a cookie value may itself contain a comma, so joining them
+// destroys the data. That is why there is no resp_header_join here: the only
+// header that forces a caller to care about repetition is the one for which
+// joining is wrong.
+fn resp_header_count(r as *Response, name as *u8) as i64 {
+    let is i64 as off with mut = 0;
+    let is i64 as seen with mut = 0;
+    let is i64 as hits with mut = 0;
+    while (seen < r.nhdr) {
+        let is *u8 as line = cast(*u8, cast(i64, r.hdr) + off);
+        if (_name_eq(line, name) == 1) { hits = hits + 1; }
+        off = off + _slen(line) + 1;
+        seen = seen + 1;
+    }
+    return hits;
+}
+
+// Copy the value of the next `name` at or after *cur into out, and advance *cur
+// past that line. Returns the value's length, -1 when there are no more, or
+// HTTP_ERR_SPACE. Start with *cur = 0:
+//
+//   let is i64 as cur with mut = 0;
+//   while (http1.resp_header_next(&r, "Set-Cookie", &cur, buf, 512) >= 0) { ... }
+//
+// The cursor is a byte offset into r.hdr, so walking every occurrence costs one
+// pass over the block rather than one rescan per hit. resp_header stays the
+// first-occurrence accessor it was; nothing about it changes.
+fn resp_header_next(r as *Response, name as *u8, cur as *i64, out as *u8, max as i64) as i64 {
+    let is i64 as off with mut = *cur;
+    if (off < 0) { off = 0; }
+    while (off < r.hdr_len) {
+        let is *u8 as line = cast(*u8, cast(i64, r.hdr) + off);
+        let is i64 as ln = _slen(line);
+        off = off + ln + 1;
+        if (_name_eq(line, name) == 1) {
+            *cur = off;
+            let is *u8 as v = _value_of(line);
+            let is i64 as vn = _slen(v);
+            if (vn + 1 > max) { return HTTP_ERR_SPACE; }
+            let is i64 as i with mut = 0;
+            while (i < vn) { out[i] = v[i]; i = i + 1; }
+            out[vn] = cast(u8, 0);
+            return vn;
+        }
+    }
+    *cur = off;
+    return 0 - 1;
+}
+
 // The i'th header line, as stored ("Name: value"). Null when out of range.
 fn resp_header_at(r as *Response, idx as i64) as *u8 {
     if (idx < 0 || idx >= r.nhdr) { return cast(*u8, 0); }

@@ -268,5 +268,47 @@ fn main() as i32 {
     http.body_init(&bd, &br, &r, 1);                   // head_request = 1
     if (http.body_read(&bd, cast(*u8, &body), 4096) != 0) { return 69; }
 
+
+    // ================= repeated headers =================
+    // Set-Cookie is the header that forces this: RFC 6265 §3 sends one cookie
+    // per line and a cookie value may contain a comma, so the comma-folding
+    // that works for other repeated headers destroys these. resp_header returns
+    // only the first, which silently drops every session cookie but one.
+    let is *u8 as sck = "HTTP/1.1 200 OK\r\nSet-Cookie: a=1\r\nContent-Length: 0\r\nSet-Cookie: b=2; Path=/\r\n\r\n";
+    mock(&c, &m, sck, slen(sck), 1);
+    bufread.br_init(&br, &c, cast(*u8, &storage), 8192);
+    if (http.resp_read_head(&br, &r, cast(*u8, &hdrbuf), 4096) != 0) { return 70; }
+
+    if (http.resp_header_count(&r, "Set-Cookie") != 2) { return 71; }
+    if (http.resp_header_count(&r, "Content-Length") != 1) { return 72; }
+    if (http.resp_header_count(&r, "X-Absent") != 0) { return 73; }
+
+    // The cursor walks every occurrence, in the order the server sent them,
+    // and skips the unrelated header sitting between them.
+    let is i64 as cur with mut = 0;
+    if (http.resp_header_next(&r, "Set-Cookie", &cur, cast(*u8, &val), 512) != 3) { return 74; }
+    if (eq(cast(*u8, &val), "a=1") == 0) { return 75; }
+    if (http.resp_header_next(&r, "Set-Cookie", &cur, cast(*u8, &val), 512) != 11) { return 76; }
+    if (eq(cast(*u8, &val), "b=2; Path=/") == 0) { return 77; }
+    if (http.resp_header_next(&r, "Set-Cookie", &cur, cast(*u8, &val), 512) != 0 - 1) { return 78; }
+
+    // A fresh cursor starts over.
+    cur = 0;
+    if (http.resp_header_next(&r, "Set-Cookie", &cur, cast(*u8, &val), 512) < 0) { return 79; }
+    if (eq(cast(*u8, &val), "a=1") == 0) { return 80; }
+
+    // A name that never appears yields nothing without walking off the block.
+    cur = 0;
+    if (http.resp_header_next(&r, "X-Absent", &cur, cast(*u8, &val), 512) != 0 - 1) { return 81; }
+
+    // resp_header is unchanged: still the first occurrence.
+    if (http.resp_header(&r, "Set-Cookie", cast(*u8, &val), 512) < 0) { return 82; }
+    if (eq(cast(*u8, &val), "a=1") == 0) { return 83; }
+
+    // A value too long for the caller's buffer is reported, not truncated.
+    let is [2]u8 as tinyv;
+    cur = 0;
+    if (http.resp_header_next(&r, "Set-Cookie", &cur, cast(*u8, &tinyv), 2) != http.HTTP_ERR_SPACE) { return 84; }
+
     return 0;
 }
