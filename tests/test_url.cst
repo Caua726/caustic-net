@@ -202,6 +202,12 @@ fn main() as i32 {
     if (chk_res(&rbase, cast(*u8, &rb), "./g",   "http://a/b/c/g")      == 0) { return 70; }
     if (chk_res(&rbase, cast(*u8, &rb), "g/",    "http://a/b/c/g/")     == 0) { return 71; }
     if (chk_res(&rbase, cast(*u8, &rb), "/g",    "http://a/g")          == 0) { return 72; }
+    // The §5.4.1 table gives "http://g" here, with no path at all. This asserts
+    // "http://g/" deliberately: §6.2.3 normalises an empty path under an
+    // authority to "/", so the two are equivalent, and HTTP wants the slash —
+    // a request line needs a target. Reading §5.4 alone this looks like a
+    // mismatch, which is why it is called out; url_resolve says the same where
+    // it writes the slash. Do not "correct" it to match the table.
     if (chk_res(&rbase, cast(*u8, &rb), "//g",   "http://g/")           == 0) { return 73; }
     if (chk_res(&rbase, cast(*u8, &rb), "?y",    "http://a/b/c/d;p?y")  == 0) { return 74; }
     if (chk_res(&rbase, cast(*u8, &rb), "g?y",   "http://a/b/c/g?y")    == 0) { return 75; }

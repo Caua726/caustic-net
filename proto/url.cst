@@ -636,8 +636,16 @@ fn url_resolve(base as *Url, ref as *u8, out as *u8, max as i64) as Url {
     let is i64 as plen = _remove_dot_segments(cast(*u8, cast(i64, out) + path_start),
                                               w - path_start);
     w = path_start + plen;
-    // A hierarchical URL with an authority always has a path; §5.3 writes "/"
-    // when normalisation emptied it.
+    // An empty path under an authority becomes "/", per the scheme-based
+    // normalisation of §6.2.3: "a URI that uses the generic syntax for
+    // authority with an empty path should be normalized to a path of '/'".
+    //
+    // This is the one place the output differs from the literal §5.4.1 table,
+    // which resolves "//g" to "http://g" with no path. The two are equivalent
+    // by §6.2.3, and the normalised form is the one HTTP wants — a request
+    // line needs a target, and every caller would otherwise have to add the
+    // slash back. Anyone checking conformance against §5.4 alone will read
+    // this as a mismatch, so it is deliberate and stated here and at the test.
     if (plen == 0) {
         if (w + 1 > max) { let is Url as e; e.ok = URL_ERR_SPACE; return e; }
         out[w] = cast(u8, 47); w = w + 1;
