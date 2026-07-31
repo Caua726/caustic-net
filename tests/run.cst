@@ -267,6 +267,7 @@ fn check_all_imports() as i32 {
     bad = bad + cast(i64, check_imports("tls/transcript.cst"));
     bad = bad + cast(i64, check_imports("tls/keysched.cst"));
     bad = bad + cast(i64, check_imports("tls/record.cst"));
+    bad = bad + cast(i64, check_imports("tls/x509.cst"));
     bad = bad + cast(i64, check_imports("proto/url.cst"));
     bad = bad + cast(i64, check_imports("proto/http1.cst"));
     if (bad == 0) { io.write_str(1, "ok\n"); return 0; }
@@ -329,6 +330,7 @@ fn main(argc as i64, argv as *u8) as i32 {
     fail = fail + cast(i64, run_case(ccp, "test_res",     "tests/test_res.cst"));
     fail = fail + cast(i64, run_case(ccp, "test_ks",      "tests/test_ks.cst"));
     fail = fail + cast(i64, run_case(ccp, "test_rec",     "tests/test_rec.cst"));
+    fail = fail + cast(i64, run_case(ccp, "test_x509",    "tests/test_x509.cst"));
     fail = fail + cast(i64, run_case(ccp, "test_conn",    "tests/test_conn.cst"));
     fail = fail + cast(i64, run_case(ccp, "test_bytes",   "tests/test_bytes.cst"));
     fail = fail + cast(i64, run_case(ccp, "test_bufread", "tests/test_bufread.cst"));
