@@ -10,11 +10,20 @@ use "std/mem.cst" only bins, core as mem;
 use "./tcp_conn.cst" as tcpc;
 use "./resolver.cst" as res;
 use "../core/conn.cst" as conn;
+use "../core/bytes.cst" as bytes;
 use "../core/errno.cst" as errno;
 use "../proto/dns.cst" as dns;
 
 // One-time WSAStartup on Windows; no-op on Linux. Safe to call repeatedly.
 fn init() as i32 {
+    // The Conn heap, built while the program is still single-threaded. See
+    // core/conn.cst's conn_heap_warm: two threads that arrive at an
+    // uninitialised bins together deadlock inside the allocator, with no
+    // error and no crash. Doing it here means every program that uses this
+    // transport is safe by construction, because nothing here works without
+    // init().
+    conn.conn_heap_warm();
+    bytes.bytes_heap_warm();
     return net.init();
 }
 

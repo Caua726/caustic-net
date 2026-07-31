@@ -81,7 +81,7 @@ proto/       url · http1 · dns · cookie* · http2* · websocket* · sse* · m
 tls/         transcript · keysched · record · x509 · pss · roots · trust · verify
              extensions* · handshake* · client*
 server/      router* · threaded* · reactor* · static* · middleware*
-client/      fetch* (url→dns→connect→tls→http→redirect→decompress)
+client/      fetch (url→dns→connect→tls→http→redirect) · decode* · pool* · parallel*
 ```
 `*` = on the roadmap, not yet landed.
 
@@ -148,6 +148,8 @@ client/      fetch* (url→dns→connect→tls→http→redirect→decompress)
 | tls | `extensions` — SNI · supported_versions · groups · key_share · signature_algorithms · ALPN | ✅ green (`tests/test_tls`, against RFC 8448's own ClientHello) |
 | tls | `handshake` — the 1-RTT client, as an explicit state machine | ✅ green (`tests/test_tls`, RFC 8448 §3 value by value + 20 hostile flights) |
 | tls | `client` — TLS as a `Conn`, one allocation, KeyUpdate handled | ✅ green (`tests/test_tls`, `examples/https_get` against the real internet) |
+| client | `fetch` — url → dns → connect → TLS → HTTP → redirects | ✅ green (`tests/test_fetch`, a real server in a second process) |
+| core | `bufread` deadline (gap 03) | ✅ `br_set_deadline`; bounds the number of fills, pair with `set_recv_timeout` for a single read |
 | everything else | see the roadmap | ⏳ |
 
 The three ⛔ rows above were all "the toolchain can't yet"; stdlib v0.1.6 closed each one, so
@@ -197,7 +199,7 @@ headers, and `url_resolve` resolves a relative reference per RFC 3986 §5.2.
 
 | | Gap | Consequence |
 |---|---|---|
-| 03 | `http1` threads no deadline through | `Conn` has `conn_read_exact_by`; http1 ignores it |
+| 03 | A read deadline bounds fills, not one read | `br_set_deadline` stops a reader between fills; a single blocking read is bounded only by `set_recv_timeout`, which takes whole seconds. Both are needed and `client/fetch` sets both |
 | 04 | No connection pool | `conn_reusable()` answers correctly, nothing reuses |
 | 05 | Response-side parsing only | the server needs the request-shaped equivalent |
 | 06 | No chunked *request* encoder | POST works only with `Content-Length` |
@@ -211,6 +213,33 @@ headers, and `url_resolve` resolves a relative reference per RFC 3986 §5.2.
 | 14 | No session resumption | `NewSessionTicket` is read and discarded. Every connection is a full handshake |
 | 15 | No client certificates | a `CertificateRequest` is skipped rather than answered |
 | 16 | A SHA-384 cipher suite needs the ClientHello to fit 1 KiB | the transcript hash is fixed by the suite, which is not known until the ServerHello, so choosing SHA-384 means rehashing both Hellos. A ClientHello past the buffer declines the suite instead |
+| 17 | No connection reuse yet | every hop of a redirect chain opens a new socket, and every https hop a new handshake |
+
+### Two bugs below this library
+
+Both were found by the first test here that needed two things running at once,
+and both are outside this repository. They are recorded because anything built
+on caustic-net will meet them.
+
+**`std/mem/bins.cst`: `bins_new` returns a heap whose lock word is
+uninitialised.** It is a local in that function and never written, so the
+struct arrives carrying whatever was on the stack. Nothing notices while the
+program is single-threaded, because the allocator's lock is a no-op until
+`std/thread`'s `spawn` turns it on — and then the first allocation through
+such a heap finds a non-zero lock, futex-waits, and never wakes. The process
+hangs with no error and no crash.
+
+`core/conn.cst` and `core/bytes.cst` used to do exactly `_bins = bins_new(...)`
+and both hung. They now let `bins_alloc` build the heap itself, which is the
+one construction that ends up consistent, because its lazy path restores the
+lock word it was holding. `transport.init()` forces both heaps up while the
+program is still single-threaded.
+
+**The optimizing backend miscompiles `std/thread.cst`'s `spawn`.** Twelve lines
+reproduce it — spawn one thread that assigns a global, join it — working at the
+default level and segfaulting at `-O1`, with the child jumping to address 0.
+`tests/test_fetch` therefore runs its server half as a second PROCESS rather
+than a thread. `client/parallel` cannot be written until this is fixed.
 
 ### How long a certificate chain takes
 

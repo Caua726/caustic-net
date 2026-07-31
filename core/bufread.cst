@@ -36,6 +36,15 @@ struct BufReader {
     tail as i64;          // one past the last buffered byte
     eof  as i64;          // 1 once the peer closed
     err  as i64;          // sticky -errno, 0 while healthy
+    // An absolute deadline in the sense of core/conn.cst's deadline_in, or 0
+    // for none. Checked before every fill, which bounds the NUMBER of reads
+    // but not the length of any one of them: this reader has no timed read to
+    // call, and transport's wait_readable takes a TCP Conn specifically —
+    // pointing it at a TLS one would read the TLS context as a file
+    // descriptor. Bounding a single read is the socket's job, through
+    // set_recv_timeout on the Conn underneath, and a caller that wants a real
+    // ceiling needs both. Said here rather than left to be discovered.
+    deadline as i64;
 }
 
 // Buffered bytes waiting to be consumed.
@@ -57,7 +66,12 @@ fn br_init(br as *BufReader, c as *conn.Conn, buf as *u8, cap as i64) as void {
     br.tail = 0;
     br.eof  = 0;
     br.err  = 0;
+    br.deadline = 0;
 }
+
+// Stop filling once `d` has passed. 0 clears it. See the note on the field.
+fn br_set_deadline(br as *BufReader, d as i64) as void { br.deadline = d; }
+fn br_deadline(br as *BufReader) as i64 { return br.deadline; }
 
 // Move the unread bytes to the front, so a fill has the whole tail to work
 // with. Cheap: the unread region is at most one partial line.
@@ -73,6 +87,12 @@ fn _br_compact(br as *BufReader) as void {
 // Returns bytes added (>0), 0 at EOF, or <0 -errno. Retries EINTR.
 fn br_fill(br as *BufReader) as i64 {
     if (br.err != 0) { return br.err; }
+    if (br.deadline != 0) {
+        if (conn.deadline_expired(br.deadline) == 1) {
+            br.err = 0 - errno.ETIMEDOUT;
+            return br.err;
+        }
+    }
     _br_compact(br);
     if (br.tail >= br.cap) { return 0; }            // full: caller must consume first
     while (1 == 1) {

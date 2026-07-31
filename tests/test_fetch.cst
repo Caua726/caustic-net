@@ -1,0 +1,401 @@
+// =======================================================
+// caustic-net/tests/test_fetch.cst
+// url in, bytes out — including the redirects.
+//
+// A real HTTP server on loopback, in a thread, serving a handful of paths that
+// between them cover every redirect rule: a two-hop chain, a relative
+// Location, a 303 that must become a GET, a 307 that must not, a cycle, and a
+// chain longer than the hop limit. fetch runs in the main thread against it,
+// over the actual stack — resolver, transport, Conn, bufread, http1.
+//
+// Two PROCESSES rather than two threads: this binary re-executes itself with
+// --server and talks to the copy. fetch reconnects for every hop, so the two
+// sides have to be alive at once, and a thread would have been the obvious
+// way — except that std/thread's spawn segfaults under the optimizing backend
+// (a twelve-line program reproduces it; see the README's known gaps). Two
+// processes are also closer to what actually happens. Nothing here is faked:
+// the client is this library and so is the server.
+//
+// The two rules that a loopback server CANNOT reach — the https-to-http
+// downgrade refusal, and what a redirect does to the method — are checked
+// directly against redirect_allowed and redirect_method, which exist as
+// separate functions for exactly that reason. A rule only exercised against
+// the live internet is a rule that is not exercised.
+//
+// Exit 0 = all pass. Non-zero = the numbered check that failed.
+// =======================================================
+
+use "std/io.cst" as io;
+use "std/process.cst" as proc;
+use "std/env.cst" as env;
+use "std/time.cst" as time;
+use "../core/conn.cst" as conn;
+use "../core/bufread.cst" as bufread;
+use "../core/bytes.cst" as bytes;
+use "../proto/url.cst" as url;
+use "../proto/http1.cst" as http;
+use "../transport/transport.cst" as tp;
+use "../tls/trust.cst" as trust;
+use "../client/fetch.cst" as fetch;
+
+let is i64 as PORT with imut = 18099;
+let is *u8 as BODY with imut = "the body at the end of the chain";
+let is i64 as BODY_N with imut = 32;
+
+let is tp.Listener as _l with mut;
+let is i64 as _serving with mut = 0;
+let is i64 as _served with mut = 0;
+
+fn streq(a as *u8, b as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (a[i] != 0 && b[i] != 0) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    if (a[i] != b[i]) { return 0; }
+    return 1;
+}
+
+fn starts(a as *u8, b as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (b[i] != 0) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// The request target out of "GET /path HTTP/1.1".
+fn target_of(line as *u8, out as *u8, max as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (line[i] != 0 && line[i] != 32) { i = i + 1; }
+    if (line[i] == 0) { return 0 - 1; }
+    i = i + 1;
+    let is i64 as n with mut = 0;
+    while (line[i] != 0 && line[i] != 32 && n < max - 1) {
+        out[n] = line[i];
+        n = n + 1;
+        i = i + 1;
+    }
+    out[n] = cast(u8, 0);
+    return n;
+}
+
+fn method_of(line as *u8, out as *u8, max as i64) as i64 {
+    let is i64 as n with mut = 0;
+    while (line[n] != 0 && line[n] != 32 && n < max - 1) {
+        out[n] = line[n];
+        n = n + 1;
+    }
+    out[n] = cast(u8, 0);
+    return n;
+}
+
+// What the last request's method was, so a 303-becomes-GET can be checked
+// from the client side.
+let is [16]u8 as _last_method with mut;
+
+fn send_str(c as *conn.Conn, s as *u8) as void {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    conn.conn_write_all(c, s, n);
+}
+
+// One connection: read the head, answer by path, close.
+fn serve_one(c as *conn.Conn) as void {
+    let is [4096]u8 as sbuf;
+    let is bufread.BufReader as br;
+    bufread.br_init(&br, c, cast(*u8, &sbuf), 4096);
+
+    let is [1024]u8 as line;
+    let is i64 as n = bufread.br_read_line(&br, cast(*u8, &line), 1024);
+    if (n <= 0) { conn.conn_close(c); return; }
+
+    let is [256]u8 as path;
+    let is [16]u8 as meth;
+    method_of(cast(*u8, &line), cast(*u8, &meth), 16);
+    target_of(cast(*u8, &line), cast(*u8, &path), 256);
+    let is i64 as i with mut = 0;
+    while (i < 16) { _last_method[i] = meth[i]; i = i + 1; }
+
+    // drain the rest of the head
+    while (1 == 1) {
+        let is i64 as k = bufread.br_read_line(&br, cast(*u8, &line), 1024);
+        if (k <= 0) { break; }
+    }
+
+    if (streq(cast(*u8, &path), "/a") == 1) {
+        send_str(c, "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:18099/b\r\nContent-Length: 5\r\n\r\nmoved");
+    } else {
+        if (streq(cast(*u8, &path), "/b") == 1) {
+            // A RELATIVE Location, which is the common case and the one that
+            // needs url_resolve rather than a parse.
+            send_str(c, "HTTP/1.1 301 Moved Permanently\r\nLocation: /c\r\nContent-Length: 0\r\n\r\n");
+        } else {
+            if (streq(cast(*u8, &path), "/c") == 1) {
+                send_str(c, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 32\r\n\r\n");
+                conn.conn_write_all(c, BODY, BODY_N);
+            } else {
+                if (streq(cast(*u8, &path), "/see") == 1) {
+                    send_str(c, "HTTP/1.1 303 See Other\r\nLocation: /c\r\nContent-Length: 0\r\n\r\n");
+                } else {
+                    if (streq(cast(*u8, &path), "/keep") == 1) {
+                        send_str(c, "HTTP/1.1 307 Temporary Redirect\r\nLocation: /echo\r\nContent-Length: 0\r\n\r\n");
+                    } else {
+                        if (streq(cast(*u8, &path), "/echo") == 1) {
+                            send_str(c, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n");
+                            conn.conn_write_all(c, cast(*u8, &_last_method), 4);
+                        } else {
+                            if (streq(cast(*u8, &path), "/loop1") == 1) {
+                                send_str(c, "HTTP/1.1 302 Found\r\nLocation: /loop2\r\nContent-Length: 0\r\n\r\n");
+                            } else {
+                                if (streq(cast(*u8, &path), "/loop2") == 1) {
+                                    send_str(c, "HTTP/1.1 302 Found\r\nLocation: /loop1\r\nContent-Length: 0\r\n\r\n");
+                                } else {
+                                    if (starts(cast(*u8, &path), "/n") == 1) {
+                                        // /n<K> redirects to /n<K+1>, forever.
+                                        let is i64 as k with mut = 0;
+                                        let is i64 as p with mut = 2;
+                                        while (path[p] >= 48 && path[p] <= 57) {
+                                            k = k * 10 + (cast(i64, path[p]) - 48);
+                                            p = p + 1;
+                                        }
+                                        let is bytes.Bytes as b with mut = bytes.bytes_new(128);
+                                        bytes.bytes_append_str(&b, "HTTP/1.1 302 Found\r\nLocation: /n");
+                                        let is [24]u8 as num;
+                                        let is i64 as nn with mut = 0;
+                                        let is i64 as vv with mut = k + 1;
+                                        if (vv == 0) { num[0] = cast(u8, 48); nn = 1; }
+                                        let is [24]u8 as rev;
+                                        let is i64 as rn with mut = 0;
+                                        while (vv > 0) {
+                                            rev[rn] = cast(u8, 48 + (vv % 10));
+                                            vv = vv / 10;
+                                            rn = rn + 1;
+                                        }
+                                        while (rn > 0) {
+                                            rn = rn - 1;
+                                            num[nn] = rev[rn];
+                                            nn = nn + 1;
+                                        }
+                                        num[nn] = cast(u8, 0);
+                                        bytes.bytes_append(&b, cast(*u8, &num), nn);
+                                        bytes.bytes_append_str(&b, "\r\nContent-Length: 0\r\n\r\n");
+                                        conn.conn_write_all(c, b.ptr, b.len);
+                                        bytes.bytes_free(&b);
+                                    } else {
+                                        send_str(c, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    _served = _served + 1;
+    conn.conn_close(c);
+    conn.conn_free(c);
+}
+
+// The --server half: accept and answer until the client stops coming, then
+// leave. The idle timeout is what makes this terminate if the client dies.
+fn server_main() as i32 {
+    tp.init();
+    let is tp.ListenResult as lr with mut = tp.listen_loopback(PORT);
+    if (lr.ok < 0) { return 1; }
+    _l = lr.l;
+    let is i64 as idle with mut = 0;
+    while (idle < 100) {
+        if (tp.listener_wait(&_l, 200) <= 0) { idle = idle + 1; continue; }
+        idle = 0;
+        let is *conn.Conn as c = tp.accept_conn(&_l);
+        if (cast(i64, c) == 0) { continue; }
+        serve_one(c);
+    }
+    tp.listener_close(&_l);
+    return 0;
+}
+
+// The server-dependent half. Returns 0, or the numbered check that failed.
+fn run_checks(f as *fetch.Fetch) as i64 {
+    let is i64 as rc with mut = 0;
+
+    // A two-hop chain: /a -302-> /b -301(relative)-> /c.
+    let is i64 as rc with mut = fetch.fetch_get(f, "http://127.0.0.1:18099/a",
+                                                conn.deadline_in(10000));
+    if (rc != 0) {
+        io.printf("/a: %s\n", fetch.fetch_err_name(rc));
+        return 21;
+    }
+    if (fetch.fetch_status(f) != 200) { return 22; }
+    if (fetch.fetch_redirects(f) != 2) {
+        io.printf("expected 2 hops, took %ld\n", fetch.fetch_redirects(f));
+        return 23;
+    }
+    if (fetch.fetch_body_len(f) != BODY_N) { return 24; }
+    let is i64 as i with mut = 0;
+    while (i < BODY_N) {
+        if (fetch.fetch_body(f)[i] != BODY[i]) { return 25; }
+        i = i + 1;
+    }
+    // The URL that actually answered, not the one asked for. A browser needs
+    // this for the address bar and for resolving the page's own links.
+    if (streq(fetch.fetch_final_url(f), "http://127.0.0.1:18099/c") == 0) {
+        io.printf("final url is %s\n", fetch.fetch_final_url(f));
+        return 26;
+    }
+    let is [64]u8 as ct;
+    if (fetch.fetch_header(f, "content-type", cast(*u8, &ct), 64) < 0) { return 27; }
+    if (streq(cast(*u8, &ct), "text/plain") == 0) { return 28; }
+
+    // No redirect at all: the count stays zero and the final URL is the one
+    // that was asked for.
+    rc = fetch.fetch_get(f, "http://127.0.0.1:18099/c", conn.deadline_in(10000));
+    if (rc != 0) { return 29; }
+    if (fetch.fetch_redirects(f) != 0) { return 30; }
+    if (streq(fetch.fetch_final_url(f), "http://127.0.0.1:18099/c") == 0) { return 31; }
+
+    // 307 preserves the method end to end: /keep answers 307 to /echo, and
+    // /echo replies with whatever method reached it.
+    rc = fetch.fetch_method(f, "POST", "http://127.0.0.1:18099/keep",
+                            conn.deadline_in(10000));
+    if (rc != 0) { io.printf("/keep: %s\n", fetch.fetch_err_name(rc)); return 32; }
+    if (fetch.fetch_body_len(f) != 4) { return 33; }
+    if (fetch.fetch_body(f)[0] != cast(u8, 80)) { return 34; }     // 'P'
+
+    // 303 turns it into a GET, which is the whole reason 303 exists.
+    rc = fetch.fetch_method(f, "POST", "http://127.0.0.1:18099/see",
+                            conn.deadline_in(10000));
+    if (rc != 0) { return 35; }
+    if (fetch.fetch_status(f) != 200) { return 36; }
+    if (fetch.fetch_body_len(f) != BODY_N) { return 37; }
+
+    // A cycle. It has to be named as one rather than run out the hop count,
+    // and it has to stop long before twenty round trips.
+    rc = fetch.fetch_get(f, "http://127.0.0.1:18099/loop1", conn.deadline_in(10000));
+    if (rc != fetch.FETCH_ERR_REDIRECTS) {
+        io.printf("loop: %s\n", fetch.fetch_err_name(rc));
+        return 38;
+    }
+    if (fetch.fetch_redirects(f) > 3) { return 39; }
+
+    // A chain that never repeats a URL and never ends: the hop limit is what
+    // stops this one, and it is a different code path from the cycle above.
+    rc = fetch.fetch_get(f, "http://127.0.0.1:18099/n0", conn.deadline_in(20000));
+    if (rc != fetch.FETCH_ERR_REDIRECTS) { return 40; }
+    if (fetch.fetch_redirects(f) != fetch.MAX_REDIRECTS) {
+        io.printf("hop limit stopped at %ld, expected %ld\n",
+                  fetch.fetch_redirects(f), fetch.MAX_REDIRECTS);
+        return 41;
+    }
+
+    // A body past the ceiling is refused rather than read.
+    f.limit = 8;
+    rc = fetch.fetch_get(f, "http://127.0.0.1:18099/c", conn.deadline_in(10000));
+    if (rc != fetch.FETCH_ERR_LIMIT) {
+        io.printf("limit: %s\n", fetch.fetch_err_name(rc));
+        return 42;
+    }
+    f.limit = 0;
+
+    // A URL that is not http or https, and one that does not parse.
+    if (fetch.fetch_get(f, "ftp://127.0.0.1/x", 0) != fetch.FETCH_ERR_SCHEME) { return 43; }
+    if (fetch.fetch_get(f, "http://", 0) != fetch.FETCH_ERR_URL) { return 44; }
+
+    // A port nobody is listening on: a connect failure, not a hang.
+    if (fetch.fetch_get(f, "http://127.0.0.1:1/x", conn.deadline_in(5000))
+        != fetch.FETCH_ERR_CONNECT) { return 45; }
+
+    return 0;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    // Re-executed with --server, this binary IS the server.
+    if (argc > 1) {
+        if (streq(env.argv(1), "--server") == 1) { return server_main(); }
+    }
+    tp.init();
+
+    // ===== the literal buffer dimensions ============================
+    if (fetch.MAX_URL != 2048) { return 1; }
+    if (fetch.MAX_HOST != 256) { return 2; }
+    if (fetch.MAX_HEAD != 32768) { return 3; }
+
+    // ===== the policy functions, with no socket in sight ============
+    // https must not become http. Everything else is allowed.
+    let is url.Url as s = url.url_parse("https://a.example/x");
+    let is url.Url as p = url.url_parse("http://a.example/x");
+    let is url.Url as s2 = url.url_parse("https://b.example/y");
+    let is url.Url as p2 = url.url_parse("http://b.example/y");
+    if (s.ok != 0) { return 4; }
+    if (p.ok != 0) { return 5; }
+    if (fetch.redirect_allowed(&s, &s2) != 0) { return 6; }
+    if (fetch.redirect_allowed(&p, &p2) != 0) { return 7; }
+    if (fetch.redirect_allowed(&p, &s2) != 0) { return 8; }     // upgrade is fine
+    if (fetch.redirect_allowed(&s, &p2) != fetch.FETCH_ERR_DOWNGRADE) { return 9; }
+    // And a scheme that is neither.
+    let is url.Url as ftp = url.url_parse("ftp://a.example/z");
+    if (ftp.ok == 0) {
+        if (fetch.redirect_allowed(&p, &ftp) != fetch.FETCH_ERR_SCHEME) { return 10; }
+    }
+
+    // The method a hop uses. 307 and 308 preserve; the rest turn into GET;
+    // HEAD stays HEAD throughout, because a HEAD that became a GET would
+    // start delivering a body the caller never asked for.
+    let is [16]u8 as m;
+    fetch.redirect_method(301, "POST", cast(*u8, &m), 16);
+    if (streq(cast(*u8, &m), "GET") == 0) { return 11; }
+    fetch.redirect_method(302, "POST", cast(*u8, &m), 16);
+    if (streq(cast(*u8, &m), "GET") == 0) { return 12; }
+    fetch.redirect_method(303, "POST", cast(*u8, &m), 16);
+    if (streq(cast(*u8, &m), "GET") == 0) { return 13; }
+    fetch.redirect_method(307, "POST", cast(*u8, &m), 16);
+    if (streq(cast(*u8, &m), "POST") == 0) { return 14; }
+    fetch.redirect_method(308, "POST", cast(*u8, &m), 16);
+    if (streq(cast(*u8, &m), "POST") == 0) { return 15; }
+    fetch.redirect_method(301, "HEAD", cast(*u8, &m), 16);
+    if (streq(cast(*u8, &m), "HEAD") == 0) { return 16; }
+    fetch.redirect_method(307, "HEAD", cast(*u8, &m), 16);
+    if (streq(cast(*u8, &m), "HEAD") == 0) { return 17; }
+
+    // ===== a real server, in another process ========================
+    let is [1024]u8 as self;
+    if (io.get_self_path(cast(*u8, &self), 1024) <= 0) { return 18; }
+
+    let is [3]i64 as sav;
+    sav[0] = cast(i64, cast(*u8, &self));
+    sav[1] = cast(i64, "--server");
+    sav[2] = 0;
+    let is i64 as spid = proc.spawnp(cast(*u8, &self), cast(*u8, &sav));
+    if (spid <= 0) { io.printf("could not start the server half\n"); return 19; }
+
+    // Wait for it to be listening rather than guessing at a sleep: a fixed
+    // delay is either too short on a loaded machine or wasted on an idle one.
+    let is i64 as tries with mut = 0;
+    while (tries < 200) {
+        let is *conn.Conn as probe = tp.dial("127.0.0.1", PORT);
+        if (cast(i64, probe) != 0) { conn.conn_free(probe); break; }
+        time.sleep_ms(10);
+        tries = tries + 1;
+    }
+    if (tries >= 200) { io.printf("server never came up\n"); return 20; }
+
+    let is fetch.Fetch as f;
+    if (fetch.fetch_init(&f, cast(*trust.TrustStore, 0)) != 0) { return 21; }
+
+    let is i64 as bad = run_checks(&f);
+
+    fetch.fetch_free(&f);
+    proc.wait_pid(spid);
+
+    if (bad != 0) {
+        io.printf("check %ld failed\n", bad);
+        return cast(i32, bad);
+    }
+    io.printf("fetch ok: redirects followed, refused and counted\n");
+    return 0;
+}

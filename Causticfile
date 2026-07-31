@@ -50,6 +50,7 @@ target "test_pss"   { src "tests/test_pss.cst"     out "build/test_pss" }
 target "test_trust" { src "tests/test_trust.cst"   out "build/test_trust" }
 target "test_verify" { src "tests/test_verify.cst"  out "build/test_verify" }
 target "test_tls"   { src "tests/test_tls.cst"     out "build/test_tls" }
+target "test_fetch" { src "tests/test_fetch.cst"   out "build/test_fetch" }
 target "test_conn"  { src "tests/test_conn.cst"    out "build/test_conn" }
 target "test_bytes" { src "tests/test_bytes.cst"   out "build/test_bytes" }
 target "test_bufread" { src "tests/test_bufread.cst" out "build/test_bufread" }

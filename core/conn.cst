@@ -165,16 +165,45 @@ fn conn_write_all_by(c as *Conn, buf as *u8, len as i64, deadline as i64) as i64
 // Every Conn-producer (tcp_conn, tls, ...) allocates through
 // cn_alloc so conn_free can release ctx + box with one heap.
 // =======================================================
+// Zero-initialised in BSS, and initialised on first use by bins itself.
+//
+// This used to carry a `_ready` flag and call bins_new on the first alloc.
+// That check-then-set is not atomic, and the moment two threads each opened a
+// connection at the same time — a server accepting while a client dialled —
+// both saw _ready at 0 and both built a heap over the same struct. The result
+// was a hang, not a crash, which is the worst way for it to present.
+//
+// bins_alloc already lazy-initialises a zeroed Bins UNDER ITS OWN LOCK, so
+// the correct amount of code here is none. std/thread's spawn calls
+// memcore.set_mt(), which is what turns that lock on.
 let is mem.Bins as _bins with mut;
-let is i32 as _ready with mut = 0;
 
 fn cn_alloc(size as i64) as *u8 {
-    if (_ready == 0) { _bins = mem.bins.bins_new(65536); _ready = 1; }
     return mem.bins.bins_alloc(&_bins, size);
 }
 
+// Force the shared heap into existence, before any thread can exist.
+//
+// bins_alloc lazy-initialises a zeroed Bins under its own lock, and that is
+// safe against concurrent ALLOCATION. It is not safe against two threads
+// arriving at the UNINITIALISED state together: a server thread accepting
+// while the main thread dials deadlocks, both inside bins_alloc, with no
+// error and no crash — the process simply stops. It was reproduced on the
+// first threaded test in this repository and it is a property of the standard
+// library, not of this file.
+//
+// So the heap is built once while the program is still single-threaded.
+// transport.init() calls this, which is why every example starts with it; a
+// program that spawns threads without going through transport has to call it
+// itself. Idempotent and cheap.
+fn conn_heap_warm() as void {
+    let is *u8 as p = cn_alloc(64);
+    if (cast(i64, p) != 0) { cn_free(p); }
+}
+
 fn cn_free(ptr as *u8) as void {
-    if (_ready == 1) { mem.bins.bins_free(&_bins, ptr); }
+    if (cast(i64, ptr) == 0) { return; }
+    mem.bins.bins_free(&_bins, ptr);
 }
 
 // Allocate a zeroed Conn box.

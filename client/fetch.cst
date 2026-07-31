@@ -1,0 +1,436 @@
+// =======================================================
+// caustic-net/client/fetch.cst
+// url in, bytes out.
+//
+//     let is Fetch as f;
+//     fetch_init(&f, &store);
+//     if (fetch_get(&f, "https://example.com/", conn.deadline_in(10000)) == 0) {
+//         // f.status, f.body.ptr, f.body.len, f.final_url
+//     }
+//     fetch_free(&f);
+//
+// This is the whole stack in one call — resolver, transport, TLS, HTTP/1.1,
+// redirects — and it is the surface caustic-browser is meant to hold. Nothing
+// above it needs to know that DNS exists.
+//
+// Filled into a struct the caller owns rather than returned from the heap,
+// which is the idiom everywhere else here: br_init, body_init, gfx.open.
+//
+// REDIRECT POLICY lives here and not in proto/http1.cst. http1 stays a codec:
+// it will tell you a response is a redirect and where to, and it will not act
+// on it. A library that follows redirects inside its response parser cannot be
+// used to write a proxy, a cache or a crawler.
+//
+// The rules, and why each:
+//
+//   * 301, 302 and 303 turn the request into a GET unless it was a HEAD.
+//     307 and 308 keep the method. That is RFC 9110 §15.4, and it is what
+//     everything on the web already assumes.
+//   * Authorization and Cookie are DROPPED when the origin changes. Sending
+//     a site's credentials to whatever it redirects to is the classic
+//     credential leak in this layer, and an open redirect turns it into
+//     anyone's credentials.
+//   * A downgrade from https to http is refused outright. A redirect is not
+//     a reason to stop encrypting, and following one silently would undo the
+//     work of everything below.
+//   * The body is DRAINED between hops rather than the connection dropped,
+//     so the socket stays reusable once client/pool.cst exists.
+// =======================================================
+
+use "std/mem.cst" as mem;
+use "std/time.cst" as time;
+use "../core/conn.cst" as conn;
+use "../core/bufread.cst" as bufread;
+use "../core/bytes.cst" as bytes;
+use "../core/errno.cst" as errno;
+use "../proto/url.cst" as url;
+use "../proto/http1.cst" as http;
+use "../transport/transport.cst" as tp;
+use "../tls/trust.cst" as trust;
+use "../tls/client.cst" as tlsc;
+
+// --- Errors (the -1800 block) ------------------------------------------
+let is i64 as FETCH_ERR_SCHEME    with imut = 0 - 1800;   // not http or https
+let is i64 as FETCH_ERR_URL       with imut = 0 - 1801;   // unparseable
+let is i64 as FETCH_ERR_CONNECT   with imut = 0 - 1802;   // no socket
+let is i64 as FETCH_ERR_TLS       with imut = 0 - 1803;   // handshake refused; see f.tls_err
+let is i64 as FETCH_ERR_LIMIT     with imut = 0 - 1804;   // body past the ceiling
+let is i64 as FETCH_ERR_REDIRECTS with imut = 0 - 1805;   // too many hops, or a loop
+let is i64 as FETCH_ERR_DOWNGRADE with imut = 0 - 1806;   // https redirected to http
+let is i64 as FETCH_ERR_SPACE     with imut = 0 - 1807;
+let is i64 as FETCH_ERR_ALLOC     with imut = 0 - 1808;
+
+// Literal dimensions, per the note in proto/dns.cst.
+let is i64 as MAX_URL       with imut = 2048;
+let is i64 as MAX_HOST      with imut = 256;
+let is i64 as MAX_HEAD      with imut = 32768;
+let is i64 as MAX_REDIRECTS with imut = 20;
+// Every URL seen this fetch, so a cycle is a named error rather than a hop
+// count running out.
+let is i64 as SEEN_SLOTS    with imut = 24;
+
+let is i64 as DEFAULT_LIMIT with imut = 33554432;   // 32 MiB
+
+struct Fetch {
+    r    as http.Response;
+    body as bytes.Bytes;
+    u    as url.Url;
+
+    status    as i64;
+    nredirect as i64;
+    tls_err   as i64;         // the exact reason a handshake was refused
+    conn_err  as i64;         // the -errno a dial failed with
+    limit     as i64;         // body ceiling; 0 means DEFAULT_LIMIT
+
+    t as *trust.TrustStore;
+
+    final_url as [2048]u8;
+    hdrbuf    as *u8;         // MAX_HEAD, mmap'd
+    brbuf     as *u8;         // 16 KiB, mmap'd
+    c         as *conn.Conn;
+
+    seen    as *u8;           // SEEN_SLOTS * MAX_URL, mmap'd
+    nseen   as i64;
+    inited  as i64;
+}
+
+fn _slen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+fn _map_ok(p as *u8) as i64 {
+    let is i64 as v = cast(i64, p);
+    if (v == 0) { return 0; }
+    if (v == 0 - 1) { return 0; }
+    return 1;
+}
+
+fn _copy_str(dst as *u8, max as i64, src as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < max - 1 && src[i] != 0) { dst[i] = src[i]; i = i + 1; }
+    dst[i] = cast(u8, 0);
+    return i;
+}
+
+fn _streq(a as *u8, b as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (a[i] != 0 && b[i] != 0) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    if (a[i] != b[i]) { return 0; }
+    return 1;
+}
+
+// The trust store is the caller's: loading 121 anchors per request would
+// re-read and re-parse a few hundred kilobytes for every image on a page.
+fn fetch_init(f as *Fetch, t as *trust.TrustStore) as i64 {
+    f.t = t;
+    f.status = 0;
+    f.nredirect = 0;
+    f.tls_err = 0;
+    f.conn_err = 0;
+    f.limit = 0;
+    f.nseen = 0;
+    f.c = cast(*conn.Conn, 0);
+    f.final_url[0] = cast(u8, 0);
+    f.body = bytes.bytes_new(16384);
+    if (cast(i64, f.body.ptr) == 0) { return FETCH_ERR_ALLOC; }
+
+    f.hdrbuf = mem.core.mmap_anon(MAX_HEAD);
+    if (_map_ok(f.hdrbuf) == 0) {
+        bytes.bytes_free(&f.body);
+        f.hdrbuf = cast(*u8, 0);
+        return FETCH_ERR_ALLOC;
+    }
+    f.brbuf = mem.core.mmap_anon(16384);
+    if (_map_ok(f.brbuf) == 0) {
+        mem.core.munmap(f.hdrbuf, MAX_HEAD);
+        bytes.bytes_free(&f.body);
+        f.hdrbuf = cast(*u8, 0);
+        f.brbuf = cast(*u8, 0);
+        return FETCH_ERR_ALLOC;
+    }
+    f.seen = mem.core.mmap_anon(SEEN_SLOTS * MAX_URL);
+    if (_map_ok(f.seen) == 0) {
+        mem.core.munmap(f.hdrbuf, MAX_HEAD);
+        mem.core.munmap(f.brbuf, 16384);
+        bytes.bytes_free(&f.body);
+        f.hdrbuf = cast(*u8, 0);
+        f.brbuf = cast(*u8, 0);
+        f.seen = cast(*u8, 0);
+        return FETCH_ERR_ALLOC;
+    }
+    f.inited = 1;
+    return 0;
+}
+
+fn fetch_free(f as *Fetch) as void {
+    if (f.inited != 1) { return; }
+    if (cast(i64, f.c) != 0) { conn.conn_free(f.c); f.c = cast(*conn.Conn, 0); }
+    if (cast(i64, f.hdrbuf) != 0) { mem.core.munmap(f.hdrbuf, MAX_HEAD); }
+    if (cast(i64, f.brbuf) != 0) { mem.core.munmap(f.brbuf, 16384); }
+    if (cast(i64, f.seen) != 0) { mem.core.munmap(f.seen, SEEN_SLOTS * MAX_URL); }
+    bytes.bytes_free(&f.body);
+    f.hdrbuf = cast(*u8, 0);
+    f.brbuf = cast(*u8, 0);
+    f.seen = cast(*u8, 0);
+    f.inited = 0;
+}
+
+// Has this URL already been requested in this fetch? A redirect cycle that is
+// shorter than the hop limit would otherwise burn every hop before saying so,
+// and would say the wrong thing when it did.
+fn _seen_before(f as *Fetch, u as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < f.nseen) {
+        if (_streq(cast(*u8, cast(i64, f.seen) + i * MAX_URL), u) == 1) { return 1; }
+        i = i + 1;
+    }
+    if (f.nseen < SEEN_SLOTS) {
+        _copy_str(cast(*u8, cast(i64, f.seen) + f.nseen * MAX_URL), MAX_URL, u);
+        f.nseen = f.nseen + 1;
+    }
+    return 0;
+}
+
+// Open a socket to `u`'s host and wrap it in TLS if the scheme says so.
+fn _connect(f as *Fetch, u as *url.Url, deadline as i64) as *conn.Conn {
+    let is [256]u8 as host;
+    if (url.url_host(u, cast(*u8, &host), MAX_HOST) < 0) {
+        f.tls_err = FETCH_ERR_URL;
+        return cast(*conn.Conn, 0);
+    }
+    let is i64 as https = url.url_scheme_is(u, "https");
+    let is i64 as port with mut = u.port;
+    if (port <= 0) {
+        if (https == 1) { port = 443; } else { port = 80; }
+    }
+
+    let is *conn.Conn as raw = tp.dial_host(cast(*u8, &host), port);
+    if (cast(i64, raw) == 0) {
+        // A socket that never opened is a CONNECT failure, not a TLS one.
+        // Folding the two together tells a user their certificate is bad when
+        // the host simply refused the port.
+        f.conn_err = tp.dial_host_err();
+        return cast(*conn.Conn, 0);
+    }
+
+    // The socket's own timeout, in whole seconds — all set_recv_timeout
+    // accepts. It bounds ONE read; the deadline on the reader bounds the
+    // total. Neither alone is enough, which is why both are set. And it goes
+    // on the TCP Conn, before wrapping: transport's tuning casts ctx to a
+    // *TcpCtx without checking, so calling it on a TLS Conn would read the
+    // TLS context as a file descriptor.
+    let is i64 as secs with mut = 30;
+    if (deadline > 0) {
+        let is i64 as left = conn.deadline_remaining(deadline);
+        secs = (left + 999) / 1000;
+        if (secs < 1) { secs = 1; }
+        if (secs > 300) { secs = 300; }
+    }
+    tp.set_recv_timeout(raw, secs);
+    tp.set_send_timeout(raw, secs);
+    tp.set_nodelay(raw);
+
+    if (https == 0) { return raw; }
+
+    let is *conn.Conn as sec = tlsc.tls_client(raw, cast(*u8, &host), f.t);
+    if (cast(i64, sec) == 0) { f.tls_err = tlsc.tls_last_err(); }
+    return sec;
+}
+
+fn fetch_conn_err(f as *Fetch) as i64 { return f.conn_err; }
+fn fetch_tls_err(f as *Fetch) as i64 { return f.tls_err; }
+
+// One request/response exchange. `redir` is filled with the Location value
+// when the answer is a redirect, and left empty otherwise.
+fn _once(f as *Fetch, u as *url.Url, method as *u8, deadline as i64,
+         redir as *u8, redirmax as i64) as i64 {
+    redir[0] = cast(u8, 0);
+
+    if (cast(i64, f.c) != 0) { conn.conn_free(f.c); f.c = cast(*conn.Conn, 0); }
+    f.tls_err = 0;
+    f.conn_err = 0;
+    f.c = _connect(f, u, deadline);
+    if (cast(i64, f.c) == 0) {
+        if (f.tls_err != 0) { return FETCH_ERR_TLS; }
+        return FETCH_ERR_CONNECT;
+    }
+
+    let is bytes.Bytes as req with mut = bytes.bytes_new(1024);
+    if (cast(i64, req.ptr) == 0) { return FETCH_ERR_ALLOC; }
+    let is i64 as rc with mut = 0;
+    if (http.req_for_url(&req, method, u, 0) < 0) { rc = FETCH_ERR_SPACE; }
+    if (rc == 0) {
+        if (http.req_header(&req, "User-Agent", "caustic-net/0.1") < 0) { rc = FETCH_ERR_SPACE; }
+    }
+    if (rc == 0) {
+        if (http.req_header(&req, "Accept", "*/*") < 0) { rc = FETCH_ERR_SPACE; }
+    }
+    if (rc == 0) {
+        if (http.req_end(&req) < 0) { rc = FETCH_ERR_SPACE; }
+    }
+    if (rc != 0) { bytes.bytes_free(&req); return rc; }
+
+    let is i64 as sent = http.req_send(f.c, &req);
+    let is i64 as want = req.len;
+    bytes.bytes_free(&req);
+    if (sent != want) {
+        if (sent < 0) { return sent; }
+        return 0 - errno.EPIPE;
+    }
+
+    let is bufread.BufReader as br;
+    bufread.br_init(&br, f.c, f.brbuf, 16384);
+    bufread.br_set_deadline(&br, deadline);
+
+    rc = http.resp_read_head(&br, &f.r, f.hdrbuf, MAX_HEAD);
+    if (rc < 0) { return rc; }
+    f.status = f.r.status;
+
+    let is http.BodyReader as bd;
+    let is i64 as head_only with mut = 0;
+    if (_streq(method, "HEAD") == 1) { head_only = 1; }
+    http.body_init(&bd, &br, &f.r, head_only);
+
+    if (http.resp_is_redirect(&f.r) == 1) {
+        if (http.resp_location(&f.r, redir, redirmax) > 0) {
+            // Drain rather than close: the socket stays reusable, which is
+            // what client/pool.cst will want, and a redirect body is a few
+            // hundred bytes of "moved here" that nobody reads.
+            http.body_drain(&bd);
+            return 1;
+        }
+    }
+
+    let is i64 as lim with mut = f.limit;
+    if (lim <= 0) { lim = DEFAULT_LIMIT; }
+    bytes.bytes_reset(&f.body);
+    let is i64 as got = http.body_read_all(&bd, &f.body, lim);
+    if (got < 0) {
+        if (got == http.HTTP_ERR_SPACE) { return FETCH_ERR_LIMIT; }
+        return got;
+    }
+    return 0;
+}
+
+// GET `target`, following redirects, into f.body.
+//
+// `deadline` is absolute, from conn.deadline_in(ms); 0 means no ceiling. It
+// covers the WHOLE fetch including every hop, which is what a browser tab
+// actually needs — a per-hop timeout multiplied by twenty redirects is not a
+// timeout.
+fn fetch_get(f as *Fetch, target as *u8, deadline as i64) as i64 {
+    return fetch_method(f, "GET", target, deadline);
+}
+
+fn fetch_method(f as *Fetch, method as *u8, target as *u8,
+                deadline as i64) as i64 {
+    if (f.inited != 1) { return FETCH_ERR_ALLOC; }
+    f.nredirect = 0;
+    f.nseen = 0;
+    f.status = 0;
+    f.tls_err = 0;
+    f.conn_err = 0;
+
+    let is [2048]u8 as cur;
+    if (_copy_str(cast(*u8, &cur), MAX_URL, target) <= 0) { return FETCH_ERR_URL; }
+
+    let is [2048]u8 as next;
+    let is [2048]u8 as loc;
+    let is [16]u8 as m;
+    _copy_str(cast(*u8, &m), 16, method);
+
+    while (1 == 1) {
+        f.u = url.url_parse(cast(*u8, &cur));
+        if (f.u.ok != 0) { return FETCH_ERR_URL; }
+        if (url.url_scheme_is(&f.u, "http") == 0) {
+            if (url.url_scheme_is(&f.u, "https") == 0) { return FETCH_ERR_SCHEME; }
+        }
+        if (_seen_before(f, cast(*u8, &cur)) == 1) { return FETCH_ERR_REDIRECTS; }
+        _copy_str(cast(*u8, &f.final_url), MAX_URL, cast(*u8, &cur));
+
+        let is i64 as rc = _once(f, &f.u, cast(*u8, &m), deadline,
+                                 cast(*u8, &loc), MAX_URL);
+        if (rc < 0) { return rc; }
+        if (rc == 0) { return 0; }
+
+        // --- it is a redirect -------------------------------------------
+        if (f.nredirect >= MAX_REDIRECTS) { return FETCH_ERR_REDIRECTS; }
+        f.nredirect = f.nredirect + 1;
+
+        // Location may be relative; url_resolve already implements RFC 3986
+        // §5.2, which is why this is one call and not a special case.
+        let is url.Url as nu = url.url_resolve(&f.u, cast(*u8, &loc),
+                                               cast(*u8, &next), MAX_URL);
+        if (nu.ok != 0) { return FETCH_ERR_URL; }
+
+        let is i64 as pol = redirect_allowed(&f.u, &nu);
+        if (pol != 0) { return pol; }
+
+        let is [16]u8 as nm;
+        redirect_method(f.status, cast(*u8, &m), cast(*u8, &nm), 16);
+        _copy_str(cast(*u8, &m), 16, cast(*u8, &nm));
+
+        _copy_str(cast(*u8, &cur), MAX_URL, cast(*u8, &next));
+    }
+    return FETCH_ERR_REDIRECTS;
+}
+
+// --- Redirect policy, as two functions with no I/O in them --------------
+//
+// Pulled out so they can be tested directly. The https-to-http rule in
+// particular is not reachable from a loopback test — that would need a TLS
+// server — and a rule that can only be exercised against the live internet is
+// a rule that is not exercised.
+
+// May a request for `from` be redirected to `to`? 0 yes, or the reason not.
+fn redirect_allowed(from as *url.Url, to as *url.Url) as i64 {
+    // No downgrade. A redirect from https to http hands the rest of the
+    // exchange to anyone on the path, and the request that started it asked
+    // not to be readable. http to https is fine and common.
+    if (url.url_scheme_is(from, "https") == 1) {
+        if (url.url_scheme_is(to, "https") == 0) { return FETCH_ERR_DOWNGRADE; }
+    }
+    if (url.url_scheme_is(to, "http") == 0) {
+        if (url.url_scheme_is(to, "https") == 0) { return FETCH_ERR_SCHEME; }
+    }
+    return 0;
+}
+
+// The method to use on the next hop. RFC 9110 §15.4: 301, 302 and 303 turn
+// anything but HEAD into a GET; 307 and 308 preserve the method exactly,
+// which is the whole reason they were defined.
+fn redirect_method(status as i64, method as *u8, out as *u8, max as i64) as void {
+    if (_streq(method, "HEAD") == 1) { _copy_str(out, max, "HEAD"); return; }
+    if (status == 307 || status == 308) { _copy_str(out, max, method); return; }
+    _copy_str(out, max, "GET");
+}
+
+fn fetch_status(f as *Fetch) as i64      { return f.status; }
+fn fetch_body(f as *Fetch) as *u8        { return f.body.ptr; }
+fn fetch_body_len(f as *Fetch) as i64    { return f.body.len; }
+fn fetch_final_url(f as *Fetch) as *u8   { return cast(*u8, &f.final_url); }
+fn fetch_redirects(f as *Fetch) as i64   { return f.nredirect; }
+
+// A response header by name, into the caller's buffer.
+fn fetch_header(f as *Fetch, name as *u8, out as *u8, max as i64) as i64 {
+    return http.resp_header(&f.r, name, out, max);
+}
+
+fn fetch_err_name(e as i64) as *u8 {
+    if (e == 0)                    { return "OK"; }
+    if (e == FETCH_ERR_SCHEME)     { return "FETCH_ERR_SCHEME"; }
+    if (e == FETCH_ERR_URL)        { return "FETCH_ERR_URL"; }
+    if (e == FETCH_ERR_CONNECT)    { return "FETCH_ERR_CONNECT"; }
+    if (e == FETCH_ERR_TLS)        { return "FETCH_ERR_TLS"; }
+    if (e == FETCH_ERR_LIMIT)      { return "FETCH_ERR_LIMIT"; }
+    if (e == FETCH_ERR_REDIRECTS)  { return "FETCH_ERR_REDIRECTS"; }
+    if (e == FETCH_ERR_DOWNGRADE)  { return "FETCH_ERR_DOWNGRADE"; }
+    if (e == FETCH_ERR_SPACE)      { return "FETCH_ERR_SPACE"; }
+    if (e == FETCH_ERR_ALLOC)      { return "FETCH_ERR_ALLOC"; }
+    return "FETCH_ERR_UNKNOWN";
+}

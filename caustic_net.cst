@@ -39,3 +39,4 @@ use "./tls/verify.cst" as verify;
 use "./tls/extensions.cst" as extensions;
 use "./tls/handshake.cst" as handshake;
 use "./tls/client.cst" as tls;
+use "./client/fetch.cst" as fetch;
