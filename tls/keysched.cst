@@ -1,0 +1,280 @@
+// =======================================================
+// caustic-net/tls/keysched.cst
+// The TLS 1.3 key schedule — RFC 8446 §7.1.
+//
+// Everything in a TLS 1.3 connection descends from three HKDF-Extract steps
+// chained through a Derive-Secret, and each step mixes in the transcript hash
+// at exactly the point the peer will have the same one:
+//
+//        0
+//        |
+//        v
+//   PSK -> HKDF-Extract = Early Secret
+//        |
+//        +-> Derive-Secret(., "ext binder"|"res binder", "")
+//        +-> Derive-Secret(., "c e traffic", ClientHello)
+//        +-> Derive-Secret(., "e exp master", ClientHello)
+//        v
+//   Derive-Secret(., "derived", "")
+//        |
+//        v
+// (EC)DHE -> HKDF-Extract = Handshake Secret
+//        |
+//        +-> Derive-Secret(., "c hs traffic", ClientHello..ServerHello)
+//        +-> Derive-Secret(., "s hs traffic", ClientHello..ServerHello)
+//        v
+//   Derive-Secret(., "derived", "")
+//        |
+//        v
+//      0 -> HKDF-Extract = Master Secret
+//        |
+//        +-> Derive-Secret(., "c ap traffic", ClientHello..server Finished)
+//        +-> Derive-Secret(., "s ap traffic", ClientHello..server Finished)
+//        +-> Derive-Secret(., "exp master",   ClientHello..server Finished)
+//        +-> Derive-Secret(., "res master",   ClientHello..client Finished)
+//
+// caustic-crypto supplies HKDF-Extract and HKDF-Expand, and nothing above
+// them: HKDF-Expand-Label and Derive-Secret are TLS's own encoding of the
+// `info` argument, so they live here. Getting that encoding wrong produces a
+// perfectly valid-looking key that simply is not the peer's, and the first
+// sign of it is a Finished MAC that does not verify — thirty byte-exact
+// details downstream of the mistake. Which is why this module is written and
+// tested BEFORE a single byte of protocol: RFC 8448 publishes every
+// intermediate value of a real handshake, so each line here has something to
+// be checked against on its own.
+// =======================================================
+
+use "caustic-crypto/mac/hmac.cst" as hmac;
+use "caustic-crypto/kdf/hkdf.cst" as hkdf;
+use "./transcript.cst" as transcript;
+
+let is i64 as KS_ERR_SPACE with imut = 0 - 1500;
+
+// The longest hash this schedule runs on, and the longest label the RFC
+// defines ("res master" and friends are all short; the buffer is sized for
+// the HkdfLabel around them).
+let is i64 as MAX_DIGEST with imut = 48;
+let is i64 as MAX_LABEL  with imut = 64;
+
+// The widest HkdfLabel the bounds above allow:
+//   2 length + 1 label-len + 6 "tls13 " + MAX_LABEL + 1 ctx-len + MAX_DIGEST
+// The buffer below is spelled as a literal because CI builds against the
+// published toolchain, where a named dimension sizes an array to nothing;
+// tests/test_ks.cst pins the literal to this constant so they cannot drift.
+let is i64 as MAX_INFO with imut = 2 + 1 + 6 + 64 + 1 + 48;   // 122
+let is i64 as INFO_BUF with imut = 128;
+
+// --- HKDF-Expand-Label — RFC 8446 §7.1 ---------------------------------
+//
+//   struct {
+//       uint16 length;
+//       opaque label<7..255>  = "tls13 " + Label;
+//       opaque context<0..255>;
+//   } HkdfLabel;
+//
+// Three details, each of which silently produces a different key:
+//   * `length` is the OUTPUT length, big-endian, not the label's.
+//   * the "tls13 " prefix is part of the label and COUNTS in its length byte.
+//   * both label and context carry a one-byte length, and the context's is
+//     present even when the context is empty.
+// Serialize the HkdfLabel into `out`, returning its length or KS_ERR_SPACE.
+//
+// Separate from the expansion so it can be asserted on its own: RFC 8448
+// prints the exact `info` bytes for each derivation, which makes this encoding
+// checkable directly instead of only through a matching output. Every mistake
+// available here produces a valid-looking key that is simply not the peer's.
+fn build_hkdf_label(label as *u8, label_len as i64,
+                    ctx as *u8, ctx_len as i64, out_len as i64,
+                    out as *u8, out_cap as i64) as i64 {
+    if (label_len < 0 || label_len > MAX_LABEL) { return KS_ERR_SPACE; }
+    if (ctx_len < 0 || ctx_len > MAX_DIGEST) { return KS_ERR_SPACE; }
+    if (out_len < 0 || out_len > 65535) { return KS_ERR_SPACE; }
+    let is i64 as need = 2 + 1 + 6 + label_len + 1 + ctx_len;
+    if (need > out_cap) { return KS_ERR_SPACE; }
+
+    let is i64 as w with mut = 0;
+    out[w] = cast(u8, (out_len >> 8) & 255); w = w + 1;   // the OUTPUT length
+    out[w] = cast(u8, out_len & 255);        w = w + 1;
+
+    out[w] = cast(u8, 6 + label_len); w = w + 1;          // "tls13 " counts here
+    out[w] = cast(u8, 116); w = w + 1;   // 't'
+    out[w] = cast(u8, 108); w = w + 1;   // 'l'
+    out[w] = cast(u8, 115); w = w + 1;   // 's'
+    out[w] = cast(u8, 49);  w = w + 1;   // '1'
+    out[w] = cast(u8, 51);  w = w + 1;   // '3'
+    out[w] = cast(u8, 32);  w = w + 1;   // ' '
+    let is i64 as i with mut = 0;
+    while (i < label_len) { out[w + i] = label[i]; i = i + 1; }
+    w = w + label_len;
+
+    out[w] = cast(u8, ctx_len); w = w + 1;                // present even at 0
+    i = 0;
+    while (i < ctx_len) { out[w + i] = ctx[i]; i = i + 1; }
+    w = w + ctx_len;
+    return w;
+}
+
+fn hkdf_expand_label(alg as *hmac.HashAlg, secret as *u8,
+                     label as *u8, label_len as i64,
+                     ctx as *u8, ctx_len as i64,
+                     out as *u8, out_len as i64) as i64 {
+    let is [128]u8 as info;
+    let is i64 as n = build_hkdf_label(label, label_len, ctx, ctx_len, out_len,
+                                       cast(*u8, &info), 128);
+    if (n < 0) { return n; }
+    hkdf.hkdf_expand(alg, secret, alg.digest, cast(*u8, &info), n, out, out_len);
+    return 0;
+}
+
+fn _slen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+// The same, taking a NUL-terminated label — every caller in the RFC has one.
+fn expand_label(alg as *hmac.HashAlg, secret as *u8, label as *u8,
+                ctx as *u8, ctx_len as i64, out as *u8, out_len as i64) as i64 {
+    return hkdf_expand_label(alg, secret, label, _slen(label), ctx, ctx_len, out, out_len);
+}
+
+// Derive-Secret(Secret, Label, Messages)
+//   = HKDF-Expand-Label(Secret, Label, Transcript-Hash(Messages), Hash.length)
+//
+// `thash` is the transcript hash already computed by the caller, because the
+// caller is the one that knows which messages are in scope — and getting THAT
+// wrong is the other half of the same class of bug.
+fn derive_secret(alg as *hmac.HashAlg, secret as *u8, label as *u8,
+                 thash as *u8, out as *u8) as i64 {
+    return expand_label(alg, secret, label, thash, alg.digest, out, alg.digest);
+}
+
+// --- The schedule ------------------------------------------------------
+
+struct Secrets {
+    alg_kind as i64;      // transcript.TR_SHA256 / TR_SHA384
+    dlen     as i64;      // the hash length, so callers need not ask twice
+
+    early    as [48]u8;
+    handshake as [48]u8;
+    master   as [48]u8;
+
+    c_hs     as [48]u8;   // client_handshake_traffic_secret
+    s_hs     as [48]u8;   // server_handshake_traffic_secret
+    c_ap     as [48]u8;   // client_application_traffic_secret_0
+    s_ap     as [48]u8;   // server_application_traffic_secret_0
+    exp      as [48]u8;   // exporter_master_secret
+    res      as [48]u8;   // resumption_master_secret
+}
+
+let is [48]u8 as _zeros with mut;
+
+// Early Secret = HKDF-Extract(salt = 0, IKM = PSK or zeros).
+//
+// With no PSK the IKM is a string of Hash.length zero bytes — NOT an empty
+// input. HKDF-Extract of nothing and of zeros give different PRKs, and the
+// difference does not show up until Finished.
+fn ks_early(s as *Secrets, alg_kind as i64, psk as *u8, psk_len as i64) as void {
+    s.alg_kind = alg_kind;
+    let is hmac.HashAlg as alg = _alg_of(alg_kind);
+    s.dlen = alg.digest;
+
+    let is i64 as i with mut = 0;
+    while (i < 48) { _zeros[i] = cast(u8, 0); i = i + 1; }
+
+    if (psk_len > 0) {
+        hkdf.hkdf_extract(&alg, cast(*u8, 0), 0, psk, psk_len, cast(*u8, &s.early));
+    } else {
+        hkdf.hkdf_extract(&alg, cast(*u8, 0), 0, cast(*u8, &_zeros), alg.digest,
+                          cast(*u8, &s.early));
+    }
+}
+
+fn _alg_of(kind as i64) as hmac.HashAlg {
+    if (kind == transcript.TR_SHA384) { return hmac.alg_sha384(); }
+    return hmac.alg_sha256();
+}
+
+// Handshake Secret = HKDF-Extract(
+//     salt = Derive-Secret(Early, "derived", ""), IKM = (EC)DHE )
+//
+// `empty_hash` is Transcript-Hash("") for this hash — the "" in the diagram is
+// an empty MESSAGE LIST, whose hash is the hash of no bytes, not an empty
+// context. Passing a zero-length context here instead is the single most
+// common way to get a schedule that runs and produces the wrong keys.
+fn ks_handshake(s as *Secrets, ecdhe as *u8, ecdhe_len as i64,
+                empty_hash as *u8, hs_thash as *u8) as void {
+    let is hmac.HashAlg as alg = _alg_of(s.alg_kind);
+    let is [48]u8 as salt;
+    derive_secret(&alg, cast(*u8, &s.early), "derived", empty_hash, cast(*u8, &salt));
+
+    hkdf.hkdf_extract(&alg, cast(*u8, &salt), alg.digest, ecdhe, ecdhe_len,
+                      cast(*u8, &s.handshake));
+
+    derive_secret(&alg, cast(*u8, &s.handshake), "c hs traffic", hs_thash, cast(*u8, &s.c_hs));
+    derive_secret(&alg, cast(*u8, &s.handshake), "s hs traffic", hs_thash, cast(*u8, &s.s_hs));
+}
+
+// Master Secret = HKDF-Extract(
+//     salt = Derive-Secret(Handshake, "derived", ""), IKM = 0 )
+//
+// `ap_thash` is the transcript through the SERVER's Finished; `res_thash` is
+// through the CLIENT's. They are different messages and produce different
+// secrets, which is why both are parameters rather than one being reused.
+fn ks_application(s as *Secrets, empty_hash as *u8,
+                  ap_thash as *u8, res_thash as *u8) as void {
+    let is hmac.HashAlg as alg = _alg_of(s.alg_kind);
+    let is [48]u8 as salt;
+    derive_secret(&alg, cast(*u8, &s.handshake), "derived", empty_hash, cast(*u8, &salt));
+
+    let is i64 as i with mut = 0;
+    while (i < 48) { _zeros[i] = cast(u8, 0); i = i + 1; }
+    hkdf.hkdf_extract(&alg, cast(*u8, &salt), alg.digest, cast(*u8, &_zeros), alg.digest,
+                      cast(*u8, &s.master));
+
+    derive_secret(&alg, cast(*u8, &s.master), "c ap traffic", ap_thash, cast(*u8, &s.c_ap));
+    derive_secret(&alg, cast(*u8, &s.master), "s ap traffic", ap_thash, cast(*u8, &s.s_ap));
+    derive_secret(&alg, cast(*u8, &s.master), "exp master",   ap_thash, cast(*u8, &s.exp));
+    derive_secret(&alg, cast(*u8, &s.master), "res master",   res_thash, cast(*u8, &s.res));
+}
+
+// --- Traffic keys ------------------------------------------------------
+//
+// [sender]_write_key = HKDF-Expand-Label(Secret, "key", "", key_length)
+// [sender]_write_iv  = HKDF-Expand-Label(Secret, "iv",  "", iv_length)
+//
+// The context is empty here — genuinely empty, not the empty transcript hash.
+// The two "empty"s in this file mean different things and are three lines
+// apart, which is exactly why each one says which it is.
+fn ks_traffic_keys(s as *Secrets, secret as *u8,
+                   key as *u8, key_len as i64, iv as *u8, iv_len as i64) as i64 {
+    let is hmac.HashAlg as alg = _alg_of(s.alg_kind);
+    let is i64 as rc with mut = expand_label(&alg, secret, "key", cast(*u8, 0), 0, key, key_len);
+    if (rc < 0) { return rc; }
+    return expand_label(&alg, secret, "iv", cast(*u8, 0), 0, iv, iv_len);
+}
+
+// The Finished MAC key for a traffic secret: RFC 8446 §4.4.4.
+//   finished_key = HKDF-Expand-Label(BaseKey, "finished", "", Hash.length)
+fn ks_finished_key(s as *Secrets, secret as *u8, out as *u8) as i64 {
+    let is hmac.HashAlg as alg = _alg_of(s.alg_kind);
+    return expand_label(&alg, secret, "finished", cast(*u8, 0), 0, out, alg.digest);
+}
+
+// verify_data = HMAC(finished_key, Transcript-Hash(...))
+fn ks_finished(s as *Secrets, secret as *u8, thash as *u8, out as *u8) as i64 {
+    let is hmac.HashAlg as alg = _alg_of(s.alg_kind);
+    let is [48]u8 as fk;
+    let is i64 as rc = ks_finished_key(s, secret, cast(*u8, &fk));
+    if (rc < 0) { return rc; }
+    hmac.hmac(&alg, cast(*u8, &fk), alg.digest, thash, alg.digest, out);
+    return 0;
+}
+
+// The next traffic secret after a KeyUpdate: RFC 8446 §7.2.
+//   application_traffic_secret_N+1 =
+//       HKDF-Expand-Label(application_traffic_secret_N, "traffic upd", "", Hash.length)
+fn ks_update_secret(s as *Secrets, secret as *u8, out as *u8) as i64 {
+    let is hmac.HashAlg as alg = _alg_of(s.alg_kind);
+    return expand_label(&alg, secret, "traffic upd", cast(*u8, 0), 0, out, alg.digest);
+}

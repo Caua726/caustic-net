@@ -1,0 +1,84 @@
+// =======================================================
+// caustic-net/tls/transcript.cst
+// The handshake transcript hash.
+//
+// TLS 1.3 binds almost everything to a running hash of every handshake
+// message sent so far — the key schedule derives from it, Finished
+// authenticates it, CertificateVerify signs it. The awkward part is that the
+// hash has to be READ at several points WITHOUT being ended: after
+// ServerHello, after EncryptedExtensions+Certificate+CertificateVerify, after
+// each Finished, and it keeps growing between them.
+//
+// sha256_final is destructive — it appends the padding and length and
+// compresses — so reading the running hash means hashing a COPY. That works
+// here because caustic-crypto's Sha256/Sha512 are flat PODs: fixed inline
+// arrays and scalars, no pointer, no heap. A plain struct assignment is a
+// complete, independent clone. tests/test_dep.cst checks that property
+// directly, since everything below depends on it and it is a property of the
+// other library rather than of this one.
+//
+// SHA-384 shares Sha512's state and differs only in init and final, which is
+// why the two live behind one struct here instead of two.
+// =======================================================
+
+use "caustic-crypto/hash/sha2.cst" as sha2;
+use "caustic-crypto/mac/hmac.cst" as hmac;
+
+let is i64 as TR_SHA256 with imut = 0;
+let is i64 as TR_SHA384 with imut = 1;
+
+let is i64 as TR_MAX_DIGEST with imut = 48;
+
+struct Transcript {
+    alg  as i64;          // TR_SHA256 / TR_SHA384
+    h256 as sha2.Sha256;
+    h512 as sha2.Sha512;  // SHA-384 runs on this
+}
+
+fn tr_init(t as *Transcript, alg as i64) as void {
+    t.alg = alg;
+    if (alg == TR_SHA384) { sha2.sha384_init(&t.h512); }
+    else { sha2.sha256_init(&t.h256); }
+}
+
+fn tr_digest_len(t as *Transcript) as i64 {
+    if (t.alg == TR_SHA384) { return 48; }
+    return 32;
+}
+
+// The HashAlg the key schedule needs, matching this transcript's hash. Kept
+// here so a caller cannot pair a SHA-256 transcript with a SHA-384 schedule.
+fn tr_hash_alg(t as *Transcript) as hmac.HashAlg {
+    if (t.alg == TR_SHA384) { return hmac.alg_sha384(); }
+    return hmac.alg_sha256();
+}
+
+fn tr_update(t as *Transcript, p as *u8, n as i64) as void {
+    if (t.alg == TR_SHA384) { sha2.sha512_update(&t.h512, p, n); }
+    else { sha2.sha256_update(&t.h256, p, n); }
+}
+
+// The hash of everything so far, WITHOUT ending the transcript.
+//
+// The clone is the whole point. Calling final on the live state would append
+// padding to it, and every message after that would hash into a state the
+// peer never had — a Finished that cannot match, from a mistake several
+// messages upstream of where it surfaces.
+fn tr_digest(t as *Transcript, out as *u8) as void {
+    if (t.alg == TR_SHA384) {
+        let is sha2.Sha512 as snap = t.h512;
+        sha2.sha384_final(&snap, out);
+        return;
+    }
+    let is sha2.Sha256 as snap = t.h256;
+    sha2.sha256_final(&snap, out);
+}
+
+// The hash of the empty transcript, which the key schedule needs for
+// Derive-Secret with an empty context. Cheap enough to recompute; naming it
+// keeps the reason visible at the call site.
+fn tr_empty_hash(alg as i64, out as *u8) as void {
+    let is Transcript as t;
+    tr_init(&t, alg);
+    tr_digest(&t, out);
+}

@@ -69,7 +69,7 @@ core/        conn (the vtable) · errno · bytes (Bytes/Slice) · bufread (lines
              entropy (checked CSPRNG) · chrono (epoch ↔ civil, ASN.1 + HTTP dates)
 transport/   tcp_conn (TCP→Conn) · transport (dial/dial_host/listen/accept) · resolver · epoll*
 proto/       url · http1 · dns · cookie* · http2* · websocket* · sse* · mime*
-tls/         records* · handshake* · keyschedule* · client* (implements Conn)
+tls/         transcript · keysched · record* · x509* · verify* · handshake* · client*
 server/      router* · threaded* · reactor* · static* · middleware*
 client/      fetch* (url→dns→connect→tls→http→redirect→decompress)
 ```
@@ -125,6 +125,8 @@ client/      fetch* (url→dns→connect→tls→http→redirect→decompress)
 | proto | `dns` — wire codec, no I/O | ✅ green (`tests/test_dns`, 2 live captures + 15 hostile packets) |
 | transport | `resolver` — `hosts` · `resolv.conf` incl. `search`/`ndots` · IPv4+IPv6 · UDP + TCP fallback · TTL cache (SOA-derived on a negative) · `dial_host` | ✅ green (`tests/test_res`, `examples/dns_lookup`) |
 | deps | `caustic-crypto` v0.1.0 wired in | ✅ green (`tests/test_dep`) |
+| tls | `transcript` — cloneable handshake hash | ✅ green (`tests/test_ks`) |
+| tls | `keysched` — HKDF-Expand-Label · Derive-Secret · the full schedule | ✅ green (`tests/test_ks`, RFC 8448 §3) |
 | everything else | see the roadmap | ⏳ |
 
 The three ⛔ rows above were all "the toolchain can't yet"; stdlib v0.1.6 closed each one, so
