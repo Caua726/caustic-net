@@ -1,0 +1,249 @@
+// =======================================================
+// caustic-net/tests/test_pss.cst
+// EMSA-PSS-VERIFY against NIST's corpus and against chosen encodings.
+//
+// Two sources, because neither alone is enough.
+//
+// NIST CAVP (tests/vec_pss.cst) says the verifier accepts real signatures and
+// rejects the five ways a signature is normally wrong. It cannot say anything
+// about the inside of the encoding: every CAVP modulus is a whole number of
+// bytes, and every failure is applied to the message, the exponent or the
+// signature — never to a chosen EM.
+//
+// So tests/vec_pss_crafted.cst carries signatures built from an EM this
+// repository chose, over throwaway keys, which is the only way to reach
+// emLen == k-1, an EM wider than emBits, non-zero leading bits, a signature
+// with n added to it, a valid signature with a 513-byte salt, a bad 0xbc
+// trailer, a non-zero PS byte and a missing separator.
+//
+// Deleting any one guard in tls/pss.cst makes something here fail, with two
+// stated exceptions: the negative-salt-length check and the
+// emLen < hLen+sLen+2 check. Both exist to stop an out-of-range read, and in
+// a language without bounds checking that read returns a stale byte which
+// happens to give the same answer. The reason is written at each of them in
+// the source rather than papered over here.
+//
+// Exit 0 = all pass. Non-zero = the numbered check that failed.
+// =======================================================
+
+use "std/io.cst" as io;
+use "caustic-crypto/pk/rsa.cst" as rsa;
+use "caustic-crypto/bigint/bigint.cst" as bi;
+use "caustic-crypto/mac/hmac.cst" as hmac;
+use "../tls/pss.cst" as pss;
+use "./vec_pss.cst" as v;
+use "./vec_pss_crafted.cst" as vc;
+
+// The three hashes the module has to serve, chosen by the vector's SHAAlg.
+fn alg_of(sha as i64) as hmac.HashAlg {
+    if (sha == 384) { return hmac.alg_sha384(); }
+    if (sha == 512) { return hmac.alg_sha512(); }
+    return hmac.alg_sha256();
+}
+
+fn eq(a as *u8, b as *u8, n as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn main() as i32 {
+    // ===== the literal buffer dimensions =============================
+    // Every scratch array in tls/pss.cst is spelled with a literal, because
+    // the compiler release CI installs does not yet resolve a named constant
+    // in an array dimension. These pins are what stops the constant and the
+    // literal from drifting apart in silence.
+    if (pss.PSS_MAX_EM != 1024) { return 1; }     // [1024]u8 em, dbmask, db
+    if (pss.PSS_MAX_HASH != 64) { return 2; }     // [64]u8 H, hprime, digest
+    if (pss.PSS_MAX_SALT != 512) { return 3; }
+    if (pss.PSS_MPRIME != 584) { return 4; }      // [584]u8 mprime
+
+    // ===== MGF1 ======================================================
+    // Lengths that are not multiples of the digest size: a counter that
+    // starts at 1, or a last block that is padded instead of truncated,
+    // diverges only in the tail and would survive a length-hLen test.
+    vc.mg_ensure();
+    let is [512]u8 as mgbuf;
+    let is i64 as i with mut = 0;
+    while (i < vc.MG_COUNT) {
+        let is hmac.HashAlg as ma = alg_of(vc.mg_sha(i));
+        let is i64 as n = vc.mg_len(i);
+
+        // Canary past the requested length. Comparing only the first n bytes
+        // cannot see a last block that is written whole instead of truncated:
+        // the prefix is right either way, and the overrun lands in whatever
+        // buffer the caller passed. Inside pss_verify that buffer has room,
+        // so nothing would ever surface.
+        let is i64 as j with mut = 0;
+        while (j < 512) { mgbuf[j] = cast(u8, 0x5A); j = j + 1; }
+
+        pss.mgf1(&ma, vc.MG_SEED, vc.MG_SEED_LEN, cast(*u8, &mgbuf), n);
+        if (eq(cast(*u8, &mgbuf), vc.mg_out(i), n) == 0) {
+            io.printf("mgf1 case %ld (sha%ld, %ld bytes) differs\n",
+                      i, vc.mg_sha(i), n);
+            return 5;
+        }
+        j = n;
+        while (j < 512) {
+            if (mgbuf[j] != 0x5A) {
+                io.printf("mgf1 case %ld wrote %ld bytes past the %ld asked for\n",
+                          i, j - n + 1, n);
+                return 6;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    // A zero-length request must write nothing rather than one block.
+    mgbuf[0] = cast(u8, 0xAA);
+    let is hmac.HashAlg as a256 = hmac.alg_sha256();
+    pss.mgf1(&a256, vc.MG_SEED, vc.MG_SEED_LEN, cast(*u8, &mgbuf), 0);
+    if (mgbuf[0] != 0xAA) { return 7; }
+
+    // ===== the CAVP corpus ===========================================
+    v.pv_ensure();
+    let is i64 as npass with mut = 0;
+    let is i64 as nfail with mut = 0;
+    let is i64 as ndiff with mut = 0;
+
+    i = 0;
+    while (i < v.PV_COUNT) {
+        let is rsa.RsaPub as pub;
+        rsa.rsa_pub_from_bytes(&pub, v.pv_n(i), v.pv_nlen(i),
+                               v.pv_e(i), v.pv_elen(i));
+        let is hmac.HashAlg as alg = alg_of(v.pv_sha(i));
+
+        let is i64 as got = pss.pss_verify(&pub, &alg,
+                                           v.pv_msg(i), v.pv_mlen(i),
+                                           v.pv_sig(i), v.pv_siglen(i),
+                                           v.pv_salt(i));
+        if (got != v.pv_want(i)) {
+            io.printf("CAVP vector %ld (sha%ld salt %ld reason %ld): got %ld want %ld\n",
+                      i, v.pv_sha(i), v.pv_salt(i), v.pv_reason(i),
+                      got, v.pv_want(i));
+            return 8;
+        }
+        if (v.pv_want(i) == 1) { npass = npass + 1; } else { nfail = nfail + 1; }
+
+        // Where caustic-crypto can answer at all — SHA-256 with the salt at
+        // hLen, which is all its own verifier accepts — it has to agree. A
+        // disagreement means one of the two is wrong and neither corpus
+        // would say which.
+        if (v.pv_sha(i) == 256 && v.pv_salt(i) == 32) {
+            let is i64 as theirs = rsa.rsa_pss_sha256_verify(&pub, v.pv_msg(i),
+                                                             v.pv_mlen(i),
+                                                             v.pv_sig(i));
+            if (theirs != got) {
+                io.printf("CAVP vector %ld: caustic-crypto says %ld, we say %ld\n",
+                          i, theirs, got);
+                return 9;
+            }
+            ndiff = ndiff + 1;
+        }
+
+        bi.big_free(&pub.n);
+        bi.big_free(&pub.e);
+        i = i + 1;
+    }
+    if (npass != 27) { io.printf("expected 27 passing CAVP vectors, saw %ld\n", npass); return 10; }
+    if (nfail != 75) { io.printf("expected 75 failing CAVP vectors, saw %ld\n", nfail); return 11; }
+    if (ndiff != 18) { io.printf("expected 18 differential vectors, saw %ld\n", ndiff); return 12; }
+
+    // ===== the crafted encodings =====================================
+    vc.pc_ensure();
+    i = 0;
+    while (i < vc.PC_COUNT) {
+        let is rsa.RsaPub as pub;
+        rsa.rsa_pub_from_bytes(&pub, vc.pc_n(i), vc.pc_nlen(i),
+                               vc.pc_e(i), vc.pc_elen(i));
+        let is hmac.HashAlg as alg = alg_of(vc.pc_sha(i));
+        let is i64 as got = pss.pss_verify(&pub, &alg,
+                                           vc.PC_MSG, vc.PC_MSG_LEN,
+                                           vc.pc_sig(i), vc.pc_siglen(i),
+                                           vc.pc_salt(i));
+        if (got != vc.pc_want(i)) {
+            io.printf("crafted vector %ld (sha%ld salt %ld): got %ld want %ld\n",
+                      i, vc.pc_sha(i), vc.pc_salt(i), got, vc.pc_want(i));
+            return 13;
+        }
+        bi.big_free(&pub.n);
+        bi.big_free(&pub.e);
+        i = i + 1;
+    }
+
+    // ===== the guards, one at a time =================================
+    // PC_OK2048 is a plain valid 2048-bit SHA-256 signature with a 32-byte
+    // salt. Everything below perturbs one argument of that same call.
+    let is i64 as ok = vc.PC_OK2048;
+    let is rsa.RsaPub as p2;
+    rsa.rsa_pub_from_bytes(&p2, vc.pc_n(ok), vc.pc_nlen(ok),
+                           vc.pc_e(ok), vc.pc_elen(ok));
+    let is i64 as k2 = vc.pc_siglen(ok);
+    if (p2.k != k2) { return 14; }
+
+    // Baseline: it really does verify.
+    if (pss.pss_verify(&p2, &a256, vc.PC_MSG, vc.PC_MSG_LEN,
+                       vc.pc_sig(ok), k2, 32) != 1) { return 15; }
+
+    // A signature shorter or longer than the modulus is refused rather than
+    // read past. The caller here is a certificate parser handing over a span
+    // it read off the wire, so this is not a theoretical argument.
+    if (pss.pss_verify(&p2, &a256, vc.PC_MSG, vc.PC_MSG_LEN,
+                       vc.pc_sig(ok), k2 - 1, 32) != 0) { return 16; }
+    if (pss.pss_verify(&p2, &a256, vc.PC_MSG, vc.PC_MSG_LEN,
+                       vc.pc_sig(ok), k2 + 1, 32) != 0) { return 17; }
+
+    // The salt length is an argument, and a wrong one has to fail. One byte
+    // short lands in the PS run; one byte long eats the 0x01 separator.
+    if (pss.pss_verify(&p2, &a256, vc.PC_MSG, vc.PC_MSG_LEN,
+                       vc.pc_sig(ok), k2, 31) != 0) { return 18; }
+    if (pss.pss_verify(&p2, &a256, vc.PC_MSG, vc.PC_MSG_LEN,
+                       vc.pc_sig(ok), k2, 33) != 0) { return 19; }
+
+    // Past the salt ceiling, and negative.
+    if (pss.pss_verify(&p2, &a256, vc.PC_MSG, vc.PC_MSG_LEN,
+                       vc.pc_sig(ok), k2, pss.PSS_MAX_SALT + 1) != 0) { return 20; }
+    if (pss.pss_verify(&p2, &a256, vc.PC_MSG, vc.PC_MSG_LEN,
+                       vc.pc_sig(ok), k2, 0 - 1) != 0) { return 21; }
+
+    // A message that is not the signed one.
+    if (pss.pss_verify(&p2, &a256, "not the message", 15,
+                       vc.pc_sig(ok), k2, 32) != 0) { return 22; }
+
+    // pss_verify is pss_verify_digest with the hash done for you; the two
+    // have to answer the same on the same input.
+    let is [256]u8 as hctx;
+    let is [64]u8 as mh;
+    call(a256.init, cast(*u8, &hctx));
+    call(a256.update, cast(*u8, &hctx), vc.PC_MSG, vc.PC_MSG_LEN);
+    call(a256.fin, cast(*u8, &hctx), cast(*u8, &mh));
+    if (pss.pss_verify_digest(&p2, &a256, cast(*u8, &mh),
+                              vc.pc_sig(ok), k2, 32) != 1) { return 23; }
+
+    bi.big_free(&p2.n);
+    bi.big_free(&p2.e);
+
+    // emLen < hLen + sLen + 2 is refused before any modexp. PC_ODDKEY is the
+    // 1025-bit key: emLen is 128, so SHA-512 with a 64-byte salt needs 130
+    // and cannot fit. Nothing else in the function can reject it that early,
+    // so a 0 here is that guard and no other.
+    let is i64 as odd = vc.PC_ODDKEY;
+    let is rsa.RsaPub as p0;
+    rsa.rsa_pub_from_bytes(&p0, vc.pc_n(odd), vc.pc_nlen(odd),
+                           vc.pc_e(odd), vc.pc_elen(odd));
+    let is hmac.HashAlg as a512 = hmac.alg_sha512();
+    if (bi.big_bitlen(&p0.n) != 1025) { return 24; }
+    if (p0.k != 129) { return 25; }
+    if (pss.pss_verify(&p0, &a512, vc.PC_MSG, vc.PC_MSG_LEN,
+                       vc.pc_sig(odd), vc.pc_siglen(odd), 64) != 0) { return 26; }
+    bi.big_free(&p0.n);
+    bi.big_free(&p0.e);
+
+    io.printf("pss ok: %ld CAVP (%ld/%ld, %ld vs crypto), %ld crafted, %ld MGF1\n",
+              v.PV_COUNT, npass, nfail, ndiff, vc.PC_COUNT, vc.MG_COUNT);
+    return 0;
+}

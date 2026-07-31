@@ -129,6 +129,7 @@ client/      fetch* (url→dns→connect→tls→http→redirect→decompress)
 | tls | `keysched` — HKDF-Expand-Label · Derive-Secret · the full schedule | ✅ green (`tests/test_ks`, RFC 8448 §3) |
 | tls | `record` — framing · AEAD · nonce/seq · inline tag · padding | ✅ green (`tests/test_rec`, RFC 8448 captured records, incl. one byte per read) |
 | tls | `x509` — DER parse · SAN · basicConstraints · keyUsage · hostname match | ✅ green (`tests/test_x509`); parser validated field-by-field against openssl on 62 real certificates |
+| tls | `pss` — EMSA-PSS-VERIFY over any hash, MGF1 generic | ✅ green (`tests/test_pss`, 102 NIST CAVP vectors + 12 chosen encodings) |
 | everything else | see the roadmap | ⏳ |
 
 The three ⛔ rows above were all "the toolchain can't yet"; stdlib v0.1.6 closed each one, so

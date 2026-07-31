@@ -46,6 +46,7 @@ target "test_res"   { src "tests/test_res.cst"     out "build/test_res" }
 target "test_ks"    { src "tests/test_ks.cst"      out "build/test_ks" }
 target "test_rec"   { src "tests/test_rec.cst"     out "build/test_rec" }
 target "test_x509"  { src "tests/test_x509.cst"    out "build/test_x509" }
+target "test_pss"   { src "tests/test_pss.cst"     out "build/test_pss" }
 target "test_conn"  { src "tests/test_conn.cst"    out "build/test_conn" }
 target "test_bytes" { src "tests/test_bytes.cst"   out "build/test_bytes" }
 target "test_bufread" { src "tests/test_bufread.cst" out "build/test_bufread" }

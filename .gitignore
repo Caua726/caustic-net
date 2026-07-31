@@ -4,3 +4,7 @@ build/
 # `foo.cst.s`, so that suffix is the exact discriminator.
 *.cst.s
 *.cst.s.o
+
+# Python bytecode from the generators in tools/.
+__pycache__/
+*.pyc

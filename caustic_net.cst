@@ -32,3 +32,4 @@ use "./tls/transcript.cst" as transcript;
 use "./tls/keysched.cst" as keysched;
 use "./tls/record.cst" as record;
 use "./tls/x509.cst" as x509;
+use "./tls/pss.cst" as pss;

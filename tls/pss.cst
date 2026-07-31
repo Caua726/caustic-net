@@ -1,0 +1,233 @@
+// =======================================================
+// caustic-net/tls/pss.cst
+// EMSA-PSS-VERIFY, parameterized by hash (RFC 8017 §9.1.2, §8.1.2).
+//
+// caustic-crypto ships rsa_pss_sha256_verify, and it is SHA-256 only: _HLEN
+// is a module constant fixed at 32, MGF1 is private and hard-wired to the
+// same hash, and the salt length is forced to hLen. TLS 1.3 announces
+// rsa_pss_rsae_sha384 and rsa_pss_rsae_sha512 as well, and an X.509
+// id-RSASSA-PSS certificate carries whatever hash and salt length its
+// parameters declare. Without this module the ClientHello would have to
+// advertise less than it can verify.
+//
+// Three differences from the crypto's version, each of which is a bug there
+// waiting for the right key:
+//
+//   1. The salt length is an ARGUMENT, not hLen. RFC 8017 recovers the salt
+//      from the padding and needs only its length; the CAVP corpus has
+//      vectors at 1, 20, 24, 32, 48 and 64 bytes, and a verifier that assumes
+//      hLen rejects most of them.
+//   2. emLen = ceil((modBits-1)/8), which is k-1 — not k — whenever modBits
+//      is 1 mod 8. big_to_bytes_be TRUNCATES silently when the value needs
+//      more bytes than asked for, so the recovered m is checked against emLen
+//      before it is written out. A 2049-bit key is where that matters, and
+//      every CAVP modulus is a multiple of 8, which is why the corpus alone
+//      would not have caught it.
+//   3. The signature length is checked against k. Reading k bytes out of a
+//      shorter buffer is an over-read, and the caller here is a certificate
+//      parser handing over a span it read off the wire.
+//
+// Returns 1 for a good signature and 0 for anything else — the crypto's
+// convention for verification, deliberately not this library's negative-errno
+// one, because a signature is valid or it is not and there is no third answer
+// worth a name.
+// =======================================================
+
+use "caustic-crypto/pk/rsa.cst" as rsa;
+use "caustic-crypto/bigint/bigint.cst" as bi;
+use "caustic-crypto/bigint/modarith.cst" as ma;
+use "caustic-crypto/mac/hmac.cst" as hmac;
+use "caustic-crypto/util/ct.cst" as ct;
+
+// Every scratch buffer below is declared with a LITERAL dimension rather than
+// the named constant beside it, for the reason spelled out in proto/dns.cst:
+// the fix that makes `[NAME]u8` resolve a named constant landed in the
+// compiler after the release CI installs, so the named form would be green
+// here and silently zero-length there. tests/test_pss.cst pins each literal
+// to its constant so the two cannot drift.
+
+// RSA up to 8192 bits, the same ceiling the crypto's own buffers use.
+let is i64 as PSS_MAX_EM   with imut = 1024;
+// SHA-512.
+let is i64 as PSS_MAX_HASH with imut = 64;
+// A salt longer than this is legal by RFC 8017 and has never been seen in a
+// certificate or a TLS signature. Bounding it keeps M' on the stack; a
+// signature that declares more is rejected rather than silently mishandled.
+let is i64 as PSS_MAX_SALT with imut = 512;
+// 8 zero bytes || mHash || salt.
+let is i64 as PSS_MPRIME   with imut = 8 + 64 + 512;   // 584
+
+// MGF1 (RFC 8017 §B.2.1) over any hash the descriptor names.
+//
+// The counter is four bytes big-endian and starts at zero, and the last block
+// is truncated rather than padded — get either wrong and the mask diverges
+// only in its tail, which shows up as a verify failure with no locality.
+fn mgf1(alg as *hmac.HashAlg, seed as *u8, seedlen as i64,
+        out as *u8, outlen as i64) as void {
+    let is i64 as hlen = alg.digest;
+    let is [256]u8 as ctx;
+    let is [64]u8 as digest;
+    let is [4]u8 as cnt;
+
+    let is i64 as done with mut = 0;
+    let is i64 as counter with mut = 0;
+    while (done < outlen) {
+        cnt[0] = cast(u8, (counter >> 24) & 255);
+        cnt[1] = cast(u8, (counter >> 16) & 255);
+        cnt[2] = cast(u8, (counter >> 8) & 255);
+        cnt[3] = cast(u8, counter & 255);
+
+        call(alg.init, cast(*u8, &ctx));
+        call(alg.update, cast(*u8, &ctx), seed, seedlen);
+        call(alg.update, cast(*u8, &ctx), cast(*u8, &cnt), 4);
+        call(alg.fin, cast(*u8, &ctx), cast(*u8, &digest));
+
+        let is i64 as take with mut = hlen;
+        if (done + take > outlen) { take = outlen - done; }
+        let is i64 as i with mut = 0;
+        while (i < take) {
+            out[done + i] = digest[i];
+            i = i + 1;
+        }
+        done = done + take;
+        counter = counter + 1;
+    }
+}
+
+// EMSA-PSS-VERIFY over an already-computed message hash.
+//
+// `mhash` is alg.digest bytes. `sig` is `siglen` bytes and has to be exactly
+// the modulus length. `slen` is the expected salt length: alg.digest for
+// TLS 1.3, and whatever the AlgorithmIdentifier declares for a certificate.
+fn pss_verify_digest(pub as *rsa.RsaPub, alg as *hmac.HashAlg,
+                     mhash as *u8, sig as *u8, siglen as i64,
+                     slen as i64) as i64 {
+    let is i64 as hlen = alg.digest;
+    // No HashAlg in caustic-crypto reports a digest outside 20..64, so these
+    // two are unreachable from any caller and no test isolates them. They stay
+    // because this function indexes fixed buffers by hlen and a future
+    // descriptor is one line away.
+    if (hlen <= 0) { return 0; }
+    if (hlen > PSS_MAX_HASH) { return 0; }
+
+    // A negative salt length makes psend run past DB, and the byte it finds
+    // there decides the answer. Deleting this guard is NOT observable from a
+    // test: the read lands inside the oversized db buffer, the stale byte is
+    // almost never 1, and the function returns 0 either way — for the wrong
+    // reason. tests/test_pss.cst check 21 pins the answer; nothing can pin
+    // where the answer came from. Same shape as the emlen guard below.
+    if (slen < 0) { return 0; }
+    if (slen > PSS_MAX_SALT) { return 0; }
+
+    let is i64 as k = pub.k;
+    if (k <= 0) { return 0; }
+    if (k > PSS_MAX_EM) { return 0; }
+    if (siglen != k) { return 0; }
+
+    let is i64 as modbits = bi.big_bitlen(&pub.n);
+    let is i64 as embits = modbits - 1;
+    let is i64 as emlen = (embits + 7) / 8;
+    // Not observable either, for the same reason: without it psend goes
+    // negative and db[psend] reads before the buffer, which yields 0 by luck
+    // rather than by decision. Check 26 uses a 1025-bit key with SHA-512 and a
+    // 64-byte salt — 130 needed, 128 available — so the guard is the only
+    // thing that SHOULD reject it, but a mutant that removes it still answers
+    // 0. The guard is here for the read, not for the answer.
+    if (emlen < hlen + slen + 2) { return 0; }
+
+    // s = OS2IP(sig), rejected unless s < n. Then m = s^e mod n, the public
+    // exponent path, so the variable-time modexp is the right one.
+    let is bi.Big as s = bi.big_from_bytes_be(sig, k);
+    if (bi.big_cmp(&s, &pub.n) >= 0) {
+        bi.big_free(&s);
+        return 0;
+    }
+    let is bi.Big as m = ma.big_modexp_public(&s, &pub.e, &pub.n);
+    bi.big_free(&s);
+
+    // I2OSP into emLen bytes. big_to_bytes_be truncates instead of failing,
+    // so the value has to be known to fit first. This subsumes RFC 8017's
+    // "leftmost 8*emLen - emBits bits of EM are zero" check, since emBits
+    // bits is exactly what fits.
+    if (bi.big_bitlen(&m) > embits) {
+        bi.big_free(&m);
+        return 0;
+    }
+    let is [1024]u8 as em;
+    bi.big_to_bytes_be(&m, cast(*u8, &em), emlen);
+    bi.big_free(&m);
+
+    if (em[emlen - 1] != 0xbc) { return 0; }
+
+    let is i64 as dblen = emlen - hlen - 1;
+
+    // H = EM[dbLen .. dbLen+hLen]
+    let is [64]u8 as H;
+    let is i64 as i with mut = 0;
+    while (i < hlen) {
+        H[i] = em[dblen + i];
+        i = i + 1;
+    }
+
+    // DB = maskedDB XOR MGF1(H, dbLen)
+    let is [1024]u8 as dbmask;
+    mgf1(alg, cast(*u8, &H), hlen, cast(*u8, &dbmask), dblen);
+    let is [1024]u8 as db;
+    i = 0;
+    while (i < dblen) {
+        db[i] = cast(u8, cast(i64, em[i]) ^ cast(i64, dbmask[i]));
+        i = i + 1;
+    }
+
+    // Clear the leading 8*emLen - emBits bits of DB. They were masked with
+    // bits of the MGF output that the encoder never set, so they carry no
+    // information and must not be compared.
+    let is i64 as topbits = 8 * emlen - embits;
+    db[0] = cast(u8, cast(i64, db[0]) & (255 >> topbits));
+
+    // DB = PS (zeros) || 0x01 || salt
+    let is i64 as psend = dblen - slen - 1;
+    i = 0;
+    while (i < psend) {
+        if (db[i] != 0) { return 0; }
+        i = i + 1;
+    }
+    if (db[psend] != 1) { return 0; }
+
+    // M' = 0x00 * 8 || mHash || salt, and H' = Hash(M')
+    let is [584]u8 as mprime;
+    i = 0;
+    while (i < 8) { mprime[i] = 0; i = i + 1; }
+    i = 0;
+    while (i < hlen) { mprime[8 + i] = mhash[i]; i = i + 1; }
+    i = 0;
+    while (i < slen) {
+        mprime[8 + hlen + i] = db[dblen - slen + i];
+        i = i + 1;
+    }
+
+    let is [256]u8 as ctx;
+    let is [64]u8 as hprime;
+    call(alg.init, cast(*u8, &ctx));
+    call(alg.update, cast(*u8, &ctx), cast(*u8, &mprime), 8 + hlen + slen);
+    call(alg.fin, cast(*u8, &ctx), cast(*u8, &hprime));
+
+    return ct.ct_eq(cast(*u8, &hprime), cast(*u8, &H), hlen);
+}
+
+// The same, hashing the message here. Convenient for a TLS CertificateVerify,
+// where the signed blob is built in a buffer a few hundred bytes long.
+fn pss_verify(pub as *rsa.RsaPub, alg as *hmac.HashAlg,
+              msg as *u8, mlen as i64, sig as *u8, siglen as i64,
+              slen as i64) as i64 {
+    if (alg.digest <= 0) { return 0; }
+    if (alg.digest > PSS_MAX_HASH) { return 0; }
+
+    let is [256]u8 as ctx;
+    let is [64]u8 as mhash;
+    call(alg.init, cast(*u8, &ctx));
+    call(alg.update, cast(*u8, &ctx), msg, mlen);
+    call(alg.fin, cast(*u8, &ctx), cast(*u8, &mhash));
+
+    return pss_verify_digest(pub, alg, cast(*u8, &mhash), sig, siglen, slen);
+}
