@@ -69,7 +69,7 @@ core/        conn (the vtable) · errno · bytes (Bytes/Slice) · bufread (lines
              entropy (checked CSPRNG) · chrono (epoch ↔ civil, ASN.1 + HTTP dates)
 transport/   tcp_conn (TCP→Conn) · transport (dial/dial_host/listen/accept) · resolver · epoll*
 proto/       url · http1 · dns · cookie* · http2* · websocket* · sse* · mime*
-tls/         transcript · keysched · record* · x509* · verify* · handshake* · client*
+tls/         transcript · keysched · record · x509* · trust* · verify* · handshake* · client*
 server/      router* · threaded* · reactor* · static* · middleware*
 client/      fetch* (url→dns→connect→tls→http→redirect→decompress)
 ```
@@ -127,6 +127,7 @@ client/      fetch* (url→dns→connect→tls→http→redirect→decompress)
 | deps | `caustic-crypto` v0.1.0 wired in | ✅ green (`tests/test_dep`) |
 | tls | `transcript` — cloneable handshake hash | ✅ green (`tests/test_ks`) |
 | tls | `keysched` — HKDF-Expand-Label · Derive-Secret · the full schedule | ✅ green (`tests/test_ks`, RFC 8448 §3) |
+| tls | `record` — framing · AEAD · nonce/seq · inline tag · padding | ✅ green (`tests/test_rec`, RFC 8448 captured records, incl. one byte per read) |
 | everything else | see the roadmap | ⏳ |
 
 The three ⛔ rows above were all "the toolchain can't yet"; stdlib v0.1.6 closed each one, so

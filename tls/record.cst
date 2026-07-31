@@ -1,0 +1,416 @@
+// =======================================================
+// caustic-net/tls/record.cst
+// The TLS 1.3 record layer — RFC 8446 §5.
+//
+// Every byte of a TLS connection travels inside a record: a 5-byte header and
+// a body that is plaintext before the handshake has keys and AEAD-sealed after.
+// Nothing above this layer sees a header, a sequence number, or a nonce.
+//
+// The details that bite, each of which produces a connection that fails in a
+// way pointing somewhere else:
+//
+//   * THE TAG IS INLINE. caustic-crypto returns and takes the AEAD tag as a
+//     separate 16-byte buffer; TLS 1.3 carries it as the last 16 bytes of the
+//     record body. Splitting it out on the way in and appending it on the way
+//     out is this layer's job, and nothing else will notice if it is missed.
+//
+//   * THE REAL CONTENT TYPE IS INSIDE. The header's type on an encrypted
+//     record always reads application_data (23), whatever it holds. The true
+//     type is the last NON-ZERO byte of the decrypted plaintext; everything
+//     after it is padding. Reading the header instead means handshake messages
+//     arriving as application data.
+//
+//   * THE SEQUENCE NUMBER DOES NOT RESET PER RECORD. It counts within one key,
+//     and goes back to zero only when the key changes. The nonce is the static
+//     IV XORed with that counter, right-aligned — so a nonce reused across two
+//     records under one key is a total loss of confidentiality for both.
+//
+//   * caustic-crypto's GHASH keeps its tables in MODULE-LEVEL MUTABLE state,
+//     regenerated per call. Alternating read and write on one connection is
+//     safe because each seal/open is one complete operation, but two threads
+//     inside it corrupt each other with NO error — a wrong tag, and the peer
+//     aborts, which looks like a network fault. Hence the mutex below.
+// =======================================================
+
+use "std/sync.cst" as sync;
+use "caustic-crypto/sym/aes.cst" as aes;
+use "caustic-crypto/sym/aes_modes.cst" as aesm;
+use "caustic-crypto/sym/chachapoly.cst" as cpoly;
+use "../core/conn.cst" as conn;
+use "../core/bufread.cst" as bufread;
+
+// --- Errors (the -1500 block; keysched owns -1500) ---------------------
+let is i64 as REC_ERR_HEADER  with imut = 0 - 1510;   // malformed record header
+let is i64 as REC_ERR_LENGTH  with imut = 0 - 1511;   // past the RFC's ceiling
+let is i64 as REC_ERR_DECRYPT with imut = 0 - 1512;   // AEAD tag did not verify
+let is i64 as REC_ERR_PADDING with imut = 0 - 1513;   // no content type in the plaintext
+let is i64 as REC_ERR_SPACE   with imut = 0 - 1514;   // caller's buffer too small
+let is i64 as REC_ERR_SUITE   with imut = 0 - 1515;   // cipher suite not configured
+let is i64 as REC_ERR_SEQ     with imut = 0 - 1516;   // sequence number exhausted
+let is i64 as REC_ERR_CLOSED  with imut = 0 - 1517;   // peer sent close_notify
+
+// --- Content types — RFC 8446 §5.1 -------------------------------------
+let is i64 as CT_CHANGE_CIPHER_SPEC with imut = 20;
+let is i64 as CT_ALERT              with imut = 21;
+let is i64 as CT_HANDSHAKE          with imut = 22;
+let is i64 as CT_APPLICATION_DATA   with imut = 23;
+
+// --- Cipher suites -----------------------------------------------------
+let is i64 as SUITE_NONE                  with imut = 0;
+let is i64 as SUITE_AES_128_GCM_SHA256    with imut = 0x1301;
+let is i64 as SUITE_AES_256_GCM_SHA384    with imut = 0x1302;
+let is i64 as SUITE_CHACHA20_POLY1305     with imut = 0x1303;
+
+// --- Sizes — RFC 8446 §5.1, §5.2 ---------------------------------------
+let is i64 as HDR_LEN     with imut = 5;
+let is i64 as MAX_PLAIN   with imut = 16384;          // 2^14
+// The ciphertext may exceed the plaintext by at most 256, which covers the
+// content-type byte, the tag, and any padding. A record claiming more is
+// rejected rather than accommodated: the ceiling is what bounds the buffers.
+let is i64 as MAX_CIPHER  with imut = 16640;          // 2^14 + 256
+let is i64 as TAG_LEN     with imut = 16;
+let is i64 as NONCE_LEN   with imut = 12;
+
+// The legacy_record_version, which TLS 1.3 fixes at 0x0303 on every record it
+// sends and ignores on every record it receives.
+let is i64 as LEGACY_VERSION with imut = 0x0303;
+
+struct RecordLayer {
+    br as *bufread.BufReader;    // inbound, over the Conn
+    c  as *conn.Conn;            // outbound
+
+    suite     as i64;
+    encrypted as i64;            // 1 once keys are installed
+
+    rkey as [32]u8;   riv as [12]u8;   rseq as i64;   rkeylen as i64;
+    wkey as [32]u8;   wiv as [12]u8;   wseq as i64;   wkeylen as i64;
+
+    // Caller-provided, so a RecordLayer is not 50 KB of struct — the same
+    // arrangement bufread uses.
+    rx    as *u8;    rxcap as i64;    // one inbound record, ciphertext then plaintext
+    plain as *u8;    plaincap as i64;
+
+    closed as i64;   // peer sent close_notify
+}
+
+// One lock over every AEAD call in this module. See the note at the top: the
+// GHASH tables in caustic-crypto are module-level and rebuilt per call, so two
+// threads inside a seal or an open corrupt each other silently. Held across
+// memory work only, never across a socket.
+let is sync.Mutex as _aead_lk with mut;
+
+// --- Setup -------------------------------------------------------------
+
+fn rl_init(rl as *RecordLayer, br as *bufread.BufReader, c as *conn.Conn,
+           rx as *u8, rxcap as i64, plain as *u8, plaincap as i64) as i64 {
+    if (rxcap < HDR_LEN + MAX_CIPHER) { return REC_ERR_SPACE; }
+    if (plaincap < MAX_PLAIN + 1) { return REC_ERR_SPACE; }
+    rl.br = br;
+    rl.c = c;
+    rl.suite = SUITE_NONE;
+    rl.encrypted = 0;
+    rl.rseq = 0;
+    rl.wseq = 0;
+    rl.rkeylen = 0;
+    rl.wkeylen = 0;
+    rl.rx = rx;
+    rl.rxcap = rxcap;
+    rl.plain = plain;
+    rl.plaincap = plaincap;
+    rl.closed = 0;
+    return 0;
+}
+
+fn _suite_key_len(suite as i64) as i64 {
+    if (suite == SUITE_AES_128_GCM_SHA256) { return 16; }
+    if (suite == SUITE_AES_256_GCM_SHA384) { return 32; }
+    if (suite == SUITE_CHACHA20_POLY1305)  { return 32; }
+    return 0;
+}
+
+// Install the keys for one direction. The sequence number goes back to zero:
+// it counts WITHIN a key, and carrying it across a rekey would skip nonces on
+// one side and not the other.
+fn rl_set_read_key(rl as *RecordLayer, suite as i64, key as *u8, iv as *u8) as i64 {
+    let is i64 as kl = _suite_key_len(suite);
+    if (kl == 0) { return REC_ERR_SUITE; }
+    rl.suite = suite;
+    rl.rkeylen = kl;
+    let is i64 as i with mut = 0;
+    while (i < kl) { rl.rkey[i] = key[i]; i = i + 1; }
+    i = 0;
+    while (i < NONCE_LEN) { rl.riv[i] = iv[i]; i = i + 1; }
+    rl.rseq = 0;
+    rl.encrypted = 1;
+    return 0;
+}
+
+fn rl_set_write_key(rl as *RecordLayer, suite as i64, key as *u8, iv as *u8) as i64 {
+    let is i64 as kl = _suite_key_len(suite);
+    if (kl == 0) { return REC_ERR_SUITE; }
+    rl.suite = suite;
+    rl.wkeylen = kl;
+    let is i64 as i with mut = 0;
+    while (i < kl) { rl.wkey[i] = key[i]; i = i + 1; }
+    i = 0;
+    while (i < NONCE_LEN) { rl.wiv[i] = iv[i]; i = i + 1; }
+    rl.wseq = 0;
+    rl.encrypted = 1;
+    return 0;
+}
+
+// --- Nonce — RFC 8446 §5.3 ---------------------------------------------
+//
+// The 64-bit sequence number, big-endian, left-padded with zeros to the IV
+// length, XORed with the static IV. Right-aligned: the counter occupies the
+// LAST eight bytes of the twelve, and the first four are the IV unchanged.
+fn build_nonce(iv as *u8, seq as i64, out as *u8) as void {
+    let is i64 as i with mut = 0;
+    while (i < NONCE_LEN) { out[i] = iv[i]; i = i + 1; }
+    let is i64 as k with mut = 0;
+    while (k < 8) {
+        let is i64 as shift = (7 - k) * 8;
+        let is i64 as byte = (seq >> shift) & 255;
+        let is i64 as at = NONCE_LEN - 8 + k;
+        out[at] = cast(u8, cast(i64, out[at]) ^ byte);
+        k = k + 1;
+    }
+}
+
+// The additional authenticated data is the record header exactly as it goes on
+// the wire, with `len` being the CIPHERTEXT length — body plus content-type
+// byte plus tag. Computing it from the plaintext length instead authenticates
+// a header the peer never saw.
+fn build_aad(ctype as i64, len as i64, out as *u8) as void {
+    out[0] = cast(u8, ctype);
+    out[1] = cast(u8, (LEGACY_VERSION >> 8) & 255);
+    out[2] = cast(u8, LEGACY_VERSION & 255);
+    out[3] = cast(u8, (len >> 8) & 255);
+    out[4] = cast(u8, len & 255);
+}
+
+fn _seal(rl as *RecordLayer, nonce as *u8, aad as *u8,
+         pt as *u8, plen as i64, ct as *u8, tag as *u8) as i64 {
+    sync.mutex_lock(&_aead_lk);
+    if (rl.suite == SUITE_CHACHA20_POLY1305) {
+        cpoly.chachapoly_seal(cast(*u8, &rl.wkey), nonce, aad, HDR_LEN, pt, plen, ct, tag);
+    } else {
+        let is aes.Aes as a;
+        aes.aes_init(&a, cast(*u8, &rl.wkey), rl.wkeylen);
+        aesm.aes_gcm_seal(&a, nonce, NONCE_LEN, aad, HDR_LEN, pt, plen, ct, tag);
+    }
+    sync.mutex_unlock(&_aead_lk);
+    return 0;
+}
+
+fn _open(rl as *RecordLayer, nonce as *u8, aad as *u8,
+         ct as *u8, clen as i64, tag as *u8, pt as *u8) as i64 {
+    sync.mutex_lock(&_aead_lk);
+    let is i64 as ok with mut = 0;
+    if (rl.suite == SUITE_CHACHA20_POLY1305) {
+        ok = cpoly.chachapoly_open(cast(*u8, &rl.rkey), nonce, aad, HDR_LEN, ct, clen, tag, pt);
+    } else {
+        let is aes.Aes as a;
+        aes.aes_init(&a, cast(*u8, &rl.rkey), rl.rkeylen);
+        ok = aesm.aes_gcm_open(&a, nonce, NONCE_LEN, aad, HDR_LEN, ct, clen, tag, pt);
+    }
+    sync.mutex_unlock(&_aead_lk);
+    return ok;
+}
+
+// --- Decrypting one record ---------------------------------------------
+
+// Split the tag off the end, decrypt, and strip the padding to find the real
+// content type. `body` is the record body as it arrived, `blen` its length.
+// Returns the plaintext length in rl.plain and writes the type to *ctype.
+fn rl_decrypt(rl as *RecordLayer, hdr_type as i64, body as *u8, blen as i64,
+              ctype as *i64) as i64 {
+    if (blen < TAG_LEN + 1) { return REC_ERR_DECRYPT; }
+    let is i64 as clen = blen - TAG_LEN;
+    if (clen > rl.plaincap) { return REC_ERR_SPACE; }
+
+    // The tag is the last 16 bytes of the body. caustic-crypto wants it
+    // separately, so it is copied out rather than pointed at — the open call
+    // reads `clen` bytes from `ct`, and handing it a buffer that runs into the
+    // tag would authenticate the tag as data.
+    let is [16]u8 as tag;
+    let is i64 as i with mut = 0;
+    while (i < TAG_LEN) { tag[i] = body[clen + i]; i = i + 1; }
+
+    let is [12]u8 as nonce;
+    build_nonce(cast(*u8, &rl.riv), rl.rseq, cast(*u8, &nonce));
+
+    let is [5]u8 as aad;
+    build_aad(hdr_type, blen, cast(*u8, &aad));
+
+    if (_open(rl, cast(*u8, &nonce), cast(*u8, &aad), body, clen,
+              cast(*u8, &tag), rl.plain) != 1) {
+        return REC_ERR_DECRYPT;
+    }
+
+    if (rl.rseq == 0x7FFFFFFFFFFFFFFF) { return REC_ERR_SEQ; }
+    rl.rseq = rl.rseq + 1;
+
+    // The content type is the last non-zero byte; everything after it is
+    // padding. Scanning from the end is the only way — the padding is zeros
+    // and so is nothing else at that position.
+    let is i64 as n with mut = clen;
+    while (n > 0) {
+        if (rl.plain[n - 1] != 0) {
+            *ctype = cast(i64, rl.plain[n - 1]);
+            return n - 1;
+        }
+        n = n - 1;
+    }
+    // All zeros: no content type at all. A record that is entirely padding is
+    // malformed, and RFC 8446 §5.4 says to abort rather than treat it as empty.
+    return REC_ERR_PADDING;
+}
+
+// --- Reading ------------------------------------------------------------
+
+// Read one record. Returns the payload length, with the payload in rl.plain
+// and the real content type in *ctype. 0 with CT_ALERT means a close_notify
+// was seen and rl.closed is set.
+fn rl_read_record(rl as *RecordLayer, ctype as *i64) as i64 {
+    if (rl.closed == 1) { return REC_ERR_CLOSED; }
+
+    let is [5]u8 as hdr;
+    let is i64 as got with mut = bufread.br_read_exact(rl.br, cast(*u8, &hdr), HDR_LEN);
+    if (got < 0) { return got; }
+    if (got != HDR_LEN) { return REC_ERR_HEADER; }
+
+    let is i64 as hdr_type = cast(i64, hdr[0]);
+    let is i64 as blen = (cast(i64, hdr[3]) << 8) + cast(i64, hdr[4]);
+
+    // The version field is not checked: TLS 1.3 fixes it at 0x0303 on send and
+    // requires receivers to ignore it, because middleboxes rewrite it.
+    if (blen <= 0) { return REC_ERR_LENGTH; }
+    if (rl.encrypted == 1) {
+        if (blen > MAX_CIPHER) { return REC_ERR_LENGTH; }
+    } else {
+        if (blen > MAX_PLAIN) { return REC_ERR_LENGTH; }
+    }
+    if (blen > rl.rxcap) { return REC_ERR_SPACE; }
+
+    got = bufread.br_read_exact(rl.br, rl.rx, blen);
+    if (got < 0) { return got; }
+    if (got != blen) { return REC_ERR_HEADER; }
+
+    if (rl.encrypted == 0) {
+        if (blen > rl.plaincap) { return REC_ERR_SPACE; }
+        let is i64 as i with mut = 0;
+        while (i < blen) { rl.plain[i] = rl.rx[i]; i = i + 1; }
+        *ctype = hdr_type;
+        return blen;
+    }
+
+    // A ChangeCipherSpec arriving mid-handshake is a compatibility artifact —
+    // TLS 1.3 has no such message, but a client that looks like TLS 1.2 on the
+    // wire sends one. It is unencrypted and must be dropped, not decrypted.
+    if (hdr_type == CT_CHANGE_CIPHER_SPEC) {
+        *ctype = CT_CHANGE_CIPHER_SPEC;
+        return 0;
+    }
+
+    let is i64 as n = rl_decrypt(rl, hdr_type, rl.rx, blen, ctype);
+    if (n < 0) { return n; }
+
+    if (*ctype == CT_ALERT) {
+        // level 1 warning / 2 fatal, then the description. close_notify is 0.
+        if (n >= 2 && rl.plain[1] == 0) { rl.closed = 1; }
+    }
+    return n;
+}
+
+// --- Writing ------------------------------------------------------------
+
+// Send one record. Before keys are installed the payload goes out as-is under
+// the given type; after, it is sealed and the header type becomes
+// application_data, with the real type appended to the plaintext.
+fn rl_write_record(rl as *RecordLayer, ctype as i64, p as *u8, n as i64) as i64 {
+    if (n < 0 || n > MAX_PLAIN) { return REC_ERR_LENGTH; }
+
+    let is [5]u8 as hdr;
+
+    if (rl.encrypted == 0) {
+        build_aad(ctype, n, cast(*u8, &hdr));
+        if (conn.conn_write_all(rl.c, cast(*u8, &hdr), HDR_LEN) != HDR_LEN) { return REC_ERR_HEADER; }
+        if (conn.conn_write_all(rl.c, p, n) != n) { return REC_ERR_HEADER; }
+        return n;
+    }
+
+    // plaintext = payload || real content type. No padding is added: it buys
+    // traffic analysis resistance this library does not yet make claims about,
+    // and an unpadded record is what the RFC's own vectors carry.
+    let is i64 as plen = n + 1;
+    if (plen > rl.plaincap) { return REC_ERR_SPACE; }
+    let is i64 as i with mut = 0;
+    while (i < n) { rl.plain[i] = p[i]; i = i + 1; }
+    rl.plain[n] = cast(u8, ctype);
+
+    let is i64 as blen = plen + TAG_LEN;
+    if (blen > rl.rxcap) { return REC_ERR_SPACE; }
+
+    // The header carries application_data whatever this really is, and its
+    // length is the CIPHERTEXT length — which is what gets authenticated.
+    build_aad(CT_APPLICATION_DATA, blen, cast(*u8, &hdr));
+
+    let is [12]u8 as nonce;
+    build_nonce(cast(*u8, &rl.wiv), rl.wseq, cast(*u8, &nonce));
+
+    let is [16]u8 as tag;
+    _seal(rl, cast(*u8, &nonce), cast(*u8, &hdr), rl.plain, plen, rl.rx, cast(*u8, &tag));
+
+    if (rl.wseq == 0x7FFFFFFFFFFFFFFF) { return REC_ERR_SEQ; }
+    rl.wseq = rl.wseq + 1;
+
+    if (conn.conn_write_all(rl.c, cast(*u8, &hdr), HDR_LEN) != HDR_LEN) { return REC_ERR_HEADER; }
+    if (conn.conn_write_all(rl.c, rl.rx, plen) != plen) { return REC_ERR_HEADER; }
+    if (conn.conn_write_all(rl.c, cast(*u8, &tag), TAG_LEN) != TAG_LEN) { return REC_ERR_HEADER; }
+    return n;
+}
+
+// Seal one record into `out` without sending it — the same bytes
+// rl_write_record would put on the wire. Exists so the layer can be tested
+// against the RFC's captured records with no socket in sight.
+fn rl_seal_record(rl as *RecordLayer, ctype as i64, p as *u8, n as i64,
+                  out as *u8, outcap as i64) as i64 {
+    if (n < 0 || n > MAX_PLAIN) { return REC_ERR_LENGTH; }
+    let is i64 as plen = n + 1;
+    let is i64 as blen = plen + TAG_LEN;
+    if (HDR_LEN + blen > outcap) { return REC_ERR_SPACE; }
+    if (plen > rl.plaincap) { return REC_ERR_SPACE; }
+
+    let is i64 as i with mut = 0;
+    while (i < n) { rl.plain[i] = p[i]; i = i + 1; }
+    rl.plain[n] = cast(u8, ctype);
+
+    build_aad(CT_APPLICATION_DATA, blen, out);
+
+    let is [12]u8 as nonce;
+    build_nonce(cast(*u8, &rl.wiv), rl.wseq, cast(*u8, &nonce));
+
+    let is [16]u8 as tag;
+    _seal(rl, cast(*u8, &nonce), out, rl.plain, plen,
+          cast(*u8, cast(i64, out) + HDR_LEN), cast(*u8, &tag));
+
+    i = 0;
+    while (i < TAG_LEN) { out[HDR_LEN + plen + i] = tag[i]; i = i + 1; }
+
+    if (rl.wseq == 0x7FFFFFFFFFFFFFFF) { return REC_ERR_SEQ; }
+    rl.wseq = rl.wseq + 1;
+    return HDR_LEN + blen;
+}
+
+fn rec_err_name(e as i64) as *u8 {
+    if (e == REC_ERR_HEADER)  { return "REC_ERR_HEADER"; }
+    if (e == REC_ERR_LENGTH)  { return "REC_ERR_LENGTH"; }
+    if (e == REC_ERR_DECRYPT) { return "REC_ERR_DECRYPT"; }
+    if (e == REC_ERR_PADDING) { return "REC_ERR_PADDING"; }
+    if (e == REC_ERR_SPACE)   { return "REC_ERR_SPACE"; }
+    if (e == REC_ERR_SUITE)   { return "REC_ERR_SUITE"; }
+    if (e == REC_ERR_SEQ)     { return "REC_ERR_SEQ"; }
+    if (e == REC_ERR_CLOSED)  { return "REC_ERR_CLOSED"; }
+    return "REC_ERR_UNKNOWN";
+}

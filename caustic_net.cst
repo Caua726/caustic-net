@@ -30,3 +30,4 @@ use "./proto/url.cst" as url;
 use "./proto/http1.cst" as http1;
 use "./tls/transcript.cst" as transcript;
 use "./tls/keysched.cst" as keysched;
+use "./tls/record.cst" as record;

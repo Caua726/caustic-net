@@ -1,0 +1,279 @@
+// =======================================================
+// tests/test_rec.cst — tls/record.cst
+//
+// Against the captured records of RFC 8448 §3, which prints each one complete
+// alongside the plaintext that produced it. Both directions are exercised:
+// the layer must DECRYPT what the RFC captured and, sealing the same payload
+// under the same key, produce those exact bytes back.
+//
+// The sequence numbers are the interesting part. The client's two records are
+// its first and second under the application key, so 0 and 1. The server's
+// application_data record is its SECOND — a handshake record (the session
+// ticket) went out under the same key first — so it is seq 1 despite being the
+// first application_data. That is the property the counter has to have: it
+// counts records under a key, not records of a type. A nonce reused across two
+// records under one key loses confidentiality for both.
+//
+// Exit 0 = all pass. Non-zero = the numbered check that failed.
+// =======================================================
+
+use "../tls/record.cst" as rec;
+use "../core/conn.cst" as conn;
+use "../core/bufread.cst" as bufread;
+
+let is *u8 as C_AP_KEY with imut = "\x17\x42\x2d\xda\x59\x6e\xd5\xd9\xac\xd8\x90\xe3\xc6\x3f\x50\x51";
+let is i64 as C_AP_KEY_N with imut = 16;
+let is *u8 as C_AP_IV with imut = "\x5b\x78\x92\x3d\xee\x08\x57\x90\x33\xe5\x23\xd9";
+let is i64 as C_AP_IV_N with imut = 12;
+let is *u8 as S_AP_KEY with imut = "\x9f\x02\x28\x3b\x6c\x9c\x07\xef\xc2\x6b\xb9\xf2\xac\x92\xe3\x56";
+let is i64 as S_AP_KEY_N with imut = 16;
+let is *u8 as S_AP_IV with imut = "\xcf\x78\x2b\x88\xdd\x83\x54\x9a\xad\xf1\xe9\x84";
+let is i64 as S_AP_IV_N with imut = 12;
+let is *u8 as S_HS_KEY with imut = "\x3f\xce\x51\x60\x09\xc2\x17\x27\xd0\xf2\xe4\xe8\x6e\xe4\x03\xbc";
+let is i64 as S_HS_KEY_N with imut = 16;
+let is *u8 as S_HS_IV with imut = "\x5d\x31\x3e\xb2\x67\x12\x76\xee\x13\x00\x0b\x30";
+let is i64 as S_HS_IV_N with imut = 12;
+let is *u8 as C_AD_PT with imut = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x20\x21\x22\x23\x24\x25\x26\x27\x28\x29\x2a\x2b\x2c\x2d\x2e\x2f\x30\x31";
+let is i64 as C_AD_PT_N with imut = 50;
+let is *u8 as C_AD_REC with imut = "\x17\x03\x03\x00\x43\xa2\x3f\x70\x54\xb6\x2c\x94\xd0\xaf\xfa\xfe\x82\x28\xba\x55\xcb\xef\xac\xea\x42\xf9\x14\xaa\x66\xbc\xab\x3f\x2b\x98\x19\xa8\xa5\xb4\x6b\x39\x5b\xd5\x4a\x9a\x20\x44\x1e\x2b\x62\x97\x4e\x1f\x5a\x62\x92\xa2\x97\x70\x14\xbd\x1e\x3d\xea\xe6\x3a\xee\xbb\x21\x69\x49\x15\xe4";
+let is i64 as C_AD_REC_N with imut = 72;
+let is *u8 as C_AL_PT with imut = "\x01\x00";
+let is i64 as C_AL_PT_N with imut = 2;
+let is *u8 as C_AL_REC with imut = "\x17\x03\x03\x00\x13\xc9\x87\x27\x60\x65\x56\x66\xb7\x4d\x7f\xf1\x15\x3e\xfd\x6d\xb6\xd0\xb0\xe3";
+let is i64 as C_AL_REC_N with imut = 24;
+let is *u8 as S_AD_PT with imut = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x20\x21\x22\x23\x24\x25\x26\x27\x28\x29\x2a\x2b\x2c\x2d\x2e\x2f\x30\x31";
+let is i64 as S_AD_PT_N with imut = 50;
+let is *u8 as S_AD_REC with imut = "\x17\x03\x03\x00\x43\x2e\x93\x7e\x11\xef\x4a\xc7\x40\xe5\x38\xad\x36\x00\x5f\xc4\xa4\x69\x32\xfc\x32\x25\xd0\x5f\x82\xaa\x1b\x36\xe3\x0e\xfa\xf9\x7d\x90\xe6\xdf\xfc\x60\x2d\xcb\x50\x1a\x59\xa8\xfc\xc4\x9c\x4b\xf2\xe5\xf0\xa2\x1c\x00\x47\xc2\xab\xf3\x32\x54\x0d\xd0\x32\xe1\x67\xc2\x95\x5d";
+let is i64 as S_AD_REC_N with imut = 72;
+
+let is *u8 as ZERO_REC with imut = "\x17\x03\x03\x00\x14\xa2\x3e\x72\x57\xa5\xb6\x22\x08\xd1\x4d\xc3\x3c\x47\x01\x5c\xff\xcc\x88\xd6\x7d";
+let is i64 as ZERO_REC_N with imut = 25;
+
+let is i64 as S_AD_SEQ with imut = 1;
+
+// A Conn that replays a fixed byte string, `chunk` bytes per read — the
+// house discipline for anything that parses a delimited stream, since a real
+// network produces both a whole record in one read and one byte at a time.
+struct MockCtx { p as *u8; n as i64; off as i64; chunk as i64; }
+
+fn _m_read(ctx as *u8, buf as *u8, len as i64) as i64 {
+    let is *MockCtx as m = cast(*MockCtx, ctx);
+    if (m.off >= m.n) { return 0; }
+    let is i64 as want with mut = len;
+    if (m.chunk > 0 && want > m.chunk) { want = m.chunk; }
+    if (want > m.n - m.off) { want = m.n - m.off; }
+    let is i64 as i with mut = 0;
+    while (i < want) { buf[i] = m.p[m.off + i]; i = i + 1; }
+    m.off = m.off + want;
+    return want;
+}
+fn _m_write(ctx as *u8, buf as *u8, len as i64) as i64 { return len; }
+fn _m_close(ctx as *u8) as i64 { return 0; }
+fn _m_state(ctx as *u8) as i64 { return conn.CONN_OPEN; }
+
+fn mock(c as *conn.Conn, m as *MockCtx, p as *u8, n as i64, chunk as i64) as void {
+    m.p = p; m.n = n; m.off = 0; m.chunk = chunk;
+    c.ctx = cast(*u8, m);
+    c.read = fn_ptr(_m_read);
+    c.write = fn_ptr(_m_write);
+    c.close = fn_ptr(_m_close);
+    c.state = fn_ptr(_m_state);
+}
+
+fn eq(a as *u8, b as *u8, n as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < n) { if (a[i] != b[i]) { return 0; } i = i + 1; }
+    return 1;
+}
+
+// Buffers a RecordLayer needs, sized by its own constants.
+let is [16645]u8 as RX with mut;
+let is [16385]u8 as PLAIN with mut;
+let is [8192]u8 as BRBUF with mut;
+let is [128]u8 as OUT with mut;
+
+fn main() as i32 {
+    let is conn.Conn as c;
+    let is MockCtx as mc;
+    let is bufread.BufReader as br;
+    let is rec.RecordLayer as rl;
+    let is i64 as ct with mut = 0;
+
+    // ===== nonce and AAD, on their own ===============================
+    // seq 0 leaves the IV untouched; the counter is right-aligned, so seq 1
+    // may only ever change the LAST byte of a 12-byte IV ending in an even
+    // value. Getting the alignment wrong gives a nonce that is wrong for every
+    // record but the first.
+    let is [12]u8 as nonce;
+    rec.build_nonce(C_AP_IV, 0, cast(*u8, &nonce));
+    if (eq(cast(*u8, &nonce), C_AP_IV, 12) == 0) { return 1; }
+
+    rec.build_nonce(C_AP_IV, 1, cast(*u8, &nonce));
+    if (eq(cast(*u8, &nonce), C_AP_IV, 11) == 0) { return 2; }
+    if (nonce[11] != cast(u8, cast(i64, C_AP_IV[11]) ^ 1)) { return 3; }
+
+    // A counter past 8 bits reaches further in, and never past byte 4.
+    rec.build_nonce(C_AP_IV, 256, cast(*u8, &nonce));
+    if (nonce[10] != cast(u8, cast(i64, C_AP_IV[10]) ^ 1)) { return 4; }
+    if (nonce[11] != C_AP_IV[11]) { return 5; }
+    if (eq(cast(*u8, &nonce), C_AP_IV, 4) == 0) { return 6; }
+
+    let is [5]u8 as aad;
+    rec.build_aad(rec.CT_APPLICATION_DATA, 0x43, cast(*u8, &aad));
+    if (aad[0] != cast(u8, 23)) { return 7; }
+    if (aad[1] != cast(u8, 3)) { return 8; }
+    if (aad[2] != cast(u8, 3)) { return 9; }
+    if (aad[3] != cast(u8, 0)) { return 10; }
+    if (aad[4] != cast(u8, 0x43)) { return 11; }
+
+    // ===== decrypting the captured records ===========================
+    // Whole in one read first.
+    mock(&c, &mc, C_AD_REC, C_AD_REC_N, 0);
+    bufread.br_init(&br, &c, cast(*u8, &BRBUF), 8192);
+    if (rec.rl_init(&rl, &br, &c, cast(*u8, &RX), 16645,
+                    cast(*u8, &PLAIN), 16385) != 0) { return 12; }
+    if (rec.rl_set_read_key(&rl, rec.SUITE_AES_128_GCM_SHA256, C_AP_KEY, C_AP_IV) != 0) { return 13; }
+
+    let is i64 as n with mut = rec.rl_read_record(&rl, &ct);
+    if (n != C_AD_PT_N) { return 14; }
+    // The header says application_data and so does the plaintext here, but the
+    // one that counts is the plaintext's.
+    if (ct != rec.CT_APPLICATION_DATA) { return 15; }
+    if (eq(cast(*u8, &PLAIN), C_AD_PT, C_AD_PT_N) == 0) { return 16; }
+    if (rl.rseq != 1) { return 17; }
+
+    // ===== one byte per read, same answer ============================
+    mock(&c, &mc, C_AD_REC, C_AD_REC_N, 1);
+    bufread.br_init(&br, &c, cast(*u8, &BRBUF), 8192);
+    rec.rl_init(&rl, &br, &c, cast(*u8, &RX), 16645, cast(*u8, &PLAIN), 16385);
+    rec.rl_set_read_key(&rl, rec.SUITE_AES_128_GCM_SHA256, C_AP_KEY, C_AP_IV);
+    n = rec.rl_read_record(&rl, &ct);
+    if (n != C_AD_PT_N) { return 18; }
+    if (eq(cast(*u8, &PLAIN), C_AD_PT, C_AD_PT_N) == 0) { return 19; }
+
+    // ===== the sequence advances on its own ==========================
+    // The alert is the client's SECOND record under this key. Decrypting it
+    // requires seq 1, which the layer must have reached by itself — a counter
+    // that stayed at 0 fails the tag here and nowhere earlier.
+    mock(&c, &mc, C_AL_REC, C_AL_REC_N, 0);
+    bufread.br_init(&br, &c, cast(*u8, &BRBUF), 8192);
+    rec.rl_init(&rl, &br, &c, cast(*u8, &RX), 16645, cast(*u8, &PLAIN), 16385);
+    rec.rl_set_read_key(&rl, rec.SUITE_AES_128_GCM_SHA256, C_AP_KEY, C_AP_IV);
+    rl.rseq = 1;
+    n = rec.rl_read_record(&rl, &ct);
+    if (n != C_AL_PT_N) { return 20; }
+    // The header reads application_data; the real type is alert. Trusting the
+    // header would deliver a close_notify as page content.
+    if (ct != rec.CT_ALERT) { return 21; }
+    if (eq(cast(*u8, &PLAIN), C_AL_PT, C_AL_PT_N) == 0) { return 22; }
+    // level 1, description 0 = close_notify, and the layer noticed.
+    if (rl.closed != 1) { return 23; }
+    if (rec.rl_read_record(&rl, &ct) != rec.REC_ERR_CLOSED) { return 24; }
+
+    // ===== the other direction's key ==================================
+    // seq 1, because the server sent a handshake record (the session ticket)
+    // under this same key first. The counter is per KEY, not per content type.
+    mock(&c, &mc, S_AD_REC, S_AD_REC_N, 0);
+    bufread.br_init(&br, &c, cast(*u8, &BRBUF), 8192);
+    rec.rl_init(&rl, &br, &c, cast(*u8, &RX), 16645, cast(*u8, &PLAIN), 16385);
+    rec.rl_set_read_key(&rl, rec.SUITE_AES_128_GCM_SHA256, S_AP_KEY, S_AP_IV);
+    rl.rseq = S_AD_SEQ;
+    n = rec.rl_read_record(&rl, &ct);
+    if (n != S_AD_PT_N) { return 25; }
+    if (eq(cast(*u8, &PLAIN), S_AD_PT, S_AD_PT_N) == 0) { return 26; }
+
+    // ===== sealing reproduces the capture byte for byte ==============
+    rec.rl_init(&rl, &br, &c, cast(*u8, &RX), 16645, cast(*u8, &PLAIN), 16385);
+    rec.rl_set_write_key(&rl, rec.SUITE_AES_128_GCM_SHA256, C_AP_KEY, C_AP_IV);
+    n = rec.rl_seal_record(&rl, rec.CT_APPLICATION_DATA, C_AD_PT, C_AD_PT_N,
+                           cast(*u8, &OUT), 128);
+    if (n != C_AD_REC_N) { return 27; }
+    if (eq(cast(*u8, &OUT), C_AD_REC, C_AD_REC_N) == 0) { return 28; }
+
+    // ...and the next one, at seq 1, is the alert record exactly.
+    n = rec.rl_seal_record(&rl, rec.CT_ALERT, C_AL_PT, C_AL_PT_N,
+                           cast(*u8, &OUT), 128);
+    if (n != C_AL_REC_N) { return 29; }
+    if (eq(cast(*u8, &OUT), C_AL_REC, C_AL_REC_N) == 0) { return 30; }
+
+    // ===== a tampered record does not open ===========================
+    let is [128]u8 as bad;
+    let is i64 as i with mut = 0;
+    while (i < C_AD_REC_N) { bad[i] = C_AD_REC[i]; i = i + 1; }
+    bad[C_AD_REC_N - 1] = cast(u8, cast(i64, bad[C_AD_REC_N - 1]) ^ 1);   // last tag byte
+    mock(&c, &mc, cast(*u8, &bad), C_AD_REC_N, 0);
+    bufread.br_init(&br, &c, cast(*u8, &BRBUF), 8192);
+    rec.rl_init(&rl, &br, &c, cast(*u8, &RX), 16645, cast(*u8, &PLAIN), 16385);
+    rec.rl_set_read_key(&rl, rec.SUITE_AES_128_GCM_SHA256, C_AP_KEY, C_AP_IV);
+    if (rec.rl_read_record(&rl, &ct) != rec.REC_ERR_DECRYPT) { return 31; }
+
+    // A flipped bit in the BODY is caught by the same tag.
+    i = 0;
+    while (i < C_AD_REC_N) { bad[i] = C_AD_REC[i]; i = i + 1; }
+    bad[10] = cast(u8, cast(i64, bad[10]) ^ 1);
+    mock(&c, &mc, cast(*u8, &bad), C_AD_REC_N, 0);
+    bufread.br_init(&br, &c, cast(*u8, &BRBUF), 8192);
+    rec.rl_init(&rl, &br, &c, cast(*u8, &RX), 16645, cast(*u8, &PLAIN), 16385);
+    rec.rl_set_read_key(&rl, rec.SUITE_AES_128_GCM_SHA256, C_AP_KEY, C_AP_IV);
+    if (rec.rl_read_record(&rl, &ct) != rec.REC_ERR_DECRYPT) { return 32; }
+
+    // And so is a header whose length was rewritten — the header IS the AAD.
+    i = 0;
+    while (i < C_AD_REC_N) { bad[i] = C_AD_REC[i]; i = i + 1; }
+    bad[0] = cast(u8, 22);                       // claim handshake
+    mock(&c, &mc, cast(*u8, &bad), C_AD_REC_N, 0);
+    bufread.br_init(&br, &c, cast(*u8, &BRBUF), 8192);
+    rec.rl_init(&rl, &br, &c, cast(*u8, &RX), 16645, cast(*u8, &PLAIN), 16385);
+    rec.rl_set_read_key(&rl, rec.SUITE_AES_128_GCM_SHA256, C_AP_KEY, C_AP_IV);
+    if (rec.rl_read_record(&rl, &ct) != rec.REC_ERR_DECRYPT) { return 33; }
+
+    // ===== the wrong sequence number is the wrong nonce ==============
+    mock(&c, &mc, C_AD_REC, C_AD_REC_N, 0);
+    bufread.br_init(&br, &c, cast(*u8, &BRBUF), 8192);
+    rec.rl_init(&rl, &br, &c, cast(*u8, &RX), 16645, cast(*u8, &PLAIN), 16385);
+    rec.rl_set_read_key(&rl, rec.SUITE_AES_128_GCM_SHA256, C_AP_KEY, C_AP_IV);
+    rl.rseq = 1;
+    if (rec.rl_read_record(&rl, &ct) != rec.REC_ERR_DECRYPT) { return 34; }
+
+    // ===== a record that is nothing but padding ======================
+    // Every byte of the plaintext is zero, so there is no content type in it.
+    // RFC 8446 §5.4 says to abort rather than treat that as an empty record of
+    // the header's type — the header on an encrypted record is always
+    // application_data and says nothing about what is inside.
+    mock(&c, &mc, ZERO_REC, ZERO_REC_N, 0);
+    bufread.br_init(&br, &c, cast(*u8, &BRBUF), 8192);
+    rec.rl_init(&rl, &br, &c, cast(*u8, &RX), 16645, cast(*u8, &PLAIN), 16385);
+    rec.rl_set_read_key(&rl, rec.SUITE_AES_128_GCM_SHA256, C_AP_KEY, C_AP_IV);
+    if (rec.rl_read_record(&rl, &ct) != rec.REC_ERR_PADDING) { return 40; }
+
+    // ===== bounds ====================================================
+    // A record claiming more than the ceiling is refused before any of it is
+    // read, which is what keeps the buffers a fixed size.
+    let is [8]u8 as huge;
+    huge[0] = cast(u8, 23); huge[1] = cast(u8, 3); huge[2] = cast(u8, 3);
+    huge[3] = cast(u8, 255); huge[4] = cast(u8, 255);
+    mock(&c, &mc, cast(*u8, &huge), 5, 0);
+    bufread.br_init(&br, &c, cast(*u8, &BRBUF), 8192);
+    rec.rl_init(&rl, &br, &c, cast(*u8, &RX), 16645, cast(*u8, &PLAIN), 16385);
+    rec.rl_set_read_key(&rl, rec.SUITE_AES_128_GCM_SHA256, C_AP_KEY, C_AP_IV);
+    if (rec.rl_read_record(&rl, &ct) != rec.REC_ERR_LENGTH) { return 35; }
+
+    // A zero-length body is not a record.
+    huge[3] = cast(u8, 0); huge[4] = cast(u8, 0);
+    mock(&c, &mc, cast(*u8, &huge), 5, 0);
+    bufread.br_init(&br, &c, cast(*u8, &BRBUF), 8192);
+    rec.rl_init(&rl, &br, &c, cast(*u8, &RX), 16645, cast(*u8, &PLAIN), 16385);
+    rec.rl_set_read_key(&rl, rec.SUITE_AES_128_GCM_SHA256, C_AP_KEY, C_AP_IV);
+    if (rec.rl_read_record(&rl, &ct) != rec.REC_ERR_LENGTH) { return 36; }
+
+    // Undersized buffers are refused at init rather than overrun later.
+    if (rec.rl_init(&rl, &br, &c, cast(*u8, &RX), 100,
+                    cast(*u8, &PLAIN), 16385) != rec.REC_ERR_SPACE) { return 37; }
+    if (rec.rl_init(&rl, &br, &c, cast(*u8, &RX), 16645,
+                    cast(*u8, &PLAIN), 100) != rec.REC_ERR_SPACE) { return 38; }
+
+    // An unconfigured suite has no key length and is refused.
+    if (rec.rl_set_read_key(&rl, 0x9999, C_AP_KEY, C_AP_IV) != rec.REC_ERR_SUITE) { return 39; }
+
+    return 0;
+}
