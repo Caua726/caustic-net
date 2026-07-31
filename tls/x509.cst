@@ -119,46 +119,73 @@ struct Cert {
     sig_alg as i64;
     sig_off as i64;     sig_len as i64;       // BIT STRING payload
 
+    // Only meaningful when sig_alg is SIG_RSA_PSS. RSASSA-PSS carries its
+    // hash and salt length in the AlgorithmIdentifier parameters instead of
+    // in the OID, so an id-RSASSA-PSS certificate says nothing about which
+    // hash signed it until these are read. 0 means "not read or not
+    // understood", which verify treats as unsupported rather than guessing.
+    pss_hash as i64;    // 256 / 384 / 512
+    pss_salt as i64;    // bytes
+
     has_bc as i64;   is_ca as i64;   path_len as i64;   // -1 = absent
     has_ku as i64;   ku as i64;
     has_eku as i64;  eku as i64;
     san_off as i64;  san_len as i64;          // the GeneralNames SEQUENCE body
 }
 
-// --- OIDs, as raw content bytes ----------------------------------------
-let is *u8 as OID_RSA        with imut = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01";
-let is *u8 as OID_EC         with imut = "\x2a\x86\x48\xce\x3d\x02\x01";
-let is *u8 as OID_ED25519    with imut = "\x2b\x65\x70";
-let is *u8 as OID_P256       with imut = "\x2a\x86\x48\xce\x3d\x03\x01\x07";
-let is *u8 as OID_P384       with imut = "\x2b\x81\x04\x00\x22";
+// --- OIDs, as content bytes with a LENGTH PREFIX -----------------------
+//
+// The first byte of each literal is how many bytes follow. It is there
+// because an OID's content can legitimately contain a zero — secp384r1 is
+// 2b 81 04 00 22 — and this file used to measure them by scanning to a NUL.
+// That read OID_P384 as three bytes, so no P-384 certificate was ever
+// recognised as P-384: `curve` stayed CURVE_UNKNOWN and every ECDSA
+// signature made by a P-384 key came back "algorithm not supported". Nothing
+// in the 62-certificate corpus had a P-384 KEY, only P-384 hashes, so it took
+// a generated chain to surface it.
+//
+// A separate length constant would have been the same trap one edit later.
+// The length lives inside the literal so that adding an OID without one does
+// not compile into a silently short comparison.
+let is *u8 as OID_RSA        with imut = "\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01";
+let is *u8 as OID_EC         with imut = "\x07\x2a\x86\x48\xce\x3d\x02\x01";
+let is *u8 as OID_ED25519    with imut = "\x03\x2b\x65\x70";
+let is *u8 as OID_P256       with imut = "\x08\x2a\x86\x48\xce\x3d\x03\x01\x07";
+let is *u8 as OID_P384       with imut = "\x05\x2b\x81\x04\x00\x22";
 
-let is *u8 as OID_SHA256_RSA with imut = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b";
-let is *u8 as OID_SHA384_RSA with imut = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0c";
-let is *u8 as OID_SHA512_RSA with imut = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0d";
-let is *u8 as OID_RSA_PSS    with imut = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0a";
-let is *u8 as OID_ECDSA_S256 with imut = "\x2a\x86\x48\xce\x3d\x04\x03\x02";
-let is *u8 as OID_ECDSA_S384 with imut = "\x2a\x86\x48\xce\x3d\x04\x03\x03";
+let is *u8 as OID_SHA256_RSA with imut = "\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b";
+let is *u8 as OID_SHA384_RSA with imut = "\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0c";
+let is *u8 as OID_SHA512_RSA with imut = "\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0d";
+let is *u8 as OID_RSA_PSS    with imut = "\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0a";
+let is *u8 as OID_ECDSA_S256 with imut = "\x08\x2a\x86\x48\xce\x3d\x04\x03\x02";
+let is *u8 as OID_ECDSA_S384 with imut = "\x08\x2a\x86\x48\xce\x3d\x04\x03\x03";
 
-let is *u8 as OID_EXT_BC     with imut = "\x55\x1d\x13";      // 2.5.29.19
-let is *u8 as OID_EXT_KU     with imut = "\x55\x1d\x0f";      // 2.5.29.15
-let is *u8 as OID_EXT_SAN    with imut = "\x55\x1d\x11";      // 2.5.29.17
-let is *u8 as OID_EXT_EKU    with imut = "\x55\x1d\x25";      // 2.5.29.37
-let is *u8 as OID_EXT_SKI    with imut = "\x55\x1d\x0e";      // 2.5.29.14
-let is *u8 as OID_EXT_AKI    with imut = "\x55\x1d\x23";      // 2.5.29.35
-let is *u8 as OID_EXT_CP     with imut = "\x55\x1d\x20";      // 2.5.29.32
-let is *u8 as OID_EXT_CRLDP  with imut = "\x55\x1d\x1f";      // 2.5.29.31
-let is *u8 as OID_EXT_NC     with imut = "\x55\x1d\x1e";      // 2.5.29.30 nameConstraints
-let is *u8 as OID_EKU_SERVER with imut = "\x2b\x06\x01\x05\x05\x07\x03\x01";
-let is *u8 as OID_EKU_CLIENT with imut = "\x2b\x06\x01\x05\x05\x07\x03\x02";
+// Hash OIDs, needed only to read RSASSA-PSS parameters. Everywhere else the
+// hash is implied by the signature OID itself.
+let is *u8 as OID_SHA1       with imut = "\x05\x2b\x0e\x03\x02\x1a";
+let is *u8 as OID_SHA256     with imut = "\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01";
+let is *u8 as OID_SHA384     with imut = "\x09\x60\x86\x48\x01\x65\x03\x04\x02\x02";
+let is *u8 as OID_SHA512     with imut = "\x09\x60\x86\x48\x01\x65\x03\x04\x02\x03";
+let is *u8 as OID_MGF1       with imut = "\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x08";
 
-fn _oidlen(s as *u8) as i64 {
-    let is i64 as n with mut = 0;
-    while (s[n] != 0) { n = n + 1; }
-    return n;
-}
+let is *u8 as OID_EXT_BC     with imut = "\x03\x55\x1d\x13";      // 2.5.29.19
+let is *u8 as OID_EXT_KU     with imut = "\x03\x55\x1d\x0f";      // 2.5.29.15
+let is *u8 as OID_EXT_SAN    with imut = "\x03\x55\x1d\x11";      // 2.5.29.17
+let is *u8 as OID_EXT_EKU    with imut = "\x03\x55\x1d\x25";      // 2.5.29.37
+let is *u8 as OID_EXT_SKI    with imut = "\x03\x55\x1d\x0e";      // 2.5.29.14
+let is *u8 as OID_EXT_AKI    with imut = "\x03\x55\x1d\x23";      // 2.5.29.35
+let is *u8 as OID_EXT_CP     with imut = "\x03\x55\x1d\x20";      // 2.5.29.32
+let is *u8 as OID_EXT_CRLDP  with imut = "\x03\x55\x1d\x1f";      // 2.5.29.31
+let is *u8 as OID_EXT_NC     with imut = "\x03\x55\x1d\x1e";      // 2.5.29.30 nameConstraints
+let is *u8 as OID_EKU_SERVER with imut = "\x08\x2b\x06\x01\x05\x05\x07\x03\x01";
+let is *u8 as OID_EKU_CLIENT with imut = "\x08\x2b\x06\x01\x05\x05\x07\x03\x02";
 
+// `want` is one of the OID_ constants above: a length byte, then that many
+// content bytes.
 fn _oid_is(buf as *u8, off as i64, len as i64, want as *u8) as i64 {
-    return der.der_oid_eq(buf, off, len, want, _oidlen(want));
+    return der.der_oid_eq(buf, off, len,
+                          cast(*u8, cast(i64, want) + 1),
+                          cast(i64, want[0]));
 }
 
 // --- Small helpers -----------------------------------------------------
@@ -261,6 +288,128 @@ fn _parse_spki(c as *Cert) as i64 {
         }
         der.der_uint(c.buf, coff, clen, &c.rsa_e_off, &c.rsa_e_len);
     }
+    return 0;
+}
+
+// --- RSASSA-PSS parameters ---------------------------------------------
+
+// The hash an AlgorithmIdentifier's OID names, as 256/384/512, else 0.
+// `off`/`len` span the SEQUENCE BODY, not the header.
+fn _hash_of_alg(buf as *u8, off as i64, len as i64) as i64 {
+    let is i64 as tag with mut = 0;
+    let is i64 as coff with mut = 0;
+    let is i64 as clen with mut = 0;
+    if (der.der_read(buf, off + len, off, &tag, &coff, &clen) < 0) { return 0; }
+    if (tag != TAG_OID) { return 0; }
+    if (_oid_is(buf, coff, clen, OID_SHA256) == 1) { return 256; }
+    if (_oid_is(buf, coff, clen, OID_SHA384) == 1) { return 384; }
+    if (_oid_is(buf, coff, clen, OID_SHA512) == 1) { return 512; }
+    return 0;
+}
+
+// RSASSA-PSS-params ::= SEQUENCE {
+//     hashAlgorithm    [0] AlgorithmIdentifier DEFAULT sha1,
+//     maskGenAlgorithm [1] AlgorithmIdentifier DEFAULT mgf1SHA1,
+//     saltLength       [2] INTEGER             DEFAULT 20,
+//     trailerField     [3] INTEGER             DEFAULT 1 }
+//
+// Unlike every other signature algorithm, id-RSASSA-PSS says nothing about
+// which hash was used — the OID is the same for SHA-256 and SHA-512. Until
+// these parameters are read, a PSS certificate cannot be verified at all.
+//
+// The defaults are SHA-1 throughout, and this leaves pss_hash at 0 for them
+// rather than filling in SHA-1: a certificate that relies on the default is
+// one nothing here will verify, and 0 makes that an explicit refusal instead
+// of a hash the certificate never named.
+fn _parse_pss_params(c as *Cert, off as i64, len as i64) as i64 {
+    c.pss_hash = 0;
+    c.pss_salt = 20;
+    if (len <= 0) { return 0; }
+
+    let is i64 as body with mut = 0;
+    let is i64 as blen with mut = 0;
+    if (der.der_enter(c.buf, off + len, off, TAG_SEQUENCE, &body, &blen) < 0) {
+        return 0 - 1;
+    }
+    let is i64 as end = body + blen;
+
+    // 0 is "SHA-1, or a hash this file does not name", and it is also what an
+    // ABSENT maskGenAlgorithm means: mgf1SHA1 is the DEFAULT, so DER omits it
+    // rather than spelling it out. Starting at "unknown" instead of "absent"
+    // is what makes a certificate that declares SHA-256 and leans on the
+    // SHA-1 default get refused — and that is the encoding openssl produces
+    // when asked for exactly that, so it is not a hypothetical shape.
+    let is i64 as mgf_hash with mut = 0;
+    let is i64 as p with mut = body;
+    while (p < end) {
+        let is i64 as tag with mut = 0;
+        let is i64 as coff with mut = 0;
+        let is i64 as clen with mut = 0;
+        let is i64 as nxt = der.der_read(c.buf, end, p, &tag, &coff, &clen);
+        if (nxt < 0) { return 0 - 1; }
+
+        if (tag == TAG_CTX0_C) {
+            let is i64 as ho with mut = 0;
+            let is i64 as hl with mut = 0;
+            if (der.der_enter(c.buf, coff + clen, coff, TAG_SEQUENCE, &ho, &hl) < 0) {
+                return 0 - 1;
+            }
+            c.pss_hash = _hash_of_alg(c.buf, ho, hl);
+        }
+
+        if (tag == TAG_CTX1_C) {
+            let is i64 as mo with mut = 0;
+            let is i64 as ml with mut = 0;
+            if (der.der_enter(c.buf, coff + clen, coff, TAG_SEQUENCE, &mo, &ml) < 0) {
+                return 0 - 1;
+            }
+            let is i64 as t2 with mut = 0;
+            let is i64 as o2 with mut = 0;
+            let is i64 as l2 with mut = 0;
+            let is i64 as after = der.der_read(c.buf, mo + ml, mo, &t2, &o2, &l2);
+            if (after < 0) { return 0 - 1; }
+            if (t2 != TAG_OID) { return 0 - 1; }
+            if (_oid_is(c.buf, o2, l2, OID_MGF1) == 0) { return 0 - 1; }
+            let is i64 as io with mut = 0;
+            let is i64 as il with mut = 0;
+            if (der.der_enter(c.buf, mo + ml, after, TAG_SEQUENCE, &io, &il) < 0) {
+                return 0 - 1;
+            }
+            mgf_hash = _hash_of_alg(c.buf, io, il);
+        }
+
+        if (tag == TAG_CTX2_C) {
+            let is i64 as t3 with mut = 0;
+            let is i64 as o3 with mut = 0;
+            let is i64 as l3 with mut = 0;
+            if (der.der_read(c.buf, coff + clen, coff, &t3, &o3, &l3) < 0) { return 0 - 1; }
+            if (t3 != 0x02) { return 0 - 1; }
+            if (l3 < 1) { return 0 - 1; }
+            if (l3 > 2) { return 0 - 1; }
+            let is i64 as v with mut = 0;
+            let is i64 as i with mut = 0;
+            while (i < l3) { v = (v << 8) + cast(i64, c.buf[o3 + i]); i = i + 1; }
+            c.pss_salt = v;
+        }
+
+        if (tag == TAG_CTX3_C) {
+            // trailerField, and 1 (0xBC) is the only value RFC 8017 defines.
+            let is i64 as t4 with mut = 0;
+            let is i64 as o4 with mut = 0;
+            let is i64 as l4 with mut = 0;
+            if (der.der_read(c.buf, coff + clen, coff, &t4, &o4, &l4) < 0) { return 0 - 1; }
+            if (t4 != 0x02) { return 0 - 1; }
+            if (l4 != 1) { return 0 - 1; }
+            if (c.buf[o4] != cast(u8, 1)) { return 0 - 1; }
+        }
+
+        p = nxt;
+    }
+
+    // MGF1's hash has to be the message hash. RFC 8446 §4.2.3 requires it for
+    // TLS and the CA/Browser baseline requirements for certificates; a
+    // mismatch is a certificate built so two verifiers can read it two ways.
+    if (mgf_hash != c.pss_hash) { c.pss_hash = 0; }
     return 0;
 }
 
@@ -464,9 +613,8 @@ fn cert_parse(buf as *u8, len as i64, c as *Cert) as i64 {
     let is i64 as salen with mut = 0;
     let is i64 as after_sa = der.der_enter(buf, topend, after_tbs, TAG_SEQUENCE, &sa, &salen);
     if (after_sa < 0) { return X509_ERR_PARSE; }
-    if (der.der_read(buf, sa + salen, sa, &tag, &coff, &clen) < 0 || tag != TAG_OID) {
-        return X509_ERR_PARSE;
-    }
+    let is i64 as after_oid = der.der_read(buf, sa + salen, sa, &tag, &coff, &clen);
+    if (after_oid < 0 || tag != TAG_OID) { return X509_ERR_PARSE; }
     c.sig_alg = SIG_UNKNOWN;
     if (_oid_is(buf, coff, clen, OID_SHA256_RSA) == 1) { c.sig_alg = SIG_RSA_SHA256; }
     if (_oid_is(buf, coff, clen, OID_SHA384_RSA) == 1) { c.sig_alg = SIG_RSA_SHA384; }
@@ -475,6 +623,14 @@ fn cert_parse(buf as *u8, len as i64, c as *Cert) as i64 {
     if (_oid_is(buf, coff, clen, OID_ECDSA_S256) == 1) { c.sig_alg = SIG_ECDSA_SHA256; }
     if (_oid_is(buf, coff, clen, OID_ECDSA_S384) == 1) { c.sig_alg = SIG_ECDSA_SHA384; }
     if (_oid_is(buf, coff, clen, OID_ED25519) == 1)    { c.sig_alg = SIG_ED25519; }
+
+    c.pss_hash = 0;
+    c.pss_salt = 0;
+    if (c.sig_alg == SIG_RSA_PSS) {
+        if (_parse_pss_params(c, after_oid, sa + salen - after_oid) < 0) {
+            return X509_ERR_PARSE;
+        }
+    }
 
     if (der.der_read(buf, topend, after_sa, &tag, &coff, &clen) < 0) { return X509_ERR_PARSE; }
     if (tag != TAG_BITSTRING || clen < 1) { return X509_ERR_PARSE; }
@@ -506,6 +662,18 @@ fn cert_parse(buf as *u8, len as i64, c as *Cert) as i64 {
     let is i64 as ia_len with mut = 0;
     let is i64 as after_ia = der.der_enter(buf, tend, p, TAG_SEQUENCE, &ia_off, &ia_len);
     if (after_ia < 0) { return X509_ERR_PARSE; }
+    // RFC 5280 §4.1.1.2 says the two MUST match, and until now this parser
+    // read the outer one and skipped the inner. Only the outer is protected
+    // by the signature; a certificate where they differ is one built so that
+    // a verifier reading one and a policy check reading the other disagree.
+    // Compared as bytes rather than re-decoded, because a re-decode that
+    // normalises away a difference is exactly what would be exploited.
+    if (ia_len != salen) { return X509_ERR_PARSE; }
+    let is i64 as ai with mut = 0;
+    while (ai < salen) {
+        if (buf[ia_off + ai] != buf[sa + ai]) { return X509_ERR_PARSE; }
+        ai = ai + 1;
+    }
     p = after_ia;
 
     // issuer — kept as the whole SEQUENCE, header included, because chain

@@ -1,0 +1,297 @@
+// =======================================================
+// caustic-net/tests/test_trust.cst
+// Where the anchors come from, and what happens when they do not.
+//
+// The embedded set and a bundle on disk go through the same decoder on
+// purpose, so most of what matters here is that the two agree: load the file
+// tools/gen_roots.py was run against and the set it produced, and every anchor
+// should come out the same. When the machine has no such file the comparison
+// is skipped and said so — this test must pass in a container with no
+// /etc/ssl, which is the whole reason the embedded set exists.
+//
+// The PEM reader is the part with sharp edges: caustic-crypto's base64_decode
+// stops at the first newline, `bins` returns NULL above 64 KiB without saying
+// so, and base64_decode is never told how much room it has. Each of those is
+// exercised below with a bundle built in memory rather than read from disk.
+//
+// Exit 0 = all pass. Non-zero = the numbered check that failed.
+// =======================================================
+
+use "std/io.cst" as io;
+use "std/time.cst" as time;
+use "../tls/trust.cst" as trust;
+use "../tls/roots.cst" as roots;
+use "../tls/x509.cst" as x509;
+
+// A PEM body, 64 base64 characters to a line — the shape a real bundle has,
+// and the shape that makes base64_decode return -1 if the newlines survive.
+let is *u8 as B64 with imut =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn pem_append(buf as *u8, pos as i64, s as *u8) as i64 {
+    let is i64 as p with mut = pos;
+    let is i64 as i with mut = 0;
+    while (s[i] != 0) { buf[p] = s[i]; p = p + 1; i = i + 1; }
+    return p;
+}
+
+fn pem_b64(buf as *u8, pos as i64, der as *u8, dlen as i64) as i64 {
+    let is i64 as p with mut = pos;
+    let is i64 as col with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < dlen) {
+        let is i64 as b0 = cast(i64, der[i]);
+        let is i64 as b1 with mut = 0;
+        let is i64 as b2 with mut = 0;
+        let is i64 as have with mut = 1;
+        if (i + 1 < dlen) { b1 = cast(i64, der[i + 1]); have = 2; }
+        if (i + 2 < dlen) { b2 = cast(i64, der[i + 2]); have = 3; }
+        let is i64 as v = (b0 << 16) + (b1 << 8) + b2;
+
+        let is [4]u8 as q;
+        q[0] = B64[(v >> 18) & 63];
+        q[1] = B64[(v >> 12) & 63];
+        q[2] = cast(u8, 61);
+        q[3] = cast(u8, 61);
+        if (have >= 2) { q[2] = B64[(v >> 6) & 63]; }
+        if (have >= 3) { q[3] = B64[v & 63]; }
+
+        let is i64 as k with mut = 0;
+        while (k < 4) {
+            buf[p] = q[k];
+            p = p + 1;
+            col = col + 1;
+            if (col == 64) { buf[p] = cast(u8, 10); p = p + 1; col = 0; }
+            k = k + 1;
+        }
+        i = i + 3;
+    }
+    if (col != 0) { buf[p] = cast(u8, 10); p = p + 1; }
+    return p;
+}
+
+fn eq(a as *u8, b as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (a[i] != 0 && b[i] != 0) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    if (a[i] != b[i]) { return 0; }
+    return 1;
+}
+
+fn main() as i32 {
+    // ===== the literal buffer dimensions =============================
+    // Same reason as everywhere else in this library: array dimensions are
+    // spelled as literals because the release compiler does not resolve a
+    // named constant there yet.
+    if (trust.MAX_ANCHORS != 512) { return 1; }     // _reserve's 512 * sizeof
+    if (trust.MAX_PEM_B64 != 16384) { return 2; }   // [16384]u8 scratch
+    if (trust.MAX_PATH != 512) { return 3; }        // [512]u8 path
+
+    // ===== the embedded set ==========================================
+    let is trust.TrustStore as e;
+    let is i64 as t0 with mut = time.now_us();
+    let is i64 as ne = trust.trust_load_embedded(&e);
+    let is i64 as emb_us = time.now_us() - t0;
+    if (ne <= 0) {
+        io.printf("embedded: %s\n", trust.trust_err_name(ne));
+        return 4;
+    }
+    if (ne != roots.ROOTS_COUNT) { return 5; }
+    if (trust.trust_skipped(&e) != 0) {
+        io.printf("embedded: %ld anchors refused by the parser\n",
+                  trust.trust_skipped(&e));
+        return 6;
+    }
+    if (trust.trust_source(&e) != trust.TRUST_EMBEDDED) { return 7; }
+    if (eq(trust.trust_source_name(&e), "embedded") == 0) { return 8; }
+    // The generator's arithmetic and the decoder's have to agree exactly. If
+    // they do not, one anchor decoded to a different length than the file
+    // says, and every offset after it is wrong.
+    if (e.derlen != roots.ROOTS_DER_BYTES) { return 9; }
+
+    // Every anchor has to be usable as one: a CA, in date somewhere, and able
+    // to sign certificates. An anchor that is none of those is dead weight
+    // that verify_chain will pick and then refuse.
+    let is i64 as i with mut = 0;
+    let is i64 as noca with mut = 0;
+    let is i64 as nosign with mut = 0;
+    let is i64 as notself with mut = 0;
+    while (i < ne) {
+        let is *x509.Cert as a = trust.trust_at(&e, i);
+        if (a.is_ca != 1) { noca = noca + 1; }
+        if (a.has_ku == 1) {
+            if ((a.ku & x509.KU_KEY_CERT_SIGN) == 0) { nosign = nosign + 1; }
+        }
+        if (x509.cert_is_self_signed(a) == 0) { notself = notself + 1; }
+        if (a.not_before >= a.not_after) { return 10; }
+        i = i + 1;
+    }
+    if (noca != 0) { io.printf("%ld anchors are not CAs\n", noca); return 11; }
+    if (nosign != 0) { io.printf("%ld anchors cannot sign certs\n", nosign); return 12; }
+    if (notself != 0) { io.printf("%ld anchors are not self-issued\n", notself); return 13; }
+
+    // trust_at refuses an index it does not have rather than reading past.
+    if (cast(i64, trust.trust_at(&e, 0 - 1)) != 0) { return 14; }
+    if (cast(i64, trust.trust_at(&e, ne)) != 0) { return 15; }
+
+    // Every anchor finds ITSELF as its own issuer, since a root is
+    // self-signed. That is the lookup path, exercised ne times.
+    i = 0;
+    while (i < ne) {
+        if (trust.trust_find_issuer(&e, trust.trust_at(&e, i)) < 0) {
+            io.printf("anchor %ld cannot find itself\n", i);
+            return 16;
+        }
+        i = i + 1;
+    }
+
+    // ===== the same set, read off disk ===============================
+    // Only if the machine has the file the embedded set was generated from.
+    // A container with no /etc/ssl must still pass everything above.
+    let is trust.TrustStore as s;
+    let is *u8 as SYSBUNDLE = "/etc/ssl/certs/ca-certificates.crt";
+    let is i64 as have_file = io.file_size(SYSBUNDLE);
+    let is i64 as ns with mut = trust.trust_load_file(&s, SYSBUNDLE);
+    let is i64 as compared with mut = 0;
+    // If the file is there, reading it MUST work. Treating a failed load as
+    // "no bundle on this machine" is how the whitespace stripping could be
+    // deleted and nothing would notice: base64_decode stops at the first
+    // newline, every certificate would be refused, and the test would report
+    // a container.
+    if (have_file > 0) {
+        if (ns <= 0) {
+            io.printf("system bundle exists (%ld bytes) but did not load: %s\n",
+                      have_file, trust.trust_err_name(ns));
+            return 45;
+        }
+    }
+    if (ns > 0) {
+        if (trust.trust_source(&s) != trust.TRUST_SYSTEM) { return 17; }
+        // Same count and same total bytes means the PEM reader and the
+        // generator saw the same certificates in the same order.
+        if (ns == ne) {
+            if (s.derlen != e.derlen) { return 18; }
+            i = 0;
+            while (i < ns) {
+                let is *x509.Cert as a = trust.trust_at(&s, i);
+                let is *x509.Cert as b = trust.trust_at(&e, i);
+                if (a.len != b.len) { return 19; }
+                if (a.subject_len != b.subject_len) { return 20; }
+                let is i64 as j with mut = 0;
+                while (j < a.len) {
+                    if (a.buf[j] != b.buf[j]) { return 21; }
+                    j = j + 1;
+                }
+                i = i + 1;
+            }
+            compared = 1;
+        }
+        trust.trust_free(&s);
+    }
+
+    // ===== a file that is not a bundle ===============================
+    if (trust.trust_load_file(&s, "/nonexistent/nowhere.pem")
+        != trust.TRUST_ERR_STORE) { return 22; }
+    // A real file with no PEM block in it is a store error, not an empty
+    // store: silently trusting nothing is how a machine ends up accepting
+    // every certificate later.
+    if (trust.trust_load_file(&s, "/etc/hostname")
+        != trust.TRUST_ERR_STORE) { return 23; }
+    // ...and a failed load leaves nothing behind.
+    if (trust.trust_count(&s) != 0) { return 24; }
+    if (cast(i64, s.der) != 0) { return 25; }
+
+    // ===== a bundle whose last block never closes ====================
+    // One good certificate followed by a BEGIN with no END. The truncated
+    // block has to be DROPPED, not decoded to wherever the file happens to
+    // stop: everything after an unterminated header is inside a block that
+    // was never closed, and feeding it to base64_decode either fails or —
+    // worse — succeeds on something that is not a certificate. One anchor,
+    // nothing skipped, is the only right answer.
+    let is [8192]u8 as pem;
+    let is i64 as pn with mut = 0;
+    let is *x509.Cert as src0 = trust.trust_at(&e, 0);
+    pn = pem_append(cast(*u8, &pem), pn, "-----BEGIN CERTIFICATE-----\n");
+    pn = pem_b64(cast(*u8, &pem), pn, src0.buf, src0.len);
+    pn = pem_append(cast(*u8, &pem), pn, "-----END CERTIFICATE-----\n");
+    let is i64 as good_end = pn;
+    pn = pem_append(cast(*u8, &pem), pn, "-----BEGIN CERTIFICATE-----\n");
+    pn = pem_b64(cast(*u8, &pem), pn, src0.buf, src0.len);
+    // deliberately no END line
+
+    let is *u8 as TMP = "build/test_trust_truncated.pem";
+    if (io.write_file_atomic(TMP, cast(*u8, &pem), pn) != 0) { return 46; }
+    let is i64 as nt = trust.trust_load_file(&s, TMP);
+    if (nt != 1) {
+        io.printf("truncated bundle: %ld anchors, %ld skipped\n",
+                  nt, trust.trust_skipped(&s));
+        return 47;
+    }
+    if (trust.trust_skipped(&s) != 0) { return 48; }
+    trust.trust_free(&s);
+
+    // The same file cut off at the end of the good block loads identically,
+    // which is what says the truncated tail contributed nothing.
+    if (io.write_file_atomic(TMP, cast(*u8, &pem), good_end) != 0) { return 49; }
+    if (trust.trust_load_file(&s, TMP) != 1) { return 50; }
+    if (trust.trust_skipped(&s) != 0) { return 51; }
+    trust.trust_free(&s);
+    io.unlink(TMP);
+
+    // ===== a store the caller fills ==================================
+    let is trust.TrustStore as p;
+    if (trust.trust_new(&p, 65536) != 0) { return 26; }
+    if (trust.trust_count(&p) != 0) { return 27; }
+    if (trust.trust_source(&p) != trust.TRUST_NONE) { return 28; }
+    if (eq(trust.trust_source_name(&p), "none") == 0) { return 29; }
+
+    // One anchor, copied out of the embedded set's arena.
+    let is *x509.Cert as first = trust.trust_at(&e, 0);
+    if (trust.trust_add_der(&p, first.buf, first.len) != 1) { return 30; }
+    if (trust.trust_count(&p) != 1) { return 31; }
+    // The copy is the point: the store must not point at the caller's buffer.
+    if (cast(i64, trust.trust_at(&p, 0).buf) == cast(i64, first.buf)) { return 32; }
+    if (trust.trust_find_issuer(&p, trust.trust_at(&p, 0)) != 0) { return 33; }
+    // ...and something that is not a certificate is refused without being
+    // counted, rather than parsed into a slot full of nothing.
+    if (trust.trust_add_der(&p, "not a certificate", 17) != 0) { return 34; }
+    if (trust.trust_count(&p) != 1) { return 35; }
+    if (trust.trust_add_der(&p, first.buf, 0) != 0) { return 36; }
+    if (trust.trust_count(&p) != 1) { return 37; }
+    // A certificate larger than the arena is refused, not written past it.
+    if (trust.trust_add_der(&p, first.buf, 1000000) != trust.TRUST_ERR_SPACE) {
+        return 38;
+    }
+    if (trust.trust_count(&p) != 1) { return 39; }
+
+    // An anchor whose issuer nobody holds comes back as -1, not as 0.
+    let is *x509.Cert as other = trust.trust_at(&e, 1);
+    if (trust.trust_find_issuer(&p, other) != 0 - 1) { return 40; }
+    trust.trust_free(&p);
+    if (trust.trust_count(&p) != 0) { return 41; }
+    if (cast(i64, trust.trust_der_ptr(&p)) != 0) { return 42; }
+
+    // ===== freeing twice is not a crash ==============================
+    trust.trust_free(&p);
+    trust.trust_free(&e);
+
+    // ===== the probe order ===========================================
+    // trust_init has to come back with SOMETHING on any machine: the system
+    // bundle where there is one, the embedded set where there is not.
+    let is trust.TrustStore as a;
+    let is i64 as na = trust.trust_init(&a);
+    if (na <= 0) {
+        io.printf("trust_init: %s\n", trust.trust_err_name(na));
+        return 43;
+    }
+    if (trust.trust_source(&a) == trust.TRUST_NONE) { return 44; }
+    io.printf("trust ok: %ld embedded anchors in %ld us, %ld from %s",
+              ne, emb_us, na, trust.trust_path(&a));
+    if (compared == 1) { io.printf(", byte-identical to the bundle on disk"); }
+    if (ns <= 0) { io.printf(", no system bundle on this machine"); }
+    io.printf("\n");
+    trust.trust_free(&a);
+    return 0;
+}

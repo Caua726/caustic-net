@@ -1,0 +1,440 @@
+// =======================================================
+// caustic-net/tls/verify.cst
+// Does this chain end at something we trust, and is it for this host?
+//
+// The errors here are deliberately distinct rather than one UNTRUSTED, because
+// a browser renders "expired", "the name does not match" and "we do not know
+// who issued this" as three different pages, and only the first is usually the
+// user's problem. That is why the -1600 block got its own taxonomy.
+//
+// What caustic-crypto provides, and what it does not:
+//
+//   * p256_ecdsa_verify and p384_ecdsa_verify are general — they take the
+//     public point, the truncated hash, r and s. (The x509_verify_ecdsa_*
+//     wrapper in its asn1/x509.cst is the one restricted to self-signed
+//     certificates; it is not used here.)
+//   * rsa_pkcs1v15_verify is hash-agnostic and takes the DigestInfo prefix as
+//     bytes, so the three prefixes are constants below.
+//   * RSASSA-PSS above SHA-256 is not there at all; tls/pss.cst is.
+//   * bigint.Big holds a heap pointer and is not copyable by assignment.
+//     Every Big made here is freed on every path out, including the error
+//     ones — that is why the signature dispatch reads as it does.
+//
+// Two things this does NOT do, said out loud rather than left to be
+// discovered: there is no revocation check of any kind (no CRL, no OCSP, no
+// stapling), and there are no name constraints — tls/x509.cst deliberately
+// reports nameConstraints as an extension it does not understand, so a
+// certificate carrying it critical is refused at parse time rather than
+// having the constraint ignored here.
+// =======================================================
+
+use "caustic-crypto/hash/sha2.cst" as sha2;
+use "caustic-crypto/mac/hmac.cst" as hmac;
+use "caustic-crypto/pk/rsa.cst" as rsa;
+use "caustic-crypto/pk/p256.cst" as p256;
+use "caustic-crypto/pk/p384.cst" as p384;
+use "caustic-crypto/pk/ed25519.cst" as ed;
+use "caustic-crypto/bigint/bigint.cst" as bi;
+use "caustic-crypto/asn1/der.cst" as der;
+use "./x509.cst" as x509;
+use "./trust.cst" as trust;
+use "./pss.cst" as pss;
+
+// --- Errors (the -1620 block) ------------------------------------------
+let is i64 as VERIFY_ERR_EXPIRED   with imut = 0 - 1620;   // notAfter is in the past
+let is i64 as VERIFY_ERR_NOTYET    with imut = 0 - 1621;   // notBefore is in the future
+let is i64 as VERIFY_ERR_HOSTNAME  with imut = 0 - 1622;   // no SAN matches
+let is i64 as VERIFY_ERR_UNTRUSTED with imut = 0 - 1623;   // chain reaches no anchor
+let is i64 as VERIFY_ERR_BADSIG    with imut = 0 - 1624;   // a link does not verify
+let is i64 as VERIFY_ERR_NOTCA     with imut = 0 - 1625;   // an issuer is not a CA
+let is i64 as VERIFY_ERR_PATHLEN   with imut = 0 - 1626;   // pathLenConstraint exceeded
+let is i64 as VERIFY_ERR_DEPTH     with imut = 0 - 1627;   // chain too long, or a loop
+let is i64 as VERIFY_ERR_SIGALG    with imut = 0 - 1628;   // algorithm not supported
+let is i64 as VERIFY_ERR_KEYUSE    with imut = 0 - 1629;   // keyUsage or EKU forbids it
+
+let is i64 as MAX_DEPTH with imut = 10;
+
+// DigestInfo prefixes for PKCS#1 v1.5, RFC 8017 §9.2 note 1. Nineteen bytes
+// each; rsa_pkcs1v15_verify takes them as-is because it does not know which
+// hash it is checking.
+let is *u8 as DI_SHA256 with imut =
+    "\x30\x31\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x01\x05\x00\x04\x20";
+let is *u8 as DI_SHA384 with imut =
+    "\x30\x41\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x02\x05\x00\x04\x30";
+let is *u8 as DI_SHA512 with imut =
+    "\x30\x51\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x03\x05\x00\x04\x40";
+let is i64 as DI_LEN with imut = 19;
+
+// The hash a signature algorithm uses, as 256/384/512, or 0.
+fn _sig_hash(c as *x509.Cert) as i64 {
+    if (c.sig_alg == x509.SIG_RSA_SHA256)   { return 256; }
+    if (c.sig_alg == x509.SIG_RSA_SHA384)   { return 384; }
+    if (c.sig_alg == x509.SIG_RSA_SHA512)   { return 512; }
+    if (c.sig_alg == x509.SIG_ECDSA_SHA256) { return 256; }
+    if (c.sig_alg == x509.SIG_ECDSA_SHA384) { return 384; }
+    if (c.sig_alg == x509.SIG_RSA_PSS)      { return c.pss_hash; }
+    return 0;
+}
+
+fn _digest(hash as i64, p as *u8, n as i64, out as *u8) as i64 {
+    if (hash == 256) { sha2.sha256(p, n, out); return 32; }
+    if (hash == 384) { sha2.sha384(p, n, out); return 48; }
+    if (hash == 512) { sha2.sha512(p, n, out); return 64; }
+    return 0;
+}
+
+fn _alg_of(hash as i64) as hmac.HashAlg {
+    if (hash == 384) { return hmac.alg_sha384(); }
+    if (hash == 512) { return hmac.alg_sha512(); }
+    return hmac.alg_sha256();
+}
+
+// --- RSA ----------------------------------------------------------------
+
+fn _verify_rsa(child as *x509.Cert, issuer as *x509.Cert,
+               hash as i64, digest as *u8, dlen as i64) as i64 {
+    if (issuer.rsa_n_off < 0) { return VERIFY_ERR_SIGALG; }
+    if (issuer.rsa_n_len <= 0) { return VERIFY_ERR_SIGALG; }
+    if (issuer.rsa_e_len <= 0) { return VERIFY_ERR_SIGALG; }
+
+    let is rsa.RsaPub as pub;
+    rsa.rsa_pub_from_bytes(&pub,
+                           cast(*u8, cast(i64, issuer.buf) + issuer.rsa_n_off),
+                           issuer.rsa_n_len,
+                           cast(*u8, cast(i64, issuer.buf) + issuer.rsa_e_off),
+                           issuer.rsa_e_len);
+
+    // RFC 8446 §4.2.3 and the CA/Browser requirements both fix the PSS salt at
+    // the hash length. A certificate declaring anything else is refused rather
+    // than verified under its own rule: this library has one PSS profile.
+    //
+    // That refusal is SIGALG and not BADSIG on purpose. "We do not accept this
+    // parameter" and "the signature is wrong" are different things to a
+    // browser, and folding the first into the second would report a
+    // well-formed certificate as forged.
+    let is i64 as unsupported with mut = 0;
+    if (child.sig_alg == x509.SIG_RSA_PSS) {
+        if (child.pss_salt != dlen) { unsupported = 1; }
+    }
+
+    // The signature has to be exactly the modulus length. Both verifiers read
+    // pub.k bytes from it, and the span came off the wire. Not observable from
+    // a test — a certificate whose signature is a different length than its
+    // issuer's modulus fails to verify either way — so this is here for the
+    // read, not for the answer.
+    let is i64 as ok with mut = 0;
+    if (unsupported == 0) {
+        if (child.sig_len == pub.k) {
+            let is *u8 as sig = cast(*u8, cast(i64, child.buf) + child.sig_off);
+            if (child.sig_alg == x509.SIG_RSA_PSS) {
+                let is hmac.HashAlg as a = _alg_of(hash);
+                ok = pss.pss_verify_digest(&pub, &a, digest, sig, child.sig_len, dlen);
+            } else {
+                let is *u8 as di with mut = DI_SHA256;
+                if (hash == 384) { di = DI_SHA384; }
+                if (hash == 512) { di = DI_SHA512; }
+                ok = rsa.rsa_pkcs1v15_verify(&pub, di, DI_LEN, digest, dlen, sig);
+            }
+        }
+    }
+
+    bi.big_free(&pub.n);
+    bi.big_free(&pub.e);
+    if (unsupported == 1) { return VERIFY_ERR_SIGALG; }
+    if (ok == 1) { return 0; }
+    return VERIFY_ERR_BADSIG;
+}
+
+// --- ECDSA --------------------------------------------------------------
+
+// Ecdsa-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }
+fn _ecdsa_rs(c as *x509.Cert, r as *bi.Big, s as *bi.Big) as i64 {
+    let is i64 as end = c.sig_off + c.sig_len;
+    let is i64 as body with mut = 0;
+    let is i64 as blen with mut = 0;
+    if (der.der_enter(c.buf, end, c.sig_off, x509.TAG_SEQUENCE, &body, &blen) < 0) {
+        return 0 - 1;
+    }
+    let is i64 as bend = body + blen;
+
+    let is i64 as tag with mut = 0;
+    let is i64 as coff with mut = 0;
+    let is i64 as clen with mut = 0;
+    let is i64 as nxt = der.der_read(c.buf, bend, body, &tag, &coff, &clen);
+    if (nxt < 0) { return 0 - 1; }
+    if (tag != 0x02) { return 0 - 1; }
+    let is i64 as ro with mut = 0;
+    let is i64 as rl with mut = 0;
+    der.der_uint(c.buf, coff, clen, &ro, &rl);
+    if (rl <= 0) { return 0 - 1; }
+
+    if (der.der_read(c.buf, bend, nxt, &tag, &coff, &clen) < 0) { return 0 - 1; }
+    if (tag != 0x02) { return 0 - 1; }
+    let is i64 as so with mut = 0;
+    let is i64 as sl with mut = 0;
+    der.der_uint(c.buf, coff, clen, &so, &sl);
+    if (sl <= 0) { return 0 - 1; }
+
+    *r = bi.big_from_bytes_be(cast(*u8, cast(i64, c.buf) + ro), rl);
+    *s = bi.big_from_bytes_be(cast(*u8, cast(i64, c.buf) + so), sl);
+    return 0;
+}
+
+fn _verify_ecdsa(child as *x509.Cert, issuer as *x509.Cert,
+                 digest as *u8, dlen as i64) as i64 {
+    let is i64 as flen with mut = 0;
+    if (issuer.curve == x509.CURVE_P256) { flen = 32; }
+    if (issuer.curve == x509.CURVE_P384) { flen = 48; }
+    // Shadowed by the length check below — with flen at 0 no real key is
+    // 1 byte long — so deleting it changes nothing observable. It is here
+    // because "we do not know this curve" is the actual reason, and reaching
+    // the same answer through a length coincidence is luck.
+    if (flen == 0) { return VERIFY_ERR_SIGALG; }
+
+    // Uncompressed point only: 0x04 || X || Y. caustic-crypto has no point
+    // decompression, and accepting a 0x02/0x03 form by reading X alone would
+    // be verifying against half a key. Neither of these two can be isolated:
+    // a key that fails them fails verification anyway, so they are here for
+    // the read they prevent, not for the answer they give.
+    if (issuer.key_len != 1 + 2 * flen) { return VERIFY_ERR_SIGALG; }
+    if (issuer.buf[issuer.key_off] != cast(u8, 4)) { return VERIFY_ERR_SIGALG; }
+
+    let is bi.Big as r;
+    let is bi.Big as s;
+    if (_ecdsa_rs(child, &r, &s) < 0) { return VERIFY_ERR_BADSIG; }
+
+    let is bi.Big as qx = bi.big_from_bytes_be(
+        cast(*u8, cast(i64, issuer.buf) + issuer.key_off + 1), flen);
+    let is bi.Big as qy = bi.big_from_bytes_be(
+        cast(*u8, cast(i64, issuer.buf) + issuer.key_off + 1 + flen), flen);
+
+    // z is the leftmost min(8*dlen, orderBits) bits of the digest — NOT the
+    // whole digest. It coincides for P-256/SHA-256 and P-384/SHA-384, so the
+    // truncation only shows up on a mismatched pair such as P-256 with
+    // SHA-384, which is legal and does occur. Both group orders are a whole
+    // number of bytes, so this is a byte-count and never a bit shift.
+    let is i64 as take with mut = dlen;
+    if (take > flen) { take = flen; }
+    let is bi.Big as z = bi.big_from_bytes_be(digest, take);
+
+    let is i64 as ok with mut = 0;
+    if (issuer.curve == x509.CURVE_P256) {
+        ok = p256.p256_ecdsa_verify(&qx, &qy, &z, &r, &s);
+    } else {
+        ok = p384.p384_ecdsa_verify(&qx, &qy, &z, &r, &s);
+    }
+
+    bi.big_free(&r);  bi.big_free(&s);
+    bi.big_free(&qx); bi.big_free(&qy);
+    bi.big_free(&z);
+    if (ok == 1) { return 0; }
+    return VERIFY_ERR_BADSIG;
+}
+
+// --- One link -----------------------------------------------------------
+
+// Is `child` signed by `issuer`'s key? 0 yes, negative otherwise.
+//
+// This asks nothing about names, dates or CA-ness — verify_chain does that.
+fn verify_signature(child as *x509.Cert, issuer as *x509.Cert) as i64 {
+    if (child.sig_len <= 0) { return VERIFY_ERR_BADSIG; }
+
+    // Ed25519 signs the message, not a hash of it, so it comes before the
+    // digest is taken.
+    if (child.sig_alg == x509.SIG_ED25519) {
+        // ed25519_verify reads 32 bytes of key and 64 of signature and is
+        // told neither length, so these bound the reads. A certificate that
+        // fails them would fail verification too, which is why no vector
+        // isolates them.
+        if (issuer.pk_alg != x509.PK_ED25519) { return VERIFY_ERR_SIGALG; }
+        if (issuer.key_len != 32) { return VERIFY_ERR_SIGALG; }
+        if (child.sig_len != 64) { return VERIFY_ERR_BADSIG; }
+        let is i64 as ok = ed.ed25519_verify(
+            cast(*u8, cast(i64, issuer.buf) + issuer.key_off),
+            cast(*u8, cast(i64, child.buf) + child.tbs_off), child.tbs_len,
+            cast(*u8, cast(i64, child.buf) + child.sig_off));
+        if (ok == 1) { return 0; }
+        return VERIFY_ERR_BADSIG;
+    }
+
+    // _digest returns 0 for a hash it cannot compute, so this is shadowed by
+    // the dlen check below. It stays to name the reason and to skip hashing a
+    // whole TBS for an algorithm that was never going to be checked.
+    let is i64 as hash = _sig_hash(child);
+    if (hash == 0) { return VERIFY_ERR_SIGALG; }
+
+    let is [64]u8 as digest;
+    let is i64 as dlen = _digest(hash,
+                                 cast(*u8, cast(i64, child.buf) + child.tbs_off),
+                                 child.tbs_len, cast(*u8, &digest));
+    if (dlen == 0) { return VERIFY_ERR_SIGALG; }
+
+    if (child.sig_alg == x509.SIG_ECDSA_SHA256
+        || child.sig_alg == x509.SIG_ECDSA_SHA384) {
+        if (issuer.pk_alg != x509.PK_EC) { return VERIFY_ERR_SIGALG; }
+        return _verify_ecdsa(child, issuer, cast(*u8, &digest), dlen);
+    }
+
+    // Shadowed by _verify_rsa's own check that the issuer carries a modulus:
+    // an EC key has rsa_n_off at -1. Kept because the mismatch it names is a
+    // different thing from a missing field.
+    if (issuer.pk_alg != x509.PK_RSA) { return VERIFY_ERR_SIGALG; }
+    return _verify_rsa(child, issuer, hash, cast(*u8, &digest), dlen);
+}
+
+// --- The chain ----------------------------------------------------------
+
+fn _in_window(c as *x509.Cert, now as i64) as i64 {
+    if (now < c.not_before) { return VERIFY_ERR_NOTYET; }
+    if (now > c.not_after)  { return VERIFY_ERR_EXPIRED; }
+    return 0;
+}
+
+// May `issuer` have signed a certificate at depth `depth` below it?
+//
+// depth is 0 when the issuer signed the leaf directly, 1 when it signed the
+// CA that signed the leaf, and so on — which is exactly what
+// pathLenConstraint counts (RFC 5280 §4.2.1.9: the number of non-self-issued
+// intermediates that may follow).
+fn _may_sign(issuer as *x509.Cert, depth as i64) as i64 {
+    // "basicConstraints absent" means "not a CA". Treating it as unconstrained
+    // is the flaw that let any leaf certificate mint others.
+    //
+    // The first line is shadowed by the second — cert_parse initialises is_ca
+    // to 0, so an absent extension already fails the value check and deleting
+    // this line changes no answer. It stays because it is the rule as RFC 5280
+    // states it, and because the shadowing is a property of an initialiser in
+    // another file.
+    if (issuer.has_bc == 0) { return VERIFY_ERR_NOTCA; }
+    if (issuer.is_ca != 1)  { return VERIFY_ERR_NOTCA; }
+    // keyUsage is optional, but when it is there it is binding.
+    if (issuer.has_ku == 1) {
+        if ((issuer.ku & x509.KU_KEY_CERT_SIGN) == 0) { return VERIFY_ERR_KEYUSE; }
+    }
+    if (issuer.path_len >= 0) {
+        if (depth > issuer.path_len) { return VERIFY_ERR_PATHLEN; }
+    }
+    return 0;
+}
+
+fn _same_cert(a as *x509.Cert, b as *x509.Cert) as i64 {
+    if (a.len != b.len) { return 0; }
+    if (a.serial_len != b.serial_len) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < a.serial_len) {
+        if (a.buf[a.serial_off + i] != b.buf[b.serial_off + i]) { return 0; }
+        i = i + 1;
+    }
+    return x509.cert_issued_by(a, b) & x509.cert_issued_by(b, a);
+}
+
+// Verify `chain[0]` for `host` at time `now`, anchored in `t`.
+//
+// chain[0] is the leaf and chain[1..] are the intermediates the peer sent, in
+// order. The peer's list is a hint, not the truth: at every level the store is
+// asked FIRST, so a chain that ends in a cross-signed root we already have as
+// an anchor stops there instead of walking to a root the peer chose. That is
+// what makes a chain with an extra, expired cross-certificate on the end
+// validate — the case that breaks naive verifiers every few years.
+//
+// A self-signed certificate the peer appends is neither required nor refused;
+// it simply never becomes the anchor, because only the store can be one.
+//
+// Returns 0, or the first thing found wrong.
+fn verify_chain(t as *trust.TrustStore, chain as *x509.Cert, n as i64,
+                host as *u8, now as i64) as i64 {
+    // Both of these are early-outs, not correctness guards: the walk below
+    // ends in UNTRUSTED on its own once `ni >= n` or the store answers -1 at
+    // every level. They are here so a hostile chain against an empty store
+    // costs nothing instead of MAX_DEPTH signature verifications, and so that
+    // a caller passing n == 0 does not have chain[0] read out from under it.
+    // Neither can be isolated by a test, and saying so is more honest than
+    // implying the corpus covers them.
+    if (n <= 0) { return VERIFY_ERR_UNTRUSTED; }
+    if (t.n <= 0) { return VERIFY_ERR_UNTRUSTED; }
+
+    let is *x509.Cert as leaf = chain;
+
+    // The leaf, before anything else: a name mismatch is the answer the user
+    // most needs, and computing signatures first only delays it.
+    if (x509.cert_name_matches(leaf, host) != 1) { return VERIFY_ERR_HOSTNAME; }
+    if (leaf.has_eku == 1) {
+        if ((leaf.eku & x509.EKU_SERVER_AUTH) == 0) { return VERIFY_ERR_KEYUSE; }
+    }
+
+    let is i64 as depth with mut = 0;
+    let is *x509.Cert as cur with mut = leaf;
+
+    while (depth < MAX_DEPTH) {
+        let is i64 as w = _in_window(cur, now);
+        if (w != 0) { return w; }
+
+        // The store first. If it holds the issuer, this is the last link.
+        let is i64 as ai = trust.trust_find_issuer(t, cur);
+        if (ai >= 0) {
+            let is *x509.Cert as anchor = trust.trust_at(t, ai);
+            let is i64 as aw = _in_window(anchor, now);
+            if (aw != 0) { return aw; }
+            let is i64 as ms = _may_sign(anchor, depth);
+            if (ms != 0) { return ms; }
+            return verify_signature(cur, anchor);
+        }
+
+        // Otherwise the next certificate the peer sent has to be the issuer.
+        let is i64 as ni = depth + 1;
+        if (ni >= n) { return VERIFY_ERR_UNTRUSTED; }
+        let is *x509.Cert as next = cast(*x509.Cert,
+                                         cast(i64, chain) + ni * sizeof(x509.Cert));
+
+        // A certificate that is its own issuer and is not in the store is a
+        // root we do not trust. The walk is already bounded by `ni >= n`, so
+        // this cannot change an answer — it stops a self-signed certificate
+        // the peer appended twice from costing one wasted signature check
+        // before the bound catches it.
+        if (_same_cert(cur, next) == 1) { return VERIFY_ERR_UNTRUSTED; }
+        if (x509.cert_issued_by(cur, next) != 1) { return VERIFY_ERR_UNTRUSTED; }
+
+        let is i64 as ms2 = _may_sign(next, depth);
+        if (ms2 != 0) { return ms2; }
+
+        let is i64 as vs = verify_signature(cur, next);
+        if (vs != 0) { return vs; }
+
+        cur = next;
+        depth = depth + 1;
+    }
+
+    return VERIFY_ERR_DEPTH;
+}
+
+fn verify_err_name(e as i64) as *u8 {
+    if (e == 0)                    { return "OK"; }
+    if (e == VERIFY_ERR_EXPIRED)   { return "VERIFY_ERR_EXPIRED"; }
+    if (e == VERIFY_ERR_NOTYET)    { return "VERIFY_ERR_NOTYET"; }
+    if (e == VERIFY_ERR_HOSTNAME)  { return "VERIFY_ERR_HOSTNAME"; }
+    if (e == VERIFY_ERR_UNTRUSTED) { return "VERIFY_ERR_UNTRUSTED"; }
+    if (e == VERIFY_ERR_BADSIG)    { return "VERIFY_ERR_BADSIG"; }
+    if (e == VERIFY_ERR_NOTCA)     { return "VERIFY_ERR_NOTCA"; }
+    if (e == VERIFY_ERR_PATHLEN)   { return "VERIFY_ERR_PATHLEN"; }
+    if (e == VERIFY_ERR_DEPTH)     { return "VERIFY_ERR_DEPTH"; }
+    if (e == VERIFY_ERR_SIGALG)    { return "VERIFY_ERR_SIGALG"; }
+    if (e == VERIFY_ERR_KEYUSE)    { return "VERIFY_ERR_KEYUSE"; }
+    return "VERIFY_ERR_UNKNOWN";
+}
+
+// A one-line summary for a human. The browser wants the code; a log wants
+// this.
+fn verify_err_text(e as i64) as *u8 {
+    if (e == VERIFY_ERR_EXPIRED)   { return "certificate has expired"; }
+    if (e == VERIFY_ERR_NOTYET)    { return "certificate is not valid yet"; }
+    if (e == VERIFY_ERR_HOSTNAME)  { return "certificate is for a different host"; }
+    if (e == VERIFY_ERR_UNTRUSTED) { return "issuer is not trusted"; }
+    if (e == VERIFY_ERR_BADSIG)    { return "signature does not verify"; }
+    if (e == VERIFY_ERR_NOTCA)     { return "issuer is not a certificate authority"; }
+    if (e == VERIFY_ERR_PATHLEN)   { return "chain is longer than the CA allows"; }
+    if (e == VERIFY_ERR_DEPTH)     { return "chain is too long"; }
+    if (e == VERIFY_ERR_SIGALG)    { return "signature algorithm is not supported"; }
+    if (e == VERIFY_ERR_KEYUSE)    { return "key is not allowed to be used this way"; }
+    if (e == 0)                    { return "ok"; }
+    return "certificate could not be checked";
+}

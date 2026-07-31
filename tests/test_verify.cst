@@ -1,0 +1,401 @@
+// =======================================================
+// caustic-net/tests/test_verify.cst
+// Chain verification, one wrong thing at a time.
+//
+// tests/vec_chain.cst holds one real chain — ietf.org, its Google Trust
+// Services intermediate, and GTS Root R4 out of the machine's bundle — and a
+// couple of dozen built by tools/gen_chains.py. The real one proves this
+// agrees with the internet; the synthetic ones exist because the internet does
+// not hand out chains that are wrong in a chosen way, and because the real one
+// is entirely ECDSA with matched hashes and a browser meets far more.
+//
+// Every failing chain has to come back as its OWN error. A verifier that
+// answers UNTRUSTED to everything passes a test that only asks "did it
+// reject", and a browser built on it can only ever render one page.
+//
+// The clock is never read: vec_chain.cst carries an instant computed from the
+// certificates themselves. The two chains that DO depend on time are made
+// here by moving that instant outside the leaf's window, which is also the
+// only way to test expiry without shipping a certificate that is already dead.
+//
+// Exit 0 = all pass. Non-zero = the numbered check that failed.
+// =======================================================
+
+use "std/io.cst" as io;
+use "std/time.cst" as time;
+use "../tls/x509.cst" as x509;
+use "../tls/trust.cst" as trust;
+use "../tls/verify.cst" as verify;
+use "./vec_chain.cst" as v;
+
+// vec_chain's small codes, so the corpus does not have to import verify.cst.
+fn want_err(code as i64) as i64 {
+    if (code == 0)  { return 0; }
+    if (code == 1)  { return verify.VERIFY_ERR_EXPIRED; }
+    if (code == 2)  { return verify.VERIFY_ERR_NOTYET; }
+    if (code == 3)  { return verify.VERIFY_ERR_HOSTNAME; }
+    if (code == 4)  { return verify.VERIFY_ERR_UNTRUSTED; }
+    if (code == 5)  { return verify.VERIFY_ERR_BADSIG; }
+    if (code == 6)  { return verify.VERIFY_ERR_NOTCA; }
+    if (code == 7)  { return verify.VERIFY_ERR_PATHLEN; }
+    if (code == 8)  { return verify.VERIFY_ERR_DEPTH; }
+    if (code == 9)  { return verify.VERIFY_ERR_SIGALG; }
+    if (code == 10) { return verify.VERIFY_ERR_KEYUSE; }
+    return 0 - 999999;
+}
+
+// Room for the longest chain in the corpus plus slack; check 2 pins it.
+let is [16]x509.Cert as _chain with mut;
+
+// Parse chain `i` into _chain. Returns the number of certificates, or <0.
+fn load_chain(i as i64) as i64 {
+    let is i64 as n = v.ch_len(i);
+    if (n > 16) { return 0 - 1; }
+    let is i64 as j with mut = 0;
+    while (j < n) {
+        let is i64 as dl with mut = 0;
+        let is *u8 as der = v.ch_cert(i, j, &dl);
+        let is i64 as rc = x509.cert_parse(der, dl, &_chain[j]);
+        if (rc < 0) {
+            io.printf("chain %s cert %ld: %s\n", v.ch_name(i), j,
+                      x509.x509_err_name(rc));
+            return 0 - 2;
+        }
+        j = j + 1;
+    }
+    return n;
+}
+
+// A store holding exactly chain `i`'s root and nothing else. Building it from
+// the corpus rather than from the machine means this test says the same thing
+// on every machine, including one whose bundle no longer carries GTS Root R4.
+fn load_root(t as *trust.TrustStore, i as i64) as i64 {
+    if (trust.trust_new(t, 65536) < 0) { return 0 - 1; }
+    // The decoy goes in FIRST, so a lookup that stops at the cheap prefilter
+    // finds the wrong anchor before the right one.
+    let is i64 as dl with mut = 0;
+    let is *u8 as dd = v.ch_decoy(i, &dl);
+    if (dl > 0) {
+        if (trust.trust_add_der(t, dd, dl) != 1) { return 0 - 3; }
+    }
+    let is i64 as rl with mut = 0;
+    let is *u8 as rd = v.ch_root(i, &rl);
+    if (trust.trust_add_der(t, rd, rl) != 1) { return 0 - 2; }
+    return 0;
+}
+
+fn main() as i32 {
+    v.ch_ensure();
+
+    // ===== the corpus, one chain at a time ===========================
+    if (v.CH_COUNT < 10) { return 1; }
+    if (v.CH_MAX > 16) { return 2; }
+
+    let is trust.TrustStore as t;
+    let is i64 as nok with mut = 0;
+    let is i64 as nbad with mut = 0;
+
+    let is i64 as i with mut = 0;
+    while (i < v.CH_COUNT) {
+        let is i64 as n = load_chain(i);
+        if (n < 0) { return 3; }
+        if (load_root(&t, i) < 0) { return 4; }
+
+        let is i64 as got = verify.verify_chain(&t, cast(*x509.Cert, &_chain),
+                                                n, v.ch_host(i), v.CH_NOW);
+        let is i64 as want = want_err(v.ch_want(i));
+        if (got != want) {
+            io.printf("chain %ld (%s): got %s, want %s\n", i, v.ch_name(i),
+                      verify.verify_err_name(got), verify.verify_err_name(want));
+            return 5;
+        }
+        if (want == 0) { nok = nok + 1; } else { nbad = nbad + 1; }
+        trust.trust_free(&t);
+        i = i + 1;
+    }
+    if (nok < 9) { io.printf("only %ld chains verified\n", nok); return 6; }
+    if (nbad < 8) { io.printf("only %ld chains rejected\n", nbad); return 7; }
+
+    // The P-384 regression, pinned. secp384r1's OID contains a zero byte, and
+    // measuring the OID constants by scanning to a NUL read it as three bytes
+    // — so `curve` stayed CURVE_UNKNOWN and every P-384 signature came back
+    // "algorithm not supported". Chain 6 is a P-384 chain; asserting that its
+    // intermediate is RECOGNISED, not merely that the chain verifies, is what
+    // stops the length prefix from being dropped again.
+    if (load_chain(6) < 0) { return 54; }
+    if (_chain[1].pk_alg != x509.PK_EC) { return 55; }
+    if (_chain[1].curve != x509.CURVE_P384) { return 56; }
+    if (x509.OID_P384[0] != 5) { return 57; }
+    if (x509.OID_P384[4] != 0) { return 58; }   // the zero that started it
+
+    // ===== time, from both sides =====================================
+    // Chain 0 is RSA/SHA-256 and known good at CH_NOW. Moving the instant one
+    // second outside the leaf's window has to change the answer, and change
+    // it to a DIFFERENT error on each side.
+    if (load_chain(0) < 0) { return 8; }
+    if (load_root(&t, 0) < 0) { return 9; }
+    // The window the whole chain is valid in, not the leaf's: the anchor is
+    // checked too, and openssl dates the root a moment before the leaf, so
+    // the leaf's own notAfter is already past the root's.
+    let is i64 as rl0 with mut = 0;
+    let is x509.Cert as root0;
+    if (x509.cert_parse(v.ch_root(0, &rl0), rl0, &root0) < 0) { return 88; }
+    let is i64 as nb with mut = _chain[0].not_before;
+    if (_chain[1].not_before > nb) { nb = _chain[1].not_before; }
+    if (root0.not_before > nb) { nb = root0.not_before; }
+    let is i64 as na with mut = _chain[0].not_after;
+    if (_chain[1].not_after < na) { na = _chain[1].not_after; }
+    if (root0.not_after < na) { na = root0.not_after; }
+    if (nb >= na) { return 10; }
+    if (v.CH_NOW <= nb) { return 11; }
+    if (v.CH_NOW >= na) { return 12; }
+
+    if (verify.verify_chain(&t, cast(*x509.Cert, &_chain), 2,
+                            v.ch_host(0), na + 1)
+        != verify.VERIFY_ERR_EXPIRED) { return 13; }
+    if (verify.verify_chain(&t, cast(*x509.Cert, &_chain), 2,
+                            v.ch_host(0), nb - 1)
+        != verify.VERIFY_ERR_NOTYET) { return 14; }
+    // And the boundaries themselves are inside the window, not outside it.
+    if (verify.verify_chain(&t, cast(*x509.Cert, &_chain), 2,
+                            v.ch_host(0), na) != 0) { return 15; }
+    if (verify.verify_chain(&t, cast(*x509.Cert, &_chain), 2,
+                            v.ch_host(0), nb) != 0) { return 16; }
+
+    // An anchor outside its own window is refused too, not only the leaf.
+    // The root is the last thing anyone looks at and the easiest to forget.
+    let is i64 as rl with mut = 0;
+    let is *u8 as rd = v.ch_root(0, &rl);
+    let is x509.Cert as rootc;
+    if (x509.cert_parse(rd, rl, &rootc) < 0) { return 17; }
+    if (verify.verify_chain(&t, cast(*x509.Cert, &_chain), 2,
+                            v.ch_host(0), rootc.not_after + 1)
+        != verify.VERIFY_ERR_EXPIRED) { return 18; }
+
+    trust.trust_free(&t);
+
+    // ===== a tampered signature ======================================
+    // One bit of the leaf's signature, flipped. Everything else about the
+    // chain is untouched, so BADSIG is the only answer that can be right —
+    // and it is the answer that distinguishes a verifier that checks
+    // signatures from one that only walks names.
+    let is [8192]u8 as tampered;
+    let is i64 as dl with mut = 0;
+    let is *u8 as leaf_der = v.ch_cert(0, 0, &dl);
+    if (dl > 8192) { return 19; }
+    let is i64 as k with mut = 0;
+    while (k < dl) { tampered[k] = leaf_der[k]; k = k + 1; }
+
+    if (load_chain(0) < 0) { return 20; }
+    let is i64 as so = _chain[0].sig_off;
+    if (so <= 0) { return 21; }
+    if (so >= dl) { return 22; }
+    tampered[so] = cast(u8, cast(i64, tampered[so]) ^ 1);
+
+    if (x509.cert_parse(cast(*u8, &tampered), dl, &_chain[0]) < 0) { return 23; }
+    if (load_root(&t, 0) < 0) { return 24; }
+    if (verify.verify_chain(&t, cast(*x509.Cert, &_chain), 2,
+                            v.ch_host(0), v.CH_NOW)
+        != verify.VERIFY_ERR_BADSIG) { return 25; }
+    trust.trust_free(&t);
+
+    // A byte of the TBS, flipped instead — the signature is intact but no
+    // longer covers what is there. Same answer, different route to it.
+    while (k < dl) { k = k + 1; }
+    k = 0;
+    while (k < dl) { tampered[k] = leaf_der[k]; k = k + 1; }
+    if (load_chain(0) < 0) { return 26; }
+    let is i64 as sn = _chain[0].serial_off;
+    tampered[sn] = cast(u8, cast(i64, tampered[sn]) ^ 0x40);
+    if (x509.cert_parse(cast(*u8, &tampered), dl, &_chain[0]) < 0) { return 27; }
+    if (load_root(&t, 0) < 0) { return 28; }
+    if (verify.verify_chain(&t, cast(*x509.Cert, &_chain), 2,
+                            v.ch_host(0), v.CH_NOW)
+        != verify.VERIFY_ERR_BADSIG) { return 29; }
+    trust.trust_free(&t);
+
+    // ===== an empty store ============================================
+    if (load_chain(0) < 0) { return 30; }
+    if (trust.trust_new(&t, 4096) < 0) { return 31; }
+    if (verify.verify_chain(&t, cast(*x509.Cert, &_chain), 2,
+                            v.ch_host(0), v.CH_NOW)
+        != verify.VERIFY_ERR_UNTRUSTED) { return 32; }
+    trust.trust_free(&t);
+
+    // ===== the peer sends only the leaf ==============================
+    // No intermediate, and the store holds only the root. The issuer is
+    // simply not reachable, which is UNTRUSTED and not a crash.
+    if (load_chain(0) < 0) { return 33; }
+    if (load_root(&t, 0) < 0) { return 34; }
+    if (verify.verify_chain(&t, cast(*x509.Cert, &_chain), 1,
+                            v.ch_host(0), v.CH_NOW)
+        != verify.VERIFY_ERR_UNTRUSTED) { return 35; }
+    // ...and a chain of length zero is refused rather than indexed into.
+    if (verify.verify_chain(&t, cast(*x509.Cert, &_chain), 0,
+                            v.ch_host(0), v.CH_NOW)
+        != verify.VERIFY_ERR_UNTRUSTED) { return 36; }
+    trust.trust_free(&t);
+
+    // ===== the store is asked before the peer's list =================
+    // Put the INTERMEDIATE in the store as an anchor. Verification must stop
+    // there, at depth 0, and never look at the root — which is what makes a
+    // chain with an extra cross-signed certificate on the end work.
+    if (load_chain(0) < 0) { return 37; }
+    if (trust.trust_new(&t, 65536) < 0) { return 38; }
+    let is i64 as il with mut = 0;
+    let is *u8 as inter_der = v.ch_cert(0, 1, &il);
+    if (trust.trust_add_der(&t, inter_der, il) != 1) { return 39; }
+    if (verify.verify_chain(&t, cast(*x509.Cert, &_chain), 2,
+                            v.ch_host(0), v.CH_NOW) != 0) { return 40; }
+    // The same store, with the peer sending nothing but the leaf: still fine,
+    // because the anchor was never in the peer's list to begin with.
+    if (verify.verify_chain(&t, cast(*x509.Cert, &_chain), 1,
+                            v.ch_host(0), v.CH_NOW) != 0) { return 41; }
+    trust.trust_free(&t);
+
+    // ===== the name check ============================================
+    if (load_chain(0) < 0) { return 42; }
+    if (load_root(&t, 0) < 0) { return 43; }
+    if (verify.verify_chain(&t, cast(*x509.Cert, &_chain), 2,
+                            "TEST.EXAMPLE", v.CH_NOW) != 0) { return 44; }
+    if (verify.verify_chain(&t, cast(*x509.Cert, &_chain), 2,
+                            "x.test.example", v.CH_NOW)
+        != verify.VERIFY_ERR_HOSTNAME) { return 45; }
+    if (verify.verify_chain(&t, cast(*x509.Cert, &_chain), 2,
+                            "test.example.evil.com", v.CH_NOW)
+        != verify.VERIFY_ERR_HOSTNAME) { return 46; }
+
+    // ===== the decoy anchor really does collide ======================
+    // If the DNs stopped matching in length and last two bytes, chain 23
+    // would pass for the boring reason and the prefilter check would be
+    // testing nothing.
+    let is i64 as ci with mut = 0;
+    while (ci < v.CH_COUNT) {
+        let is i64 as dl2 with mut = 0;
+        if (v.ch_decoy(ci, &dl2) != cast(*u8, 0)) {
+            let is i64 as rl2 with mut = 0;
+            let is *u8 as rd2 = v.ch_root(ci, &rl2);
+            let is x509.Cert as dcert;
+            let is x509.Cert as rcert;
+            if (x509.cert_parse(v.ch_decoy(ci, &dl2), dl2, &dcert) < 0) { return 59; }
+            if (x509.cert_parse(rd2, rl2, &rcert) < 0) { return 60; }
+            if (dcert.subject_len != rcert.subject_len) { return 61; }
+            let is i64 as de = dcert.subject_off + dcert.subject_len;
+            let is i64 as re = rcert.subject_off + rcert.subject_len;
+            if (dcert.buf[de - 1] != rcert.buf[re - 1]) { return 62; }
+            if (dcert.buf[de - 2] != rcert.buf[re - 2]) { return 63; }
+            // ...and they are genuinely different names, or there is no test.
+            if (x509.cert_issued_by(&dcert, &rcert) == 1) { return 64; }
+        }
+        ci = ci + 1;
+    }
+
+    // ===== an anchor's own signature over the intermediate ===========
+    // The tampering above hits the LEAF, whose issuer is found in the peer's
+    // list. Flipping the INTERMEDIATE's signature is the only way to reach
+    // the verification against the anchor, which is a different call site.
+    let is i64 as il2 with mut = 0;
+    let is *u8 as inter0 = v.ch_cert(0, 1, &il2);
+    if (il2 > 8192) { return 65; }
+    k = 0;
+    while (k < il2) { tampered[k] = inter0[k]; k = k + 1; }
+    if (load_chain(0) < 0) { return 66; }
+    let is i64 as iso = _chain[1].sig_off;
+    tampered[iso] = cast(u8, cast(i64, tampered[iso]) ^ 1);
+    if (x509.cert_parse(cast(*u8, &tampered), il2, &_chain[1]) < 0) { return 67; }
+    if (load_root(&t, 0) < 0) { return 68; }
+    if (verify.verify_chain(&t, cast(*x509.Cert, &_chain), 2,
+                            v.ch_host(0), v.CH_NOW)
+        != verify.VERIFY_ERR_BADSIG) { return 69; }
+    trust.trust_free(&t);
+
+    // ===== an anchor outside its own window ==========================
+    // Chain 22's root expires in 100 days while its leaf lasts 3650, so
+    // there is an instant where the leaf is fine and the anchor is not. A
+    // verifier that only checks the chain it was handed says yes there.
+    let is i64 as si = 22;
+    if (load_chain(si) < 0) { return 70; }
+    if (load_root(&t, si) < 0) { return 71; }
+    let is i64 as srl with mut = 0;
+    let is x509.Cert as sroot;
+    if (x509.cert_parse(v.ch_root(si, &srl), srl, &sroot) < 0) { return 72; }
+    if (sroot.not_after >= _chain[0].not_after) { return 73; }
+    if (verify.verify_chain(&t, cast(*x509.Cert, &_chain), 2,
+                            v.ch_host(si), sroot.not_after + 1)
+        != verify.VERIFY_ERR_EXPIRED) { return 74; }
+    // ...and at that instant the leaf and the intermediate are both fine, so
+    // EXPIRED can only have come from the anchor.
+    if (_chain[0].not_after <= sroot.not_after + 1) { return 75; }
+    if (_chain[1].not_after <= sroot.not_after + 1) { return 76; }
+    trust.trust_free(&t);
+
+    // ===== a certificate that says two things about its own algorithm =
+    // RFC 5280 §4.1.1.2: the AlgorithmIdentifier inside the TBS and the one
+    // outside it must match, and only the outer is signed. cert_parse must
+    // refuse the certificate rather than hand verify a field that was never
+    // covered.
+    if (v.BADALG_LEN > 0) {
+        let is x509.Cert as bad;
+        if (x509.cert_parse(v.BADALG, v.BADALG_LEN, &bad)
+            != x509.X509_ERR_PARSE) { return 77; }
+    }
+
+    // ===== a PSS trailerField that is not 1 ==========================
+    // RFC 8017 defines exactly one trailer byte. A certificate naming another
+    // is refused at parse time rather than verified as if it had said 1 —
+    // which is what would happen if the field were simply skipped.
+    if (v.BADTRAIL_LEN > 0) {
+        let is x509.Cert as bt;
+        if (x509.cert_parse(v.BADTRAIL, v.BADTRAIL_LEN, &bt)
+            != x509.X509_ERR_PARSE) { return 87; }
+    }
+
+    // ===== how long it takes =========================================
+    // The number that decides whether a browser built on this is usable. RSA
+    // and ECDSA are measured apart because they cost entirely different
+    // things — a modexp against a scalar multiplication — and a page pulls
+    // both.
+    let is i64 as ROUNDS = 20;
+    if (load_chain(0) < 0) { return 85; }
+    if (load_root(&t, 0) < 0) { return 86; }
+    let is i64 as t0 with mut = time.now_us();
+    let is i64 as r with mut = 0;
+    while (r < ROUNDS) {
+        if (verify.verify_chain(&t, cast(*x509.Cert, &_chain), 2,
+                                v.ch_host(0), v.CH_NOW) != 0) { return 78; }
+        r = r + 1;
+    }
+    let is i64 as rsa_us = (time.now_us() - t0) / ROUNDS;
+    trust.trust_free(&t);
+
+    if (load_chain(5) < 0) { return 79; }        // ecdsa_p256
+    if (load_root(&t, 5) < 0) { return 80; }
+    t0 = time.now_us();
+    r = 0;
+    while (r < ROUNDS) {
+        if (verify.verify_chain(&t, cast(*x509.Cert, &_chain), 2,
+                                v.ch_host(5), v.CH_NOW) != 0) { return 81; }
+        r = r + 1;
+    }
+    let is i64 as ec_us = (time.now_us() - t0) / ROUNDS;
+    trust.trust_free(&t);
+
+    let is i64 as real_us with mut = 0;
+    if (load_chain(v.CH_REAL) < 0) { return 82; }
+    if (load_root(&t, v.CH_REAL) < 0) { return 83; }
+    t0 = time.now_us();
+    r = 0;
+    while (r < ROUNDS) {
+        if (verify.verify_chain(&t, cast(*x509.Cert, &_chain), 2,
+                                v.ch_host(v.CH_REAL), v.CH_NOW) != 0) { return 84; }
+        r = r + 1;
+    }
+    real_us = (time.now_us() - t0) / ROUNDS;
+    trust.trust_free(&t);
+
+    io.printf("verify ok: %ld chains (%ld good, %ld rejected by name)\n",
+              v.CH_COUNT, nok, nbad);
+    io.printf("           rsa2048 %ld us, ecdsa p256 %ld us, ietf.org %ld us per chain\n",
+              rsa_us, ec_us, real_us);
+    return 0;
+}

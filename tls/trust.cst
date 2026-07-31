@@ -1,0 +1,430 @@
+// =======================================================
+// caustic-net/tls/trust.cst
+// The set of certificates a chain is allowed to end at.
+//
+// Two sources, in this order:
+//
+//   1. the machine's own bundle — $SSL_CERT_FILE, then the four paths the
+//      common distributions use;
+//   2. tls/roots.cst, compiled in.
+//
+// The order is not arbitrary. A root set inside a binary cannot be updated and
+// cannot have an anchor REMOVED from it, and removal is the part that matters:
+// when a CA is distrusted, every machine with a package manager stops trusting
+// it that week and every binary carrying its own copy keeps going. So the
+// embedded set exists for the machine that has no bundle at all — causticos, a
+// scratch container, Windows — and loses to the system's everywhere else.
+//
+// Three things in the standard library and in caustic-crypto make this less
+// obvious than "read the file and decode it":
+//
+//   * `bins` returns NULL in SILENCE above 65536 bytes, and io.read_file_in
+//     writes through that NULL. A CA bundle is 200-500 KB. Everything here
+//     goes through mem.core.mmap_anon, which fails with (void*)-1 rather
+//     than 0 and is checked for both.
+//   * base64_decode returns -1 at the first '\n' and does not skip
+//     whitespace. Nothing in the ecosystem handles a PEM header. Both are
+//     this module's job, and the embedded set is emitted already stripped so
+//     that it lands on the same decoder rather than a second one.
+//   * base64_decode writes without being told the size of its output, so the
+//     bound is computed and checked here, before the call.
+//
+// $SSL_CERT_FILE is only visible to a program that called env.init(argc, argv)
+// — that is the standard library's contract for every environment reader, not
+// something this module can work around. Without it the probe starts at the
+// distribution paths, which is the right answer for a program that never
+// wanted the override.
+//
+// An anchor the parser refuses is SKIPPED and counted, not fatal. A distro
+// bundle usually carries one or two encodings X.509 tolerates and this parser
+// does not, and refusing 121 anchors over one of them would be worse than
+// carrying 120. trust_skipped() reports the number so a caller can complain.
+// =======================================================
+
+use "std/io.cst" as io;
+use "std/mem.cst" as mem;
+use "std/env.cst" as env;
+use "caustic-crypto/util/base64.cst" as b64;
+use "./x509.cst" as x509;
+use "./roots.cst" as roots;
+
+let is i64 as TRUST_ERR_NOTRUST with imut = 0 - 1610;   // nothing to trust anywhere
+let is i64 as TRUST_ERR_STORE   with imut = 0 - 1611;   // unreadable or not a bundle
+let is i64 as TRUST_ERR_MEM     with imut = 0 - 1612;   // the mapping failed
+let is i64 as TRUST_ERR_SPACE   with imut = 0 - 1613;   // more anchors than MAX_ANCHORS
+
+let is i64 as TRUST_NONE     with imut = 0;
+let is i64 as TRUST_SYSTEM   with imut = 1;
+let is i64 as TRUST_EMBEDDED with imut = 2;
+
+// Buffers below are spelled with literal dimensions; see the note in
+// proto/dns.cst. tests/test_trust.cst pins each literal to its constant.
+let is i64 as MAX_ANCHORS with imut = 512;
+// A file past this is not a CA bundle, whatever its name says.
+let is i64 as MAX_BUNDLE  with imut = 8388608;      // 8 MiB
+// The base64 of one certificate, whitespace removed. 16 KiB of base64 is a
+// 12 KiB certificate, which is larger than anything a CA has issued.
+let is i64 as MAX_PEM_B64 with imut = 16384;
+let is i64 as MAX_PATH    with imut = 512;
+
+let is *u8 as PEM_BEGIN with imut = "-----BEGIN CERTIFICATE-----";
+let is *u8 as PEM_END   with imut = "-----END CERTIFICATE-----";
+
+// Probed in order. SSL_CERT_FILE comes before all of them.
+let is *u8 as PATH_DEBIAN with imut = "/etc/ssl/certs/ca-certificates.crt";
+let is *u8 as PATH_FEDORA with imut = "/etc/pki/tls/certs/ca-bundle.crt";
+let is *u8 as PATH_ALPINE with imut = "/etc/ssl/cert.pem";
+let is *u8 as PATH_SUSE   with imut = "/etc/ssl/ca-bundle.pem";
+
+struct TrustStore {
+    // One mapping holding every anchor's DER, back to back. Each Cert below
+    // points into it, so the two are freed together and never separately.
+    der    as *u8;   dercap  as i64;   derlen as i64;
+    c      as *x509.Cert;   ccap as i64;   n as i64;
+    src    as i64;
+    skipped as i64;
+    path   as [512]u8;      // where it came from, for diagnostics
+}
+
+fn _slen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+// mmap_anon reports failure as 0 on some backends and (void*)-1 on others.
+fn _map_ok(p as *u8) as i64 {
+    let is i64 as v = cast(i64, p);
+    if (v == 0) { return 0; }
+    if (v == 0 - 1) { return 0; }
+    return 1;
+}
+
+fn _zero(t as *TrustStore) as void {
+    t.der = cast(*u8, 0);   t.dercap = 0;   t.derlen = 0;
+    t.c = cast(*x509.Cert, 0);   t.ccap = 0;   t.n = 0;
+    t.src = TRUST_NONE;
+    t.skipped = 0;
+    t.path[0] = cast(u8, 0);
+}
+
+fn _set_path(t as *TrustStore, p as *u8) as void {
+    let is i64 as i with mut = 0;
+    while (i < 511 && p[i] != 0) {
+        t.path[i] = p[i];
+        i = i + 1;
+    }
+    t.path[i] = cast(u8, 0);
+}
+
+// Reserve the DER arena and the Cert array. `derbytes` is an upper bound on
+// the decoded size; overshooting costs address space and nothing else.
+fn _reserve(t as *TrustStore, derbytes as i64) as i64 {
+    t.der = mem.core.mmap_anon(derbytes);
+    if (_map_ok(t.der) == 0) { t.der = cast(*u8, 0); return TRUST_ERR_MEM; }
+    t.dercap = derbytes;
+    t.derlen = 0;
+
+    let is i64 as cbytes = 512 * sizeof(x509.Cert);
+    t.c = cast(*x509.Cert, mem.core.mmap_anon(cbytes));
+    if (_map_ok(cast(*u8, t.c)) == 0) {
+        mem.core.munmap(t.der, t.dercap);
+        t.der = cast(*u8, 0);   t.dercap = 0;
+        t.c = cast(*x509.Cert, 0);
+        return TRUST_ERR_MEM;
+    }
+    t.ccap = MAX_ANCHORS;
+    t.n = 0;
+    return 0;
+}
+
+fn trust_free(t as *TrustStore) as void {
+    if (cast(i64, t.der) != 0) { mem.core.munmap(t.der, t.dercap); }
+    if (cast(i64, t.c) != 0) {
+        mem.core.munmap(cast(*u8, t.c), t.ccap * sizeof(x509.Cert));
+    }
+    _zero(t);
+}
+
+// An empty store with room for `derbytes` of certificate. Replaces whatever
+// the store held. The caller pins its own anchors with trust_add_der.
+fn trust_new(t as *TrustStore, derbytes as i64) as i64 {
+    trust_free(t);
+    let is i64 as rc = _reserve(t, derbytes);
+    if (rc < 0) { return rc; }
+    t.src = TRUST_NONE;
+    _set_path(t, "(caller)");
+    return 0;
+}
+
+// Add one anchor from raw DER. It is COPIED into the store's arena, so the
+// caller's buffer does not have to outlive the store — which matters, because
+// every Cert in here points into that arena and nowhere else.
+//
+// Returns 1 when an anchor was added, 0 when this one was refused by the
+// parser, and a negative sentinel only when the STORE cannot continue.
+fn trust_add_der(t as *TrustStore, der as *u8, dlen as i64) as i64 {
+    if (dlen <= 0) { return 0; }
+    if (t.n >= t.ccap) { return TRUST_ERR_SPACE; }
+    if (t.derlen + dlen > t.dercap) { return TRUST_ERR_SPACE; }
+
+    let is *u8 as dst = cast(*u8, cast(i64, t.der) + t.derlen);
+    let is i64 as i with mut = 0;
+    while (i < dlen) { dst[i] = der[i]; i = i + 1; }
+
+    let is i64 as rc = x509.cert_parse(dst, dlen,
+                                       cast(*x509.Cert, cast(i64, t.c)
+                                            + t.n * sizeof(x509.Cert)));
+    if (rc < 0) { return 0; }
+
+    t.derlen = t.derlen + dlen;
+    t.n = t.n + 1;
+    return 1;
+}
+
+// Decode one certificate's base64 into the arena and parse it.
+fn _add_b64(t as *TrustStore, s as *u8, slen as i64) as i64 {
+    if (slen <= 0) { return 0; }
+    if (t.n >= t.ccap) { return TRUST_ERR_SPACE; }
+
+    // base64_decode writes as much as the input implies and is never told how
+    // much room it has. 3*slen/4 is the exact ceiling, so check it first.
+    //
+    // Unreachable as things stand: both callers reserve an arena sized from
+    // the input, so the sum can never exceed it. That is the argument for
+    // keeping it rather than against — the day a caller sizes the arena some
+    // other way, this is the difference between an error and a write past the
+    // end of a mapping. No test isolates it, and none can without a caller
+    // that is wrong.
+    let is i64 as bound = (slen / 4) * 3 + 3;
+    if (t.derlen + bound > t.dercap) { return TRUST_ERR_SPACE; }
+
+    let is i64 as dn = b64.base64_decode(s, slen, cast(*u8, cast(i64, t.der) + t.derlen));
+    if (dn <= 0) { return 0; }
+
+    let is i64 as rc = x509.cert_parse(cast(*u8, cast(i64, t.der) + t.derlen), dn,
+                                       cast(*x509.Cert, cast(i64, t.c)
+                                            + t.n * sizeof(x509.Cert)));
+    if (rc < 0) { return 0; }
+
+    t.derlen = t.derlen + dn;
+    t.n = t.n + 1;
+    return 1;
+}
+
+// Walk a PEM buffer, feeding every CERTIFICATE block to _add_b64.
+//
+// `scratch` is MAX_PEM_B64 bytes owned by the caller's frame, so this module
+// carries no mutable state and two threads loading two stores do not meet.
+fn _load_pem(t as *TrustStore, buf as *u8, len as i64,
+             scratch as *u8) as i64 {
+    let is i64 as bl = _slen(PEM_BEGIN);
+    let is i64 as el = _slen(PEM_END);
+    let is i64 as pos with mut = 0;
+
+    while (pos < len) {
+        // find BEGIN
+        let is i64 as b with mut = 0 - 1;
+        let is i64 as i with mut = pos;
+        while (i + bl <= len) {
+            let is i64 as k with mut = 0;
+            while (k < bl && buf[i + k] == PEM_BEGIN[k]) { k = k + 1; }
+            if (k == bl) { b = i; break; }
+            i = i + 1;
+        }
+        if (b < 0) { break; }
+
+        let is i64 as body = b + bl;
+
+        // find END after it
+        let is i64 as e with mut = 0 - 1;
+        i = body;
+        while (i + el <= len) {
+            let is i64 as k with mut = 0;
+            while (k < el && buf[i + k] == PEM_END[k]) { k = k + 1; }
+            if (k == el) { e = i; break; }
+            i = i + 1;
+        }
+        // A BEGIN with no END is a truncated bundle, not a reason to keep
+        // scanning: everything after it is inside a block that never closed.
+        if (e < 0) { break; }
+
+        // Copy the body out with every space, tab, CR and LF removed —
+        // base64_decode stops at the first one of those with -1.
+        let is i64 as sn with mut = 0;
+        let is i64 as over with mut = 0;
+        i = body;
+        while (i < e) {
+            let is u8 as ch = buf[i];
+            if (ch != 32 && ch != 9 && ch != 13 && ch != 10) {
+                if (sn >= MAX_PEM_B64) { over = 1; break; }
+                scratch[sn] = ch;
+                sn = sn + 1;
+            }
+            i = i + 1;
+        }
+
+        if (over == 1) {
+            t.skipped = t.skipped + 1;
+        } else {
+            let is i64 as rc = _add_b64(t, scratch, sn);
+            if (rc < 0) { return rc; }
+            if (rc == 0) { t.skipped = t.skipped + 1; }
+        }
+
+        pos = e + el;
+    }
+
+    if (t.n == 0) { return TRUST_ERR_STORE; }
+    return 0;
+}
+
+// Load a PEM bundle from disk. Replaces whatever the store held.
+fn trust_load_file(t as *TrustStore, path as *u8) as i64 {
+    trust_free(t);
+
+    let is i64 as sz = io.file_size(path);
+    if (sz <= 0) { return TRUST_ERR_STORE; }
+    // A resource bound, and the only one between "this path is wrong" and a
+    // mapping the size of whatever it pointed at. Not observable from a test
+    // without an 8 MiB fixture, which is not worth carrying.
+    if (sz > MAX_BUNDLE) { return TRUST_ERR_STORE; }
+
+    // The whole file, mapped. Not `bins`: it returns NULL above 64 KiB and
+    // says nothing, and every bundle worth reading is past that.
+    let is *u8 as raw = mem.core.mmap_anon(sz);
+    if (_map_ok(raw) == 0) { return TRUST_ERR_MEM; }
+
+    let is i64 as fd = io._open_read(path);
+    if (fd < 0) { mem.core.munmap(raw, sz); return TRUST_ERR_STORE; }
+    let is i64 as got = io.read_exact(fd, raw, sz);
+    io._close_fd(fd);
+    // Short read: the file shrank between the stat and the read, or it is not
+    // a regular file. Reachable only by racing the filesystem, so nothing
+    // tests it — but reading a partial bundle as a whole one would silently
+    // drop trust anchors.
+    if (got != sz) { mem.core.munmap(raw, sz); return TRUST_ERR_STORE; }
+
+    // Decoded output is at most three quarters of the base64 that produced
+    // it, and the file is bigger than its base64 by the headers and newlines.
+    let is i64 as rc with mut = _reserve(t, (sz / 4) * 3 + 4096);
+    if (rc < 0) { mem.core.munmap(raw, sz); return rc; }
+
+    let is [16384]u8 as scratch;
+    rc = _load_pem(t, raw, sz, cast(*u8, &scratch));
+    mem.core.munmap(raw, sz);
+    if (rc < 0) { trust_free(t); return rc; }
+
+    t.src = TRUST_SYSTEM;
+    _set_path(t, path);
+    return t.n;
+}
+
+// Load the set compiled in by tools/gen_roots.py.
+fn trust_load_embedded(t as *TrustStore) as i64 {
+    trust_free(t);
+    roots.roots_ensure();
+
+    let is i64 as rc with mut = _reserve(t, roots.ROOTS_DER_BYTES + 4096);
+    if (rc < 0) { return rc; }
+
+    let is i64 as i with mut = 0;
+    while (i < roots.roots_count()) {
+        let is i64 as bl with mut = 0;
+        let is *u8 as s = roots.roots_b64(i, &bl);
+        let is i64 as one = _add_b64(t, s, bl);
+        if (one < 0) { trust_free(t); return one; }
+        if (one == 0) { t.skipped = t.skipped + 1; }
+        i = i + 1;
+    }
+
+    if (t.n == 0) { trust_free(t); return TRUST_ERR_NOTRUST; }
+    t.src = TRUST_EMBEDDED;
+    _set_path(t, roots.ROOTS_SOURCE);
+    return t.n;
+}
+
+// $SSL_CERT_FILE, then the distribution paths, then the embedded set.
+//
+// Returns the number of anchors loaded, or TRUST_ERR_NOTRUST if even the
+// embedded set failed — which can only happen if this binary was built
+// without one.
+fn trust_init(t as *TrustStore) as i64 {
+    _zero(t);
+
+    let is *u8 as fromenv = env.getenv("SSL_CERT_FILE");
+    if (cast(i64, fromenv) != 0) {
+        if (fromenv[0] != 0) {
+            let is i64 as rc = trust_load_file(t, fromenv);
+            // An explicit override that does not work is an error worth
+            // surfacing, not something to quietly walk past: the operator
+            // asked for that file and got someone else's anchors instead.
+            if (rc > 0) { return rc; }
+            return rc;
+        }
+    }
+
+    if (trust_load_file(t, PATH_DEBIAN) > 0) { return t.n; }
+    if (trust_load_file(t, PATH_FEDORA) > 0) { return t.n; }
+    if (trust_load_file(t, PATH_ALPINE) > 0) { return t.n; }
+    if (trust_load_file(t, PATH_SUSE) > 0) { return t.n; }
+
+    return trust_load_embedded(t);
+}
+
+fn trust_count(t as *TrustStore) as i64   { return t.n; }
+// Exposed so a test can prove the mapping was released rather than only that
+// the count went to zero.
+fn trust_der_ptr(t as *TrustStore) as *u8 { return t.der; }
+fn trust_skipped(t as *TrustStore) as i64 { return t.skipped; }
+fn trust_source(t as *TrustStore) as i64  { return t.src; }
+fn trust_path(t as *TrustStore) as *u8    { return cast(*u8, &t.path); }
+
+fn trust_at(t as *TrustStore, i as i64) as *x509.Cert {
+    if (i < 0) { return cast(*x509.Cert, 0); }
+    if (i >= t.n) { return cast(*x509.Cert, 0); }
+    return cast(*x509.Cert, cast(i64, t.c) + i * sizeof(x509.Cert));
+}
+
+// The index of an anchor whose subject is the certificate's issuer, or -1.
+//
+// The DN comparison is byte-exact (cert_issued_by), so this can only ever
+// miss an anchor a smarter comparison would find — never invent one. A miss
+// surfaces as "issuer unknown", which is the safe direction.
+//
+// The last four bytes of a DN are compared before the whole thing because
+// otherwise every lookup is 121 full-length memcmps and a chain does several.
+fn trust_find_issuer(t as *TrustStore, c as *x509.Cert) as i64 {
+    if (c.issuer_len < 4) { return 0 - 1; }
+    let is u8 as t0 = c.buf[c.issuer_off + c.issuer_len - 1];
+    let is u8 as t1 = c.buf[c.issuer_off + c.issuer_len - 2];
+
+    let is i64 as i with mut = 0;
+    while (i < t.n) {
+        let is *x509.Cert as a = cast(*x509.Cert,
+                                      cast(i64, t.c) + i * sizeof(x509.Cert));
+        if (a.subject_len == c.issuer_len) {
+            if (a.buf[a.subject_off + a.subject_len - 1] == t0) {
+                if (a.buf[a.subject_off + a.subject_len - 2] == t1) {
+                    if (x509.cert_issued_by(c, a) == 1) { return i; }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn trust_source_name(t as *TrustStore) as *u8 {
+    if (t.src == TRUST_SYSTEM)   { return "system"; }
+    if (t.src == TRUST_EMBEDDED) { return "embedded"; }
+    return "none";
+}
+
+fn trust_err_name(e as i64) as *u8 {
+    if (e == TRUST_ERR_NOTRUST) { return "TRUST_ERR_NOTRUST"; }
+    if (e == TRUST_ERR_STORE)   { return "TRUST_ERR_STORE"; }
+    if (e == TRUST_ERR_MEM)     { return "TRUST_ERR_MEM"; }
+    if (e == TRUST_ERR_SPACE)   { return "TRUST_ERR_SPACE"; }
+    return "TRUST_ERR_UNKNOWN";
+}
