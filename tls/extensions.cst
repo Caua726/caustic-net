@@ -1,0 +1,300 @@
+// =======================================================
+// caustic-net/tls/extensions.cst
+// The extension blocks a ClientHello carries, and finding one in a reply.
+//
+// Pure byte work: nothing here touches a socket, a key or a transcript, which
+// is what lets it be tested against RFC 8448's printed ClientHello a field at
+// a time instead of only as part of a handshake.
+//
+// Which extensions, and why each one:
+//
+//   server_name        almost every host on the internet is virtual. Without
+//                      SNI the server has no idea which certificate to send
+//                      and the connection either fails or gets the wrong one.
+//   supported_versions this is where "TLS 1.3" is actually said. The version
+//                      field in the record and in the ClientHello body both
+//                      still read 1.2, because middleboxes rewrite anything
+//                      else.
+//   supported_groups   X25519 only. caustic-crypto exports p256_ecdh_base but
+//                      no p256_ecdh_shared and keeps its scalar multiply
+//                      private, so P-256 key exchange is upstream work. A
+//                      server that insists on it sends HelloRetryRequest,
+//                      which the handshake names rather than mis-parses.
+//   key_share          the X25519 public key, sent up front so a 1-RTT
+//                      handshake is possible at all.
+//   signature_algs     exactly what tls/verify.cst can check, and nothing
+//                      more. Announcing an algorithm we cannot verify is how
+//                      a handshake gets to the last message before failing.
+//   alpn               "http/1.1". Without it a server that also speaks HTTP/2
+//                      may pick h2, and proto/http1.cst will read the frames
+//                      as a status line.
+//
+// Lengths are the hazard here, not content: every block is length-prefixed
+// two or three deep, and a builder that writes a length before it knows the
+// body has to go back and patch it. `_patch16` is that, in one place.
+// =======================================================
+
+use "../core/bytes.cst" as bytes;
+
+// --- Extension numbers (RFC 8446 §4.2) ---------------------------------
+let is i64 as EXT_SERVER_NAME     with imut = 0;
+let is i64 as EXT_SUPPORTED_GROUPS with imut = 10;
+let is i64 as EXT_SIG_ALGS        with imut = 13;
+let is i64 as EXT_ALPN            with imut = 16;
+let is i64 as EXT_SUPPORTED_VERS  with imut = 43;
+let is i64 as EXT_COOKIE          with imut = 44;
+let is i64 as EXT_KEY_SHARE       with imut = 51;
+
+// --- Named groups ------------------------------------------------------
+let is i64 as GROUP_X25519 with imut = 0x001D;
+let is i64 as GROUP_P256   with imut = 0x0017;
+let is i64 as GROUP_P384   with imut = 0x0018;
+
+// --- SignatureScheme ---------------------------------------------------
+let is i64 as SIG_ECDSA_P256_SHA256 with imut = 0x0403;
+let is i64 as SIG_ECDSA_P384_SHA384 with imut = 0x0503;
+let is i64 as SIG_RSA_PSS_RSAE_256  with imut = 0x0804;
+let is i64 as SIG_RSA_PSS_RSAE_384  with imut = 0x0805;
+let is i64 as SIG_RSA_PSS_RSAE_512  with imut = 0x0806;
+let is i64 as SIG_ED25519           with imut = 0x0807;
+let is i64 as SIG_RSA_PSS_PSS_256   with imut = 0x0809;
+let is i64 as SIG_RSA_PSS_PSS_384   with imut = 0x080a;
+let is i64 as SIG_RSA_PSS_PSS_512   with imut = 0x080b;
+let is i64 as SIG_RSA_PKCS1_SHA256  with imut = 0x0401;
+let is i64 as SIG_RSA_PKCS1_SHA384  with imut = 0x0501;
+let is i64 as SIG_RSA_PKCS1_SHA512  with imut = 0x0601;
+
+let is i64 as TLS_1_3 with imut = 0x0304;
+let is i64 as TLS_1_2 with imut = 0x0303;
+
+let is i64 as EXT_ERR_SPACE with imut = 0 - 1519;
+
+// --- Small writers ------------------------------------------------------
+
+fn put8(b as *bytes.Bytes, v as i64) as i64 {
+    return bytes.bytes_push(b, cast(u8, v & 255));
+}
+
+fn put16(b as *bytes.Bytes, v as i64) as i64 {
+    if (bytes.bytes_push(b, cast(u8, (v >> 8) & 255)) < 0) { return EXT_ERR_SPACE; }
+    if (bytes.bytes_push(b, cast(u8, v & 255)) < 0) { return EXT_ERR_SPACE; }
+    return 0;
+}
+
+fn put24(b as *bytes.Bytes, v as i64) as i64 {
+    if (bytes.bytes_push(b, cast(u8, (v >> 16) & 255)) < 0) { return EXT_ERR_SPACE; }
+    return put16(b, v);
+}
+
+// Rewrite a two-byte length that was written as a placeholder, now that the
+// body after it is known. `at` is the offset of the high byte.
+fn patch16(b as *bytes.Bytes, at as i64) as void {
+    let is i64 as n = b.len - at - 2;
+    b.ptr[at] = cast(u8, (n >> 8) & 255);
+    b.ptr[at + 1] = cast(u8, n & 255);
+}
+
+fn slen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+// Open an extension: its type, then a length to be patched. Returns the
+// offset to hand to patch16, or <0.
+fn open_ext(b as *bytes.Bytes, kind as i64) as i64 {
+    if (put16(b, kind) < 0) { return EXT_ERR_SPACE; }
+    let is i64 as at = b.len;
+    if (put16(b, 0) < 0) { return EXT_ERR_SPACE; }
+    return at;
+}
+
+// --- The extensions -----------------------------------------------------
+
+// server_name: a list of one host_name entry (RFC 6066 §3).
+//
+// An IP literal must NOT be sent here — the RFC says the extension carries a
+// DNS name and nothing else — so the caller decides. transport/dial_host
+// knows which it had; this function does not.
+fn ext_server_name(b as *bytes.Bytes, host as *u8) as i64 {
+    let is i64 as n = slen(host);
+    if (n <= 0) { return 0; }
+    if (n > 65535) { return EXT_ERR_SPACE; }
+
+    let is i64 as at = open_ext(b, EXT_SERVER_NAME);
+    if (at < 0) { return at; }
+    let is i64 as lat = b.len;
+    if (put16(b, 0) < 0) { return EXT_ERR_SPACE; }   // ServerNameList length
+    if (put8(b, 0) < 0) { return EXT_ERR_SPACE; }    // name_type = host_name
+    if (put16(b, n) < 0) { return EXT_ERR_SPACE; }
+    if (bytes.bytes_append(b, host, n) < 0) { return EXT_ERR_SPACE; }
+    patch16(b, lat);
+    patch16(b, at);
+    return 0;
+}
+
+// supported_versions, client form: a ONE-byte list length, not two. It is the
+// only extension in the ClientHello shaped that way, and getting it wrong
+// makes a server read the version list as garbage and fall back to 1.2.
+fn ext_supported_versions_client(b as *bytes.Bytes) as i64 {
+    let is i64 as at = open_ext(b, EXT_SUPPORTED_VERS);
+    if (at < 0) { return at; }
+    if (put8(b, 2) < 0) { return EXT_ERR_SPACE; }
+    if (put16(b, TLS_1_3) < 0) { return EXT_ERR_SPACE; }
+    patch16(b, at);
+    return 0;
+}
+
+fn ext_supported_groups(b as *bytes.Bytes) as i64 {
+    let is i64 as at = open_ext(b, EXT_SUPPORTED_GROUPS);
+    if (at < 0) { return at; }
+    if (put16(b, 2) < 0) { return EXT_ERR_SPACE; }
+    if (put16(b, GROUP_X25519) < 0) { return EXT_ERR_SPACE; }
+    patch16(b, at);
+    return 0;
+}
+
+// key_share with one X25519 entry. `pub` is 32 bytes.
+fn ext_key_share_client(b as *bytes.Bytes, pub as *u8) as i64 {
+    let is i64 as at = open_ext(b, EXT_KEY_SHARE);
+    if (at < 0) { return at; }
+    let is i64 as lat = b.len;
+    if (put16(b, 0) < 0) { return EXT_ERR_SPACE; }
+    if (put16(b, GROUP_X25519) < 0) { return EXT_ERR_SPACE; }
+    if (put16(b, 32) < 0) { return EXT_ERR_SPACE; }
+    if (bytes.bytes_append(b, pub, 32) < 0) { return EXT_ERR_SPACE; }
+    patch16(b, lat);
+    patch16(b, at);
+    return 0;
+}
+
+// Exactly what tls/verify.cst knows how to check.
+//
+// The rsa_pss_pss_* schemes are here as well as rsa_pss_rsae_*: they differ
+// only in whether the certificate's key is id-RSASSA-PSS or plain rsaEncryption,
+// and tls/x509.cst reads both.
+fn ext_signature_algorithms(b as *bytes.Bytes) as i64 {
+    let is i64 as at = open_ext(b, EXT_SIG_ALGS);
+    if (at < 0) { return at; }
+    let is i64 as lat = b.len;
+    if (put16(b, 0) < 0) { return EXT_ERR_SPACE; }
+    if (put16(b, SIG_ECDSA_P256_SHA256) < 0) { return EXT_ERR_SPACE; }
+    if (put16(b, SIG_ECDSA_P384_SHA384) < 0) { return EXT_ERR_SPACE; }
+    if (put16(b, SIG_ED25519) < 0) { return EXT_ERR_SPACE; }
+    if (put16(b, SIG_RSA_PSS_RSAE_256) < 0) { return EXT_ERR_SPACE; }
+    if (put16(b, SIG_RSA_PSS_RSAE_384) < 0) { return EXT_ERR_SPACE; }
+    if (put16(b, SIG_RSA_PSS_RSAE_512) < 0) { return EXT_ERR_SPACE; }
+    if (put16(b, SIG_RSA_PSS_PSS_256) < 0) { return EXT_ERR_SPACE; }
+    if (put16(b, SIG_RSA_PSS_PSS_384) < 0) { return EXT_ERR_SPACE; }
+    if (put16(b, SIG_RSA_PSS_PSS_512) < 0) { return EXT_ERR_SPACE; }
+    if (put16(b, SIG_RSA_PKCS1_SHA256) < 0) { return EXT_ERR_SPACE; }
+    if (put16(b, SIG_RSA_PKCS1_SHA384) < 0) { return EXT_ERR_SPACE; }
+    if (put16(b, SIG_RSA_PKCS1_SHA512) < 0) { return EXT_ERR_SPACE; }
+    patch16(b, lat);
+    patch16(b, at);
+    return 0;
+}
+
+// application_layer_protocol_negotiation, announcing http/1.1 alone.
+fn ext_alpn_http11(b as *bytes.Bytes) as i64 {
+    let is i64 as at = open_ext(b, EXT_ALPN);
+    if (at < 0) { return at; }
+    let is i64 as lat = b.len;
+    if (put16(b, 0) < 0) { return EXT_ERR_SPACE; }
+    if (put8(b, 8) < 0) { return EXT_ERR_SPACE; }
+    if (bytes.bytes_append(b, "http/1.1", 8) < 0) { return EXT_ERR_SPACE; }
+    patch16(b, lat);
+    patch16(b, at);
+    return 0;
+}
+
+// --- Reading ------------------------------------------------------------
+
+// Find extension `want` inside an extension block that starts at `p` and runs
+// `n` bytes — the bytes AFTER the two-byte block length. Writes the body's
+// offset and length. Returns 1 found, 0 not found, <0 malformed.
+//
+// A truncated block is malformed rather than "not found": the difference
+// matters, because "not found" on a required extension and "the peer sent
+// something that does not parse" are different failures.
+fn ext_find(p as *u8, n as i64, want as i64,
+            off as *i64, len as *i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i + 4 <= n) {
+        let is i64 as kind = (cast(i64, p[i]) << 8) + cast(i64, p[i + 1]);
+        let is i64 as elen = (cast(i64, p[i + 2]) << 8) + cast(i64, p[i + 3]);
+        if (i + 4 + elen > n) { return 0 - 1; }
+        if (kind == want) {
+            *off = i + 4;
+            *len = elen;
+            return 1;
+        }
+        i = i + 4 + elen;
+    }
+    if (i != n) { return 0 - 1; }
+    return 0;
+}
+
+// Walk every extension. `cur` starts at 0 and is opaque. Returns 1 with kind
+// and body written, 0 at the end, <0 malformed.
+fn ext_next(p as *u8, n as i64, cur as *i64, kind as *i64,
+            off as *i64, len as *i64) as i64 {
+    let is i64 as i = *cur;
+    if (i == n) { return 0; }
+    if (i + 4 > n) { return 0 - 1; }
+    *kind = (cast(i64, p[i]) << 8) + cast(i64, p[i + 1]);
+    let is i64 as elen = (cast(i64, p[i + 2]) << 8) + cast(i64, p[i + 3]);
+    if (i + 4 + elen > n) { return 0 - 1; }
+    *off = i + 4;
+    *len = elen;
+    *cur = i + 4 + elen;
+    return 1;
+}
+
+// The version a ServerHello selected, from its supported_versions extension.
+// TLS 1.3 puts it there and leaves the legacy_version field reading 1.2, so
+// reading the legacy field is reading a constant.
+fn ext_server_version(p as *u8, n as i64) as i64 {
+    let is i64 as off with mut = 0;
+    let is i64 as len with mut = 0;
+    let is i64 as rc = ext_find(p, n, EXT_SUPPORTED_VERS, &off, &len);
+    if (rc < 0) { return rc; }
+    if (rc == 0) { return 0; }
+    if (len != 2) { return 0 - 1; }
+    return (cast(i64, p[off]) << 8) + cast(i64, p[off + 1]);
+}
+
+// The peer's key_share: its group, and where the key is. In a ServerHello the
+// extension holds ONE entry with no list wrapper, unlike the client's.
+fn ext_server_key_share(p as *u8, n as i64, group as *i64,
+                        off as *i64, len as *i64) as i64 {
+    let is i64 as eo with mut = 0;
+    let is i64 as el with mut = 0;
+    let is i64 as rc = ext_find(p, n, EXT_KEY_SHARE, &eo, &el);
+    if (rc <= 0) { return rc; }
+    if (el < 4) { return 0 - 1; }
+    *group = (cast(i64, p[eo]) << 8) + cast(i64, p[eo + 1]);
+    let is i64 as klen = (cast(i64, p[eo + 2]) << 8) + cast(i64, p[eo + 3]);
+    if (4 + klen > el) { return 0 - 1; }
+    *off = eo + 4;
+    *len = klen;
+    return 1;
+}
+
+// The protocol an ALPN extension selected, copied out NUL-terminated.
+fn ext_alpn_selected(p as *u8, n as i64, out as *u8, max as i64) as i64 {
+    let is i64 as eo with mut = 0;
+    let is i64 as el with mut = 0;
+    let is i64 as rc = ext_find(p, n, EXT_ALPN, &eo, &el);
+    if (rc <= 0) { return rc; }
+    if (el < 3) { return 0 - 1; }
+    let is i64 as listlen = (cast(i64, p[eo]) << 8) + cast(i64, p[eo + 1]);
+    if (listlen + 2 > el) { return 0 - 1; }
+    let is i64 as one = cast(i64, p[eo + 2]);
+    if (one + 3 > el) { return 0 - 1; }
+    if (one + 1 > max) { return EXT_ERR_SPACE; }
+    let is i64 as i with mut = 0;
+    while (i < one) { out[i] = p[eo + 3 + i]; i = i + 1; }
+    out[one] = cast(u8, 0);
+    return one;
+}

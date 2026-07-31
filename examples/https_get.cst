@@ -1,0 +1,138 @@
+// =======================================================
+// caustic-net/examples/https_get.cst
+// The same HTTP request as examples/http_get.cst, over TLS.
+//
+// This file exists to be COMPARED with that one. Everything from the buffered
+// reader upward — req_for_url, req_send, resp_read_head, body_init,
+// body_read_all — is identical, because a TLS Conn and a TCP Conn are the same
+// thing to everything above the transport. The difference is one expression:
+//
+//     tp.dial_host(host, 80)
+//     tls.tls_client(tp.dial_host(host, 443), host, &store)
+//
+// If anything else had to change, core/conn.cst's vtable would not have been
+// worth having, and the whole shape of this library would be wrong.
+//
+// It talks to the real internet, so tests/run.cst BUILDS it and does not run
+// it: a name server or a remote host is not allowed to decide whether this
+// repository's tests pass. The offline proof is tests/test_tls.cst, which
+// replays RFC 8448 byte for byte.
+//
+// Run by hand:
+//     caustic-mk build https_get && ./build/https_get [host] [path]
+// =======================================================
+
+use "std/io.cst" as io;
+use "std/env.cst" as env;
+use "std/time.cst" as time;
+use "../core/conn.cst"    as conn;
+use "../core/bufread.cst" as bufread;
+use "../core/bytes.cst"   as bytes;
+use "../transport/transport.cst" as tp;
+use "../proto/url.cst"    as url;
+use "../proto/http1.cst"  as http;
+use "../tls/trust.cst"    as trust;
+use "../tls/verify.cst"   as verify;
+use "../tls/client.cst"   as tls;
+use "../tls/handshake.cst" as hs;
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    tp.init();
+
+    let is *u8 as target with mut = "https://example.com/";
+    if (argc > 1) { target = env.argv(1); }
+
+    let is url.Url as u = url.url_parse(target);
+    if (u.ok != 0) {
+        io.printf("cannot parse %s: %s\n", target, url.url_err_name(u.ok));
+        return 1;
+    }
+    if (url.url_scheme_is(&u, "https") == 0) {
+        io.printf("not an https URL: %s\n", target);
+        return 2;
+    }
+
+    let is [256]u8 as host;
+    if (url.url_host(&u, cast(*u8, &host), 256) < 0) { return 3; }
+    let is i64 as port with mut = u.port;
+    if (port <= 0) { port = 443; }
+
+    // The trust store, once. Loading it per request would re-read and
+    // re-parse a few hundred kilobytes for every page on a site.
+    let is trust.TrustStore as store;
+    let is i64 as nanchor = trust.trust_init(&store);
+    if (nanchor <= 0) {
+        io.printf("no trust anchors: %s\n", trust.trust_err_name(nanchor));
+        return 4;
+    }
+    io.printf("%ld anchors from %s\n", nanchor, trust.trust_path(&store));
+
+    let is i64 as t0 with mut = time.now_ms();
+
+    // ---- the one line that differs from examples/http_get.cst ----------
+    let is *conn.Conn as c =
+        tls.tls_client(tp.dial_host(cast(*u8, &host), port), cast(*u8, &host), &store);
+    // --------------------------------------------------------------------
+
+    if (cast(i64, c) == 0) {
+        let is i64 as e = tls.tls_last_err();
+        io.printf("connect to %s:%ld failed: %s / %s\n",
+                  cast(*u8, &host), port, hs.tls_err_name(e), verify.verify_err_text(e));
+        trust.trust_free(&store);
+        return 5;
+    }
+    io.printf("handshake ok in %ld ms, alpn \"%s\"\n",
+              time.now_ms() - t0, tls.tls_alpn(c));
+
+    let is bytes.Bytes as req with mut = bytes.bytes_new(1024);
+    if (http.req_for_url(&req, "GET", &u, 0) < 0) { return 6; }
+    if (http.req_header(&req, "User-Agent", "caustic-net/0.1") < 0) { return 7; }
+    if (http.req_header(&req, "Accept", "*/*") < 0) { return 8; }
+    if (http.req_end(&req) < 0) { return 9; }
+    if (http.req_send(c, &req) != req.len) { io.printf("send failed\n"); return 10; }
+    bytes.bytes_free(&req);
+
+    let is [16384]u8 as store_buf;
+    let is bufread.BufReader as br;
+    bufread.br_init(&br, c, cast(*u8, &store_buf), 16384);
+
+    let is http.Response as r;
+    let is [8192]u8 as hdrbuf;
+    let is i64 as rc = http.resp_read_head(&br, &r, cast(*u8, &hdrbuf), 8192);
+    if (rc < 0) {
+        io.printf("response head: %s\n", http.http_err_name(rc));
+        return 11;
+    }
+
+    let is [256]u8 as ctype;
+    if (http.resp_header(&r, "content-type", cast(*u8, &ctype), 256) < 0) {
+        ctype[0] = cast(u8, 0);
+    }
+
+    let is http.BodyReader as bd;
+    http.body_init(&bd, &br, &r, 0);
+    let is bytes.Bytes as body with mut = bytes.bytes_new(16384);
+    let is i64 as got = http.body_read_all(&bd, &body, 4194304);
+    if (got < 0) {
+        io.printf("body: %s\n", http.http_err_name(got));
+        return 12;
+    }
+
+    io.printf("https_get ok: %ld %s, %ld bytes of %s in %ld ms\n",
+              r.status, cast(*u8, &host), got, cast(*u8, &ctype),
+              time.now_ms() - t0);
+
+    // The first line of the body, so it is visible that these are real bytes.
+    let is i64 as show with mut = 0;
+    while (show < got && show < 200 && body.ptr[show] != 10) { show = show + 1; }
+    io.printf("  ");
+    let is i64 as i with mut = 0;
+    while (i < show) { io.printf("%c", cast(i64, body.ptr[i])); i = i + 1; }
+    io.printf("\n");
+
+    bytes.bytes_free(&body);
+    conn.conn_free(c);
+    trust.trust_free(&store);
+    return 0;
+}

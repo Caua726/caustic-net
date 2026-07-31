@@ -1,0 +1,957 @@
+// =======================================================
+// caustic-net/tls/handshake.cst
+// The TLS 1.3 client handshake, as an explicit state machine.
+//
+// hs_step advances one state and returns WANT_READ or WANT_WRITE when it
+// needs the socket. That shape is not decoration: the language has no
+// closures, so a handshake written as a straight-line function would be a
+// handshake that can only ever block. Driven this way the same code serves a
+// blocking caller today (hs_run) and a reactor later, with no rewrite. It is
+// what the two sentinels in core/errno.cst were reserved for.
+//
+// TLS 1.3 only. 1.2 is a second handshake in its entirety — RSA key
+// transport, CBC MAC-then-encrypt and the attacks that come with it — for
+// coverage that stopped mattering.
+//
+// WHAT THIS DOES WITH THE CERTIFICATE, precisely, because the two halves are
+// different things and folding them together is how TLS implementations go
+// wrong:
+//
+//   * CertificateVerify is ALWAYS checked. It is a signature by the leaf's
+//     key over the transcript, and it is what proves the peer holds the key
+//     in the certificate it sent. There is no way to turn it off.
+//   * Chain verification — is this leaf trusted, and is it for this host — is
+//     POLICY, and the caller supplies it as a TrustStore. Passing null means
+//     the caller vouches for the peer some other way. tls/client.cst never
+//     passes null; the RFC 8448 replay does, because that trace's certificate
+//     is self-signed, has no SubjectAltName and expired in 2026, and testing
+//     the key schedule is not a reason to weaken what a browser does.
+//
+// The failure mode this module was designed around is a Finished MAC that
+// does not match, which tells you one of thirty byte-exact details is wrong
+// and not which. hs_set_private and hs_set_hello exist for that: with the
+// RFC's ephemeral key and its ClientHello, every transcript hash and every
+// derived secret on the path is a published number, and tests/test_tls.cst
+// asserts each in order. The first divergence names the step.
+// =======================================================
+
+use "std/time.cst" as time;
+use "caustic-crypto/pk/x25519.cst" as x25519;
+use "caustic-crypto/mac/hmac.cst" as hmac;
+use "caustic-crypto/pk/rsa.cst" as rsa;
+use "caustic-crypto/pk/p256.cst" as p256;
+use "caustic-crypto/pk/p384.cst" as p384;
+use "caustic-crypto/pk/ed25519.cst" as ed;
+use "caustic-crypto/hash/sha2.cst" as sha2;
+use "caustic-crypto/bigint/bigint.cst" as bi;
+use "caustic-crypto/asn1/der.cst" as der;
+use "std/mem.cst" as mem;
+use "../core/errno.cst" as errno;
+use "../core/entropy.cst" as entropy;
+use "../core/bytes.cst" as bytes;
+use "./record.cst" as record;
+use "./transcript.cst" as transcript;
+use "./keysched.cst" as keysched;
+use "./extensions.cst" as ext;
+use "./x509.cst" as x509;
+use "./trust.cst" as trust;
+use "./verify.cst" as verify;
+use "./pss.cst" as pss;
+
+// --- Errors (the -1520 block) ------------------------------------------
+let is i64 as TLS_ERR_PROTOCOL with imut = 0 - 1520;   // out of order or malformed
+let is i64 as TLS_ERR_ALERT    with imut = 0 - 1521;   // the peer aborted
+let is i64 as TLS_ERR_HRR      with imut = 0 - 1522;   // HelloRetryRequest
+let is i64 as TLS_ERR_VERSION  with imut = 0 - 1523;   // not TLS 1.3
+let is i64 as TLS_ERR_SUITE    with imut = 0 - 1524;   // no suite in common
+let is i64 as TLS_ERR_CERT     with imut = 0 - 1525;   // chain refused; see hs.verr
+let is i64 as TLS_ERR_FINISHED with imut = 0 - 1526;   // Finished MAC mismatch
+let is i64 as TLS_ERR_KEYSHARE with imut = 0 - 1527;   // wrong group, or zero secret
+let is i64 as TLS_ERR_MSGSIZE  with imut = 0 - 1528;   // handshake message too large
+let is i64 as TLS_ERR_SIGALG   with imut = 0 - 1529;   // CertificateVerify algorithm
+let is i64 as TLS_ERR_BADSIG   with imut = 0 - 1530;   // CertificateVerify failed
+let is i64 as TLS_ERR_ENTROPY  with imut = 0 - 1531;   // no random for the key
+let is i64 as TLS_ERR_SPACE    with imut = 0 - 1532;
+
+// --- Handshake message types -------------------------------------------
+let is i64 as HS_CLIENT_HELLO   with imut = 1;
+let is i64 as HS_SERVER_HELLO   with imut = 2;
+let is i64 as HS_NEW_TICKET     with imut = 4;
+let is i64 as HS_ENCRYPTED_EXT  with imut = 8;
+let is i64 as HS_CERTIFICATE    with imut = 11;
+let is i64 as HS_CERT_VERIFY    with imut = 15;
+let is i64 as HS_FINISHED       with imut = 20;
+let is i64 as HS_KEY_UPDATE     with imut = 24;
+let is i64 as HS_CERT_REQUEST   with imut = 13;
+
+// --- States -------------------------------------------------------------
+let is i64 as ST_START     with imut = 0;
+let is i64 as ST_WAIT_SH   with imut = 1;
+let is i64 as ST_WAIT_EE   with imut = 2;
+let is i64 as ST_WAIT_CERT with imut = 3;
+let is i64 as ST_WAIT_CV   with imut = 4;
+let is i64 as ST_WAIT_FIN  with imut = 5;
+let is i64 as ST_SEND_FIN  with imut = 6;
+let is i64 as ST_DONE      with imut = 7;
+
+// Buffers below use literal dimensions; see the note in proto/dns.cst.
+// tests/test_tls.cst pins each literal to its constant.
+let is i64 as MAX_HS_MSG  with imut = 65536;   // one reassembled handshake message
+let is i64 as MAX_CERTS   with imut = 8;       // certificates in a peer's chain
+let is i64 as MAX_HOST    with imut = 256;
+
+// The 64 spaces, the context string and the separator that a TLS 1.3
+// CertificateVerify signs, before the transcript hash (RFC 8446 §4.4.3).
+let is *u8 as CV_PREFIX with imut =
+    "\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20TLS 1.3, server CertificateVerify\x00";
+let is i64 as CV_PREFIX_N with imut = 98;   // 64 + 33 + 1
+
+struct Handshake {
+    rl as *record.RecordLayer;
+    tr as transcript.Transcript;
+    ks as keysched.Secrets;
+
+    st  as i64;
+    err as i64;
+
+    host as [256]u8;
+    t    as *trust.TrustStore;      // null = the caller vouches for the peer
+    now  as i64;
+
+    priv as [32]u8;   pub as [32]u8;   shared as [32]u8;
+    have_priv as i64;               // 1 when a test forced the key
+
+    suite as i64;   alg_kind as i64;   hlen as i64;
+
+    // Transcript-Hash("") for this suite's hash, and the transcript through
+    // the SERVER's Finished. The second is captured when it is current and
+    // used one state later: the application secrets derive from it, but they
+    // cannot be derived until the CLIENT's Finished has also been hashed,
+    // because the resumption secret in the same call needs that one.
+    empty_hash as [48]u8;
+    th_ap as [48]u8;
+
+    // The last handshake message read, reassembled across records. mmap'd, so
+    // it is not part of the Conn context's budget and is released the moment
+    // the handshake ends.
+    msg    as *u8;   msgcap as i64;   msglen as i64;
+    // A COPY of the Certificate message. Every Cert parsed out of it holds
+    // offsets into the buffer it was parsed from, and `msg` is reused by the
+    // very next message — CertificateVerify — so a leaf left pointing there
+    // has its public key read out of the signature that is being checked
+    // against it. That failure looks exactly like a bad signature.
+    certbuf as *u8;  certbuflen as i64;
+    // Bytes of the current record's plaintext not yet consumed.
+    pend   as *u8;   pendlen as i64;  pendoff as i64;
+
+    hello  as *u8;   hellolen as i64;    // a forced ClientHello, for the trace
+
+    // The ClientHello as it went out. Kept because the transcript is started
+    // as SHA-256 — the hash is a property of the cipher suite and the suite
+    // is not known until the ServerHello — so a server that picks a SHA-384
+    // suite means rehashing the two Hellos under the other hash. Both are
+    // still to hand at that moment and nothing else is in the transcript yet.
+    hello_sent as [1024]u8;   hello_sent_len as i64;
+
+    certs  as *x509.Cert;   ncert as i64;
+    verr   as i64;                       // the exact answer from verify_chain
+    alpn   as [16]u8;
+}
+
+fn _slen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+fn _map_ok(p as *u8) as i64 {
+    let is i64 as v = cast(i64, p);
+    if (v == 0) { return 0; }
+    if (v == 0 - 1) { return 0; }
+    return 1;
+}
+
+fn _u16(p as *u8, i as i64) as i64 {
+    return (cast(i64, p[i]) << 8) + cast(i64, p[i + 1]);
+}
+
+fn _u24(p as *u8, i as i64) as i64 {
+    return (cast(i64, p[i]) << 16) + (cast(i64, p[i + 1]) << 8) + cast(i64, p[i + 2]);
+}
+
+// --- Setup --------------------------------------------------------------
+
+fn hs_init(h as *Handshake, rl as *record.RecordLayer, host as *u8,
+           t as *trust.TrustStore) as i64 {
+    h.rl = rl;
+    h.st = ST_START;
+    h.err = 0;
+    h.t = t;
+    h.now = time.unix_time();
+    h.have_priv = 0;
+    h.suite = 0;
+    h.alg_kind = 0;
+    h.hlen = 32;
+    h.msglen = 0;
+    h.pend = cast(*u8, 0);
+    h.pendlen = 0;
+    h.pendoff = 0;
+    h.hello = cast(*u8, 0);
+    h.hellolen = 0;
+    h.ncert = 0;
+    h.verr = 0;
+    h.alpn[0] = cast(u8, 0);
+
+    let is i64 as i with mut = 0;
+    while (i < 255 && host[i] != 0) { h.host[i] = host[i]; i = i + 1; }
+    h.host[i] = cast(u8, 0);
+
+    h.msg = mem.core.mmap_anon(65536);
+    if (_map_ok(h.msg) == 0) { h.msg = cast(*u8, 0); return TLS_ERR_SPACE; }
+    h.msgcap = MAX_HS_MSG;
+
+    h.certbuf = mem.core.mmap_anon(65536);
+    if (_map_ok(h.certbuf) == 0) {
+        mem.core.munmap(h.msg, h.msgcap);
+        h.msg = cast(*u8, 0);
+        h.certbuf = cast(*u8, 0);
+        return TLS_ERR_SPACE;
+    }
+    h.certbuflen = 0;
+
+    h.certs = cast(*x509.Cert, mem.core.mmap_anon(8 * sizeof(x509.Cert)));
+    if (_map_ok(cast(*u8, h.certs)) == 0) {
+        mem.core.munmap(h.msg, h.msgcap);
+        mem.core.munmap(h.certbuf, 65536);
+        h.msg = cast(*u8, 0);
+        h.certbuf = cast(*u8, 0);
+        h.certs = cast(*x509.Cert, 0);
+        return TLS_ERR_SPACE;
+    }
+    return 0;
+}
+
+fn hs_free(h as *Handshake) as void {
+    if (cast(i64, h.msg) != 0) { mem.core.munmap(h.msg, h.msgcap); }
+    if (cast(i64, h.certbuf) != 0) { mem.core.munmap(h.certbuf, 65536); }
+    if (cast(i64, h.certs) != 0) {
+        mem.core.munmap(cast(*u8, h.certs), 8 * sizeof(x509.Cert));
+    }
+    h.msg = cast(*u8, 0);
+    h.certbuf = cast(*u8, 0);
+    h.certs = cast(*x509.Cert, 0);
+    h.msgcap = 0;
+}
+
+// Force the ephemeral private key. For RFC 8448 only: the trace publishes the
+// client's key, and without it not one of its intermediate values can be
+// compared. Never called by tls/client.cst.
+fn hs_set_private(h as *Handshake, priv as *u8) as void {
+    let is i64 as i with mut = 0;
+    while (i < 32) { h.priv[i] = priv[i]; i = i + 1; }
+    h.have_priv = 1;
+    x25519.x25519_base(cast(*u8, &h.priv), cast(*u8, &h.pub));
+}
+
+// Send this exact ClientHello instead of building one. Also RFC 8448 only:
+// the transcript covers the ClientHello byte for byte, so the trace's
+// published hashes can only be reproduced by sending the trace's message.
+fn hs_set_hello(h as *Handshake, p as *u8, n as i64) as void {
+    h.hello = p;
+    h.hellolen = n;
+}
+
+fn hs_set_now(h as *Handshake, now as i64) as void { h.now = now; }
+
+fn hs_state(h as *Handshake) as i64 { return h.st; }
+fn hs_msg(h as *Handshake) as *u8 { return h.msg; }
+fn hs_msglen(h as *Handshake) as i64 { return h.msglen; }
+fn hs_alpn(h as *Handshake) as *u8 { return cast(*u8, &h.alpn); }
+fn hs_verr(h as *Handshake) as i64 { return h.verr; }
+
+// --- Reading a handshake message ---------------------------------------
+
+// Fill `pend` from the record layer if it is empty. Returns 0 when there are
+// bytes to consume, or a sentinel.
+fn _need_plain(h as *Handshake) as i64 {
+    if (h.pendoff < h.pendlen) { return 0; }
+    while (1 == 1) {
+        let is i64 as ctype with mut = 0;
+        let is i64 as n = record.rl_read_record(h.rl, &ctype);
+        if (n < 0) { return n; }
+        // A ChangeCipherSpec is a compatibility artifact with no meaning in
+        // TLS 1.3; rl_read_record already declines to decrypt it and hands
+        // back zero bytes.
+        if (ctype == record.CT_CHANGE_CIPHER_SPEC) { continue; }
+        if (ctype == record.CT_ALERT) { return TLS_ERR_ALERT; }
+        if (ctype != record.CT_HANDSHAKE) { return TLS_ERR_PROTOCOL; }
+        if (n == 0) { continue; }
+        h.pend = h.rl.plain;
+        h.pendlen = n;
+        h.pendoff = 0;
+        return 0;
+    }
+    return TLS_ERR_PROTOCOL;
+}
+
+// Read exactly `n` bytes of handshake stream into `out`, crossing records.
+fn _read_hs(h as *Handshake, out as *u8, n as i64) as i64 {
+    let is i64 as got with mut = 0;
+    while (got < n) {
+        let is i64 as rc = _need_plain(h);
+        if (rc < 0) { return rc; }
+        let is i64 as avail = h.pendlen - h.pendoff;
+        let is i64 as take with mut = n - got;
+        if (take > avail) { take = avail; }
+        let is i64 as i with mut = 0;
+        while (i < take) { out[got + i] = h.pend[h.pendoff + i]; i = i + 1; }
+        got = got + take;
+        h.pendoff = h.pendoff + take;
+    }
+    return n;
+}
+
+// One whole handshake message into h.msg, header included, and hashed into
+// the transcript. The header is part of what the transcript covers.
+//
+// A message can span records and a record can hold several messages, which is
+// why this reassembles rather than reading a record at a time.
+fn _next_message(h as *Handshake, mtype as *i64) as i64 {
+    let is [4]u8 as hdr;
+    let is i64 as rc with mut = _read_hs(h, cast(*u8, &hdr), 4);
+    if (rc < 0) { return rc; }
+
+    let is i64 as body = _u24(cast(*u8, &hdr), 1);
+    if (body < 0) { return TLS_ERR_PROTOCOL; }
+    if (4 + body > h.msgcap) { return TLS_ERR_MSGSIZE; }
+
+    h.msg[0] = hdr[0];  h.msg[1] = hdr[1];  h.msg[2] = hdr[2];  h.msg[3] = hdr[3];
+    if (body > 0) {
+        rc = _read_hs(h, cast(*u8, cast(i64, h.msg) + 4), body);
+        if (rc < 0) { return rc; }
+    }
+    h.msglen = 4 + body;
+    *mtype = cast(i64, hdr[0]);
+    transcript.tr_update(&h.tr, h.msg, h.msglen);
+    return h.msglen;
+}
+
+// --- ClientHello --------------------------------------------------------
+
+// Build a ClientHello into `b`, handshake header included.
+fn _build_hello(h as *Handshake, b as *bytes.Bytes) as i64 {
+    bytes.bytes_reset(b);
+    if (ext.put8(b, HS_CLIENT_HELLO) < 0) { return TLS_ERR_SPACE; }
+    let is i64 as lenat = b.len;
+    if (ext.put24(b, 0) < 0) { return TLS_ERR_SPACE; }
+
+    // legacy_version stays 0x0303 whatever the real version is; middleboxes
+    // reject anything else and TLS 1.3 says so in supported_versions instead.
+    if (ext.put16(b, ext.TLS_1_2) < 0) { return TLS_ERR_SPACE; }
+
+    let is [32]u8 as rnd;
+    if (entropy.entropy_fill(cast(*u8, &rnd), 32) != 32) { return TLS_ERR_ENTROPY; }
+    if (bytes.bytes_append(b, cast(*u8, &rnd), 32) < 0) { return TLS_ERR_SPACE; }
+
+    // legacy_session_id: 32 random bytes rather than empty. It is echoed by
+    // the server and a middlebox that sees an empty one is more likely to
+    // decide this is not a TLS handshake it understands.
+    if (ext.put8(b, 32) < 0) { return TLS_ERR_SPACE; }
+    if (entropy.entropy_fill(cast(*u8, &rnd), 32) != 32) { return TLS_ERR_ENTROPY; }
+    if (bytes.bytes_append(b, cast(*u8, &rnd), 32) < 0) { return TLS_ERR_SPACE; }
+
+    // cipher_suites: the three TLS 1.3 suites the record layer implements.
+    if (ext.put16(b, 6) < 0) { return TLS_ERR_SPACE; }
+    if (ext.put16(b, record.SUITE_AES_128_GCM_SHA256) < 0) { return TLS_ERR_SPACE; }
+    if (ext.put16(b, record.SUITE_AES_256_GCM_SHA384) < 0) { return TLS_ERR_SPACE; }
+    if (ext.put16(b, record.SUITE_CHACHA20_POLY1305) < 0) { return TLS_ERR_SPACE; }
+
+    // legacy_compression_methods: one entry, null.
+    if (ext.put8(b, 1) < 0) { return TLS_ERR_SPACE; }
+    if (ext.put8(b, 0) < 0) { return TLS_ERR_SPACE; }
+
+    let is i64 as extat = b.len;
+    if (ext.put16(b, 0) < 0) { return TLS_ERR_SPACE; }
+    if (ext.ext_server_name(b, cast(*u8, &h.host)) < 0) { return TLS_ERR_SPACE; }
+    if (ext.ext_supported_versions_client(b) < 0) { return TLS_ERR_SPACE; }
+    if (ext.ext_supported_groups(b) < 0) { return TLS_ERR_SPACE; }
+    if (ext.ext_signature_algorithms(b) < 0) { return TLS_ERR_SPACE; }
+    if (ext.ext_key_share_client(b, cast(*u8, &h.pub)) < 0) { return TLS_ERR_SPACE; }
+    if (ext.ext_alpn_http11(b) < 0) { return TLS_ERR_SPACE; }
+    ext.patch16(b, extat);
+
+    let is i64 as body = b.len - lenat - 3;
+    b.ptr[lenat] = cast(u8, (body >> 16) & 255);
+    b.ptr[lenat + 1] = cast(u8, (body >> 8) & 255);
+    b.ptr[lenat + 2] = cast(u8, body & 255);
+    return 0;
+}
+
+// --- ServerHello --------------------------------------------------------
+
+// HelloRetryRequest is a ServerHello whose random is this exact value
+// (RFC 8446 §4.1.3). It is not a separate message type, and a client that
+// does not know that reads it as a ServerHello and fails somewhere later.
+let is *u8 as HRR_RANDOM with imut =
+    "\xcf\x21\xad\x74\xe5\x9a\x61\x11\xbe\x1d\x8c\x02\x1e\x65\xb8\x91\xc2\xa2\x11\x16\x7a\xbb\x8c\x5e\x07\x9e\x09\xe2\xc8\xa8\x33\x9c";
+
+fn _parse_server_hello(h as *Handshake) as i64 {
+    let is *u8 as p = h.msg;
+    let is i64 as n = h.msglen;
+    if (n < 4 + 2 + 32 + 1) { return TLS_ERR_PROTOCOL; }
+
+    let is i64 as i with mut = 4;
+    i = i + 2;                                  // legacy_version, ignored
+
+    let is i64 as k with mut = 0;
+    let is i64 as hrr with mut = 1;
+    while (k < 32) {
+        if (p[i + k] != HRR_RANDOM[k]) { hrr = 0; break; }
+        k = k + 1;
+    }
+    if (hrr == 1) { return TLS_ERR_HRR; }
+    i = i + 32;
+
+    let is i64 as sidlen = cast(i64, p[i]);
+    i = i + 1 + sidlen;
+    if (i + 3 > n) { return TLS_ERR_PROTOCOL; }
+
+    h.suite = _u16(p, i);
+    i = i + 2;
+    i = i + 1;                                  // legacy_compression_method
+
+    if (i + 2 > n) { return TLS_ERR_PROTOCOL; }
+    let is i64 as elen = _u16(p, i);
+    i = i + 2;
+    if (i + elen > n) { return TLS_ERR_PROTOCOL; }
+    let is *u8 as exts = cast(*u8, cast(i64, p) + i);
+
+    if (ext.ext_server_version(exts, elen) != ext.TLS_1_3) { return TLS_ERR_VERSION; }
+
+    if (h.suite == record.SUITE_AES_256_GCM_SHA384) {
+        h.alg_kind = transcript.TR_SHA384;
+        h.hlen = 48;
+    } else {
+        if (h.suite != record.SUITE_AES_128_GCM_SHA256) {
+            if (h.suite != record.SUITE_CHACHA20_POLY1305) { return TLS_ERR_SUITE; }
+        }
+        h.alg_kind = transcript.TR_SHA256;
+        h.hlen = 32;
+    }
+
+    // The transcript was started as SHA-256 before the suite was known —
+    // ClientHello is hashed before the server picks one. If the server chose
+    // a SHA-384 suite the transcript has to be rebuilt, which is possible
+    // because the only messages in it so far are the two Hellos and both are
+    // still to hand.
+    if (h.alg_kind == transcript.TR_SHA384) {
+        // Only possible if the ClientHello was small enough to keep. One
+        // larger than the buffer cannot be rehashed, so the SHA-384 suite is
+        // declined rather than continued with a transcript under the wrong
+        // hash — a mismatch there would surface as a Finished failure with no
+        // trace back to here.
+        if (h.hello_sent_len <= 0) { return TLS_ERR_SUITE; }
+        transcript.tr_init(&h.tr, transcript.TR_SHA384);
+        transcript.tr_update(&h.tr, cast(*u8, &h.hello_sent), h.hello_sent_len);
+        transcript.tr_update(&h.tr, h.msg, h.msglen);
+    }
+
+    let is i64 as grp with mut = 0;
+    let is i64 as ko with mut = 0;
+    let is i64 as kl with mut = 0;
+    if (ext.ext_server_key_share(exts, elen, &grp, &ko, &kl) != 1) {
+        return TLS_ERR_KEYSHARE;
+    }
+    if (grp != ext.GROUP_X25519) { return TLS_ERR_KEYSHARE; }
+    if (kl != 32) { return TLS_ERR_KEYSHARE; }
+
+    x25519.x25519(cast(*u8, &h.priv), cast(*u8, cast(i64, exts) + ko),
+                  cast(*u8, &h.shared));
+
+    // RFC 7748 §6.1: an all-zero shared secret means the peer sent a
+    // low-order point and the "shared" secret is a constant. caustic-crypto
+    // does not check, so it is checked here.
+    let is i64 as z with mut = 0;
+    k = 0;
+    while (k < 32) { z = z | cast(i64, h.shared[k]); k = k + 1; }
+    if (z == 0) { return TLS_ERR_KEYSHARE; }
+
+    return 0;
+}
+
+// --- The server's flight -------------------------------------------------
+
+fn _key_len(suite as i64) as i64 {
+    if (suite == record.SUITE_AES_128_GCM_SHA256) { return 16; }
+    return 32;
+}
+
+fn _install_handshake_keys(h as *Handshake) as i64 {
+    let is [48]u8 as th;
+    transcript.tr_digest(&h.tr, cast(*u8, &th));
+    transcript.tr_empty_hash(h.alg_kind, cast(*u8, &h.empty_hash));
+
+    keysched.ks_early(&h.ks, h.alg_kind, cast(*u8, 0), 0);
+    keysched.ks_handshake(&h.ks, cast(*u8, &h.shared), 32,
+                          cast(*u8, &h.empty_hash), cast(*u8, &th));
+
+    let is [32]u8 as key;
+    let is [12]u8 as iv;
+    let is i64 as klen = _key_len(h.suite);
+
+    if (keysched.ks_traffic_keys(&h.ks, cast(*u8, &h.ks.s_hs), cast(*u8, &key),
+                                 klen, cast(*u8, &iv), 12) < 0) { return TLS_ERR_SPACE; }
+    if (record.rl_set_read_key(h.rl, h.suite, cast(*u8, &key), cast(*u8, &iv)) < 0) {
+        return TLS_ERR_SUITE;
+    }
+    if (keysched.ks_traffic_keys(&h.ks, cast(*u8, &h.ks.c_hs), cast(*u8, &key),
+                                 klen, cast(*u8, &iv), 12) < 0) { return TLS_ERR_SPACE; }
+    if (record.rl_set_write_key(h.rl, h.suite, cast(*u8, &key), cast(*u8, &iv)) < 0) {
+        return TLS_ERR_SUITE;
+    }
+    return 0;
+}
+
+fn _parse_encrypted_extensions(h as *Handshake) as i64 {
+    if (h.msglen < 6) { return TLS_ERR_PROTOCOL; }
+    let is i64 as elen = _u16(h.msg, 4);
+    if (6 + elen > h.msglen) { return TLS_ERR_PROTOCOL; }
+    let is *u8 as exts = cast(*u8, cast(i64, h.msg) + 6);
+    // ALPN is advisory here: a server that ignores it and sends nothing back
+    // has chosen http/1.1 by omission, which is what the caller assumes.
+    ext.ext_alpn_selected(exts, elen, cast(*u8, &h.alpn), 16);
+    return 0;
+}
+
+// Certificate ::= opaque context<0..255>; CertificateEntry list<0..2^24-1>
+// where each entry is cert_data<1..2^24-1> followed by its own extensions.
+fn _parse_certificate(h as *Handshake) as i64 {
+    if (h.msglen < 8) { return TLS_ERR_PROTOCOL; }
+
+    // Copy first. Everything below points into this buffer for as long as the
+    // handshake lasts; `msg` belongs to the next message.
+    if (h.msglen > 65536) { return TLS_ERR_MSGSIZE; }
+    let is i64 as ci with mut = 0;
+    while (ci < h.msglen) { h.certbuf[ci] = h.msg[ci]; ci = ci + 1; }
+    h.certbuflen = h.msglen;
+    let is *u8 as cb = h.certbuf;
+
+    let is i64 as ctxlen = cast(i64, cb[4]);
+    let is i64 as i with mut = 5 + ctxlen;
+    if (i + 3 > h.certbuflen) { return TLS_ERR_PROTOCOL; }
+    let is i64 as listlen = _u24(cb, i);
+    i = i + 3;
+    if (i + listlen > h.certbuflen) { return TLS_ERR_PROTOCOL; }
+    let is i64 as end = i + listlen;
+
+    h.ncert = 0;
+    while (i + 3 <= end) {
+        let is i64 as clen = _u24(cb, i);
+        i = i + 3;
+        if (i + clen > end) { return TLS_ERR_PROTOCOL; }
+        if (h.ncert < MAX_CERTS) {
+            let is i64 as rc = x509.cert_parse(
+                cast(*u8, cast(i64, cb) + i), clen,
+                cast(*x509.Cert, cast(i64, h.certs) + h.ncert * sizeof(x509.Cert)));
+            // A certificate this parser refuses ends the handshake when it is
+            // the leaf, and is skipped when it is not: an intermediate we
+            // cannot read may still be one the trust store makes unnecessary.
+            if (rc < 0) {
+                if (h.ncert == 0) { h.verr = rc; return TLS_ERR_CERT; }
+            } else {
+                h.ncert = h.ncert + 1;
+            }
+        }
+        i = i + clen;
+        if (i + 2 > end) { return TLS_ERR_PROTOCOL; }
+        let is i64 as xl = _u16(cb, i);
+        i = i + 2 + xl;
+    }
+    if (i != end) { return TLS_ERR_PROTOCOL; }
+    if (h.ncert == 0) { return TLS_ERR_PROTOCOL; }
+    return 0;
+}
+
+// The transcript CertificateVerify covers ends at Certificate, so the digest
+// has to be taken BEFORE this message joins the transcript. _next_message
+// already added it, so the hash is recomputed from a transcript that excludes
+// it — which is why the caller hands the digest in rather than this reading it.
+fn _check_cert_verify(h as *Handshake, signed as *u8, signed_len as i64,
+                      digest as *u8, dlen as i64) as i64 {
+    if (h.msglen < 8) { return TLS_ERR_PROTOCOL; }
+    let is i64 as scheme = _u16(h.msg, 4);
+    let is i64 as siglen = _u16(h.msg, 6);
+    if (8 + siglen != h.msglen) { return TLS_ERR_PROTOCOL; }
+    let is *u8 as sig = cast(*u8, cast(i64, h.msg) + 8);
+
+    let is *x509.Cert as leaf = h.certs;
+    let is i64 as ok with mut = 0;
+
+    if (scheme == ext.SIG_ED25519) {
+        if (leaf.pk_alg != x509.PK_ED25519) { return TLS_ERR_SIGALG; }
+        if (leaf.key_len != 32) { return TLS_ERR_SIGALG; }
+        if (siglen != 64) { return TLS_ERR_BADSIG; }
+        // Ed25519 signs the message itself; every other scheme signs a digest
+        // of it. Either way the blob was built before this message joined the
+        // transcript, because the transcript CertificateVerify covers ends at
+        // Certificate.
+        ok = ed.ed25519_verify(cast(*u8, cast(i64, leaf.buf) + leaf.key_off),
+                               signed, signed_len, sig);
+        if (ok == 1) { return 0; }
+        return TLS_ERR_BADSIG;
+    }
+
+    if (scheme == ext.SIG_ECDSA_P256_SHA256 || scheme == ext.SIG_ECDSA_P384_SHA384) {
+        if (leaf.pk_alg != x509.PK_EC) { return TLS_ERR_SIGALG; }
+        let is i64 as flen with mut = 0;
+        if (leaf.curve == x509.CURVE_P256) { flen = 32; }
+        if (leaf.curve == x509.CURVE_P384) { flen = 48; }
+        if (flen == 0) { return TLS_ERR_SIGALG; }
+        if (leaf.key_len != 1 + 2 * flen) { return TLS_ERR_SIGALG; }
+        if (leaf.buf[leaf.key_off] != cast(u8, 4)) { return TLS_ERR_SIGALG; }
+
+        let is i64 as bend = 8 + siglen;
+        let is i64 as body with mut = 0;
+        let is i64 as blen with mut = 0;
+        if (der.der_enter(h.msg, bend, 8, x509.TAG_SEQUENCE, &body, &blen) < 0) {
+            return TLS_ERR_BADSIG;
+        }
+        let is i64 as tag with mut = 0;
+        let is i64 as co with mut = 0;
+        let is i64 as cl with mut = 0;
+        let is i64 as nxt = der.der_read(h.msg, body + blen, body, &tag, &co, &cl);
+        if (nxt < 0) { return TLS_ERR_BADSIG; }
+        if (tag != 0x02) { return TLS_ERR_BADSIG; }
+        let is i64 as ro with mut = 0;
+        let is i64 as rlen with mut = 0;
+        der.der_uint(h.msg, co, cl, &ro, &rlen);
+        if (der.der_read(h.msg, body + blen, nxt, &tag, &co, &cl) < 0) {
+            return TLS_ERR_BADSIG;
+        }
+        if (tag != 0x02) { return TLS_ERR_BADSIG; }
+        let is i64 as so with mut = 0;
+        let is i64 as slen2 with mut = 0;
+        der.der_uint(h.msg, co, cl, &so, &slen2);
+        if (rlen <= 0) { return TLS_ERR_BADSIG; }
+        if (slen2 <= 0) { return TLS_ERR_BADSIG; }
+
+        let is bi.Big as r = bi.big_from_bytes_be(cast(*u8, cast(i64, h.msg) + ro), rlen);
+        let is bi.Big as s = bi.big_from_bytes_be(cast(*u8, cast(i64, h.msg) + so), slen2);
+        let is bi.Big as qx = bi.big_from_bytes_be(
+            cast(*u8, cast(i64, leaf.buf) + leaf.key_off + 1), flen);
+        let is bi.Big as qy = bi.big_from_bytes_be(
+            cast(*u8, cast(i64, leaf.buf) + leaf.key_off + 1 + flen), flen);
+        let is i64 as take with mut = dlen;
+        if (take > flen) { take = flen; }
+        let is bi.Big as z = bi.big_from_bytes_be(digest, take);
+
+        if (leaf.curve == x509.CURVE_P256) {
+            ok = p256.p256_ecdsa_verify(&qx, &qy, &z, &r, &s);
+        } else {
+            ok = p384.p384_ecdsa_verify(&qx, &qy, &z, &r, &s);
+        }
+        bi.big_free(&r);  bi.big_free(&s);
+        bi.big_free(&qx); bi.big_free(&qy); bi.big_free(&z);
+        if (ok == 1) { return 0; }
+        return TLS_ERR_BADSIG;
+    }
+
+    // Everything left is RSA. TLS 1.3 forbids PKCS#1 v1.5 in
+    // CertificateVerify (RFC 8446 §4.4.3) even though the codepoints exist,
+    // so only the PSS schemes are accepted here.
+    let is i64 as hash with mut = 0;
+    if (scheme == ext.SIG_RSA_PSS_RSAE_256) { hash = 256; }
+    if (scheme == ext.SIG_RSA_PSS_PSS_256)  { hash = 256; }
+    if (scheme == ext.SIG_RSA_PSS_RSAE_384) { hash = 384; }
+    if (scheme == ext.SIG_RSA_PSS_PSS_384)  { hash = 384; }
+    if (scheme == ext.SIG_RSA_PSS_RSAE_512) { hash = 512; }
+    if (scheme == ext.SIG_RSA_PSS_PSS_512)  { hash = 512; }
+    if (hash == 0) { return TLS_ERR_SIGALG; }
+    if (leaf.pk_alg != x509.PK_RSA) { return TLS_ERR_SIGALG; }
+    if (leaf.rsa_n_off < 0) { return TLS_ERR_SIGALG; }
+
+    let is i64 as want with mut = 32;
+    if (hash == 384) { want = 48; }
+    if (hash == 512) { want = 64; }
+    if (dlen != want) { return TLS_ERR_SIGALG; }
+
+    let is rsa.RsaPub as pub;
+    rsa.rsa_pub_from_bytes(&pub,
+                           cast(*u8, cast(i64, leaf.buf) + leaf.rsa_n_off),
+                           leaf.rsa_n_len,
+                           cast(*u8, cast(i64, leaf.buf) + leaf.rsa_e_off),
+                           leaf.rsa_e_len);
+    let is hmac.HashAlg as a with mut = hmac.alg_sha256();
+    if (hash == 384) { a = hmac.alg_sha384(); }
+    if (hash == 512) { a = hmac.alg_sha512(); }
+    ok = 0;
+    if (siglen == pub.k) {
+        ok = pss.pss_verify_digest(&pub, &a, digest, sig, siglen, want);
+    }
+    bi.big_free(&pub.n);
+    bi.big_free(&pub.e);
+    if (ok == 1) { return 0; }
+    return TLS_ERR_BADSIG;
+}
+
+// --- Driving ------------------------------------------------------------
+
+// One state forward. 0 when it advanced, a sentinel otherwise.
+fn hs_step(h as *Handshake) as i64 {
+    if (h.st == ST_DONE) { return 0; }
+
+    if (h.st == ST_START) {
+        if (h.have_priv == 0) {
+            if (entropy.entropy_fill(cast(*u8, &h.priv), 32) != 32) {
+                return TLS_ERR_ENTROPY;
+            }
+            x25519.x25519_base(cast(*u8, &h.priv), cast(*u8, &h.pub));
+        }
+        transcript.tr_init(&h.tr, transcript.TR_SHA256);
+
+        let is bytes.Bytes as b with mut = bytes.bytes_new(1024);
+        if (cast(i64, b.ptr) == 0) { return TLS_ERR_SPACE; }
+        let is i64 as rc with mut = 0;
+        if (h.hellolen > 0) {
+            if (bytes.bytes_append(&b, h.hello, h.hellolen) < 0) { rc = TLS_ERR_SPACE; }
+        } else {
+            rc = _build_hello(h, &b);
+        }
+        if (rc < 0) { bytes.bytes_free(&b); return rc; }
+
+        transcript.tr_update(&h.tr, b.ptr, b.len);
+        h.hello_sent_len = 0;
+        if (b.len <= 1024) {
+            let is i64 as i with mut = 0;
+            while (i < b.len) { h.hello_sent[i] = b.ptr[i]; i = i + 1; }
+            h.hello_sent_len = b.len;
+        }
+        let is i64 as w = record.rl_write_record(h.rl, record.CT_HANDSHAKE, b.ptr, b.len);
+        bytes.bytes_free(&b);
+        if (w < 0) { return w; }
+
+        h.st = ST_WAIT_SH;
+        return 0;
+    }
+
+    if (h.st == ST_WAIT_SH) {
+        let is i64 as mt with mut = 0;
+        let is i64 as rc with mut = _next_message(h, &mt);
+        if (rc < 0) { return rc; }
+        if (mt != HS_SERVER_HELLO) { return TLS_ERR_PROTOCOL; }
+        rc = _parse_server_hello(h);
+        if (rc < 0) { return rc; }
+        // The transcript hash for the handshake secret is taken AFTER
+        // ServerHello and BEFORE anything else. A step out of order here
+        // surfaces only as a Finished that will not match.
+        rc = _install_handshake_keys(h);
+        if (rc < 0) { return rc; }
+        h.st = ST_WAIT_EE;
+        return 0;
+    }
+
+    if (h.st == ST_WAIT_EE) {
+        let is i64 as mt with mut = 0;
+        let is i64 as rc with mut = _next_message(h, &mt);
+        if (rc < 0) { return rc; }
+        if (mt != HS_ENCRYPTED_EXT) { return TLS_ERR_PROTOCOL; }
+        rc = _parse_encrypted_extensions(h);
+        if (rc < 0) { return rc; }
+        h.st = ST_WAIT_CERT;
+        return 0;
+    }
+
+    if (h.st == ST_WAIT_CERT) {
+        let is i64 as mt with mut = 0;
+        let is i64 as rc with mut = _next_message(h, &mt);
+        if (rc < 0) { return rc; }
+        // A CertificateRequest may sit here. This client has no certificate
+        // to offer, so it is skipped and the real Certificate read next; a
+        // server that asked will get an empty Certificate in reply only once
+        // client authentication is implemented, which it is not.
+        if (mt == HS_CERT_REQUEST) { return 0; }
+        if (mt != HS_CERTIFICATE) { return TLS_ERR_PROTOCOL; }
+        rc = _parse_certificate(h);
+        if (rc < 0) { return rc; }
+
+        // Chain policy, if the caller supplied any. CertificateVerify below
+        // is checked either way.
+        if (cast(i64, h.t) != 0) {
+            h.verr = verify.verify_chain(h.t, h.certs, h.ncert,
+                                         cast(*u8, &h.host), h.now);
+            if (h.verr != 0) { return TLS_ERR_CERT; }
+        }
+        h.st = ST_WAIT_CV;
+        return 0;
+    }
+
+    if (h.st == ST_WAIT_CV) {
+        // Built before the message is read, because the transcript
+        // CertificateVerify signs ends at Certificate and _next_message would
+        // have folded this message into it.
+        let is [160]u8 as signed;
+        let is [48]u8 as th;
+        transcript.tr_digest(&h.tr, cast(*u8, &th));
+        let is i64 as k with mut = 0;
+        while (k < CV_PREFIX_N) { signed[k] = CV_PREFIX[k]; k = k + 1; }
+        k = 0;
+        while (k < h.hlen) { signed[CV_PREFIX_N + k] = th[k]; k = k + 1; }
+        let is i64 as signed_len = CV_PREFIX_N + h.hlen;
+
+        let is i64 as scheme_hash with mut = 256;
+        let is [64]u8 as d256;
+        let is [64]u8 as d384;
+        let is [64]u8 as d512;
+        sha2.sha256(cast(*u8, &signed), signed_len, cast(*u8, &d256));
+        sha2.sha384(cast(*u8, &signed), signed_len, cast(*u8, &d384));
+        sha2.sha512(cast(*u8, &signed), signed_len, cast(*u8, &d512));
+
+        let is i64 as mt with mut = 0;
+        let is i64 as rc with mut = _next_message(h, &mt);
+        if (rc < 0) { return rc; }
+        if (mt != HS_CERT_VERIFY) { return TLS_ERR_PROTOCOL; }
+        if (h.msglen < 8) { return TLS_ERR_PROTOCOL; }
+
+        let is i64 as scheme = _u16(h.msg, 4);
+        scheme_hash = 256;
+        if (scheme == ext.SIG_ECDSA_P384_SHA384) { scheme_hash = 384; }
+        if (scheme == ext.SIG_RSA_PSS_RSAE_384) { scheme_hash = 384; }
+        if (scheme == ext.SIG_RSA_PSS_PSS_384) { scheme_hash = 384; }
+        if (scheme == ext.SIG_RSA_PSS_RSAE_512) { scheme_hash = 512; }
+        if (scheme == ext.SIG_RSA_PSS_PSS_512) { scheme_hash = 512; }
+
+        if (scheme_hash == 384) {
+            rc = _check_cert_verify(h, cast(*u8, &signed), signed_len,
+                                    cast(*u8, &d384), 48);
+        } else {
+            if (scheme_hash == 512) {
+                rc = _check_cert_verify(h, cast(*u8, &signed), signed_len,
+                                        cast(*u8, &d512), 64);
+            } else {
+                rc = _check_cert_verify(h, cast(*u8, &signed), signed_len,
+                                        cast(*u8, &d256), 32);
+            }
+        }
+        if (rc < 0) { return rc; }
+        h.st = ST_WAIT_FIN;
+        return 0;
+    }
+
+    if (h.st == ST_WAIT_FIN) {
+        // Same shape as CertificateVerify: the MAC covers the transcript up
+        // to but not including this message, so the expected value is
+        // computed first.
+        let is [48]u8 as th;
+        transcript.tr_digest(&h.tr, cast(*u8, &th));
+        let is [48]u8 as want;
+        if (keysched.ks_finished(&h.ks, cast(*u8, &h.ks.s_hs), cast(*u8, &th),
+                                 cast(*u8, &want)) < 0) { return TLS_ERR_SPACE; }
+
+        let is i64 as mt with mut = 0;
+        let is i64 as rc with mut = _next_message(h, &mt);
+        if (rc < 0) { return rc; }
+        if (mt != HS_FINISHED) { return TLS_ERR_PROTOCOL; }
+        if (h.msglen != 4 + h.hlen) { return TLS_ERR_FINISHED; }
+        let is i64 as diff with mut = 0;
+        let is i64 as i with mut = 0;
+        while (i < h.hlen) {
+            diff = diff | (cast(i64, h.msg[4 + i]) ^ cast(i64, want[i]));
+            i = i + 1;
+        }
+        if (diff != 0) { return TLS_ERR_FINISHED; }
+
+        // The application secrets derive from the transcript INCLUDING the
+        // server's Finished, which _next_message has just folded in. They
+        // cannot be computed yet: ks_application also produces the resumption
+        // secret, which needs the transcript through the CLIENT's Finished.
+        // So the hash is saved here, while it is the current one.
+        transcript.tr_digest(&h.tr, cast(*u8, &h.th_ap));
+        h.st = ST_SEND_FIN;
+        return 0;
+    }
+
+    if (h.st == ST_SEND_FIN) {
+        let is [48]u8 as th;
+        transcript.tr_digest(&h.tr, cast(*u8, &th));
+        let is [48]u8 as mac;
+        if (keysched.ks_finished(&h.ks, cast(*u8, &h.ks.c_hs), cast(*u8, &th),
+                                 cast(*u8, &mac)) < 0) { return TLS_ERR_SPACE; }
+
+        let is [64]u8 as fin;
+        fin[0] = cast(u8, HS_FINISHED);
+        fin[1] = cast(u8, 0);
+        fin[2] = cast(u8, 0);
+        fin[3] = cast(u8, h.hlen);
+        let is i64 as i with mut = 0;
+        while (i < h.hlen) { fin[4 + i] = mac[i]; i = i + 1; }
+
+        let is i64 as w = record.rl_write_record(h.rl, record.CT_HANDSHAKE,
+                                                 cast(*u8, &fin), 4 + h.hlen);
+        if (w < 0) { return w; }
+        transcript.tr_update(&h.tr, cast(*u8, &fin), 4 + h.hlen);
+
+        // Now the transcript reaches the client's Finished, which is the
+        // second hash ks_application wants.
+        let is [48]u8 as th_res;
+        transcript.tr_digest(&h.tr, cast(*u8, &th_res));
+        keysched.ks_application(&h.ks, cast(*u8, &h.empty_hash),
+                                cast(*u8, &h.th_ap), cast(*u8, &th_res));
+
+        // Only now do the application keys go in. Installing them earlier
+        // would have sealed the Finished above under the wrong key.
+        let is [32]u8 as key;
+        let is [12]u8 as iv;
+        let is i64 as klen = _key_len(h.suite);
+        if (keysched.ks_traffic_keys(&h.ks, cast(*u8, &h.ks.c_ap), cast(*u8, &key),
+                                     klen, cast(*u8, &iv), 12) < 0) { return TLS_ERR_SPACE; }
+        if (record.rl_set_write_key(h.rl, h.suite, cast(*u8, &key),
+                                    cast(*u8, &iv)) < 0) { return TLS_ERR_SUITE; }
+        if (keysched.ks_traffic_keys(&h.ks, cast(*u8, &h.ks.s_ap), cast(*u8, &key),
+                                     klen, cast(*u8, &iv), 12) < 0) { return TLS_ERR_SPACE; }
+        if (record.rl_set_read_key(h.rl, h.suite, cast(*u8, &key),
+                                   cast(*u8, &iv)) < 0) { return TLS_ERR_SUITE; }
+
+        h.st = ST_DONE;
+        return 0;
+    }
+
+    return TLS_ERR_PROTOCOL;
+}
+
+// Drive to completion, blocking. 0 on success.
+fn hs_run(h as *Handshake) as i64 {
+    let is i64 as guard with mut = 0;
+    while (h.st != ST_DONE) {
+        let is i64 as rc = hs_step(h);
+        if (rc < 0) {
+            if (rc != errno.WANT_READ && rc != errno.WANT_WRITE) {
+                h.err = rc;
+                return rc;
+            }
+        }
+        guard = guard + 1;
+        // A step that neither advances nor fails cannot happen twice per
+        // state; this bounds a peer that sends nothing but skippable
+        // messages — CertificateRequest, ChangeCipherSpec — forever.
+        if (guard > 64) { h.err = TLS_ERR_PROTOCOL; return TLS_ERR_PROTOCOL; }
+    }
+    return 0;
+}
+
+fn tls_err_name(e as i64) as *u8 {
+    if (e == 0)                { return "OK"; }
+    if (e == TLS_ERR_PROTOCOL) { return "TLS_ERR_PROTOCOL"; }
+    if (e == TLS_ERR_ALERT)    { return "TLS_ERR_ALERT"; }
+    if (e == TLS_ERR_HRR)      { return "TLS_ERR_HRR"; }
+    if (e == TLS_ERR_VERSION)  { return "TLS_ERR_VERSION"; }
+    if (e == TLS_ERR_SUITE)    { return "TLS_ERR_SUITE"; }
+    if (e == TLS_ERR_CERT)     { return "TLS_ERR_CERT"; }
+    if (e == TLS_ERR_FINISHED) { return "TLS_ERR_FINISHED"; }
+    if (e == TLS_ERR_KEYSHARE) { return "TLS_ERR_KEYSHARE"; }
+    if (e == TLS_ERR_MSGSIZE)  { return "TLS_ERR_MSGSIZE"; }
+    if (e == TLS_ERR_SIGALG)   { return "TLS_ERR_SIGALG"; }
+    if (e == TLS_ERR_BADSIG)   { return "TLS_ERR_BADSIG"; }
+    if (e == TLS_ERR_ENTROPY)  { return "TLS_ERR_ENTROPY"; }
+    if (e == TLS_ERR_SPACE)    { return "TLS_ERR_SPACE"; }
+    return "TLS_ERR_UNKNOWN";
+}

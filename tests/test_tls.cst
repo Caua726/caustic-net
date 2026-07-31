@@ -1,0 +1,736 @@
+// =======================================================
+// caustic-net/tests/test_tls.cst
+// The RFC 8448 handshake, replayed one state at a time.
+//
+// The server's flight is served from canned bytes over a fake Conn, with the
+// client's ephemeral key and its ClientHello forced to the trace's, so every
+// value the RFC publishes is reproducible. The test asserts them IN ORDER:
+// the shared secret, the transcript after ServerHello, the handshake secret,
+// both traffic secrets, both key/iv pairs, each decrypted message, the
+// transcript after the server's Finished, the master secret, both application
+// secrets, and finally the client's Finished record byte for byte.
+//
+// That ordering is the whole point. A handshake tested only by its final
+// Finished says "one of thirty byte-exact details is wrong" and nothing more.
+// Here the first check that fails names the step.
+//
+// The trace is also replayed ONE BYTE PER READ, which is this library's rule
+// for anything that reads a delimited stream: a 679-byte record arriving in
+// 679 reads has to produce the same handshake as one arriving whole.
+//
+// Chain verification is not exercised here and cannot be — the RFC's
+// certificate is self-signed, CN=rsa, has no SubjectAltName and expired on
+// 2026-07-30. What IS exercised is CertificateVerify, which is
+// rsa_pss_rsae_sha256 over a 1024-bit key and therefore runs through
+// tls/pss.cst. The policy path gets its own check at the end: the same trace
+// with a real store must be refused, with the exact reason.
+//
+// Exit 0 = all pass. Non-zero = the numbered check that failed.
+// =======================================================
+
+use "std/io.cst" as io;
+use "../core/conn.cst" as conn;
+use "../core/bufread.cst" as bufread;
+use "../tls/record.cst" as record;
+use "../tls/transcript.cst" as transcript;
+use "../tls/keysched.cst" as keysched;
+use "../tls/handshake.cst" as hs;
+use "../tls/extensions.cst" as ext;
+use "../tls/x509.cst" as x509;
+use "../tls/trust.cst" as trust;
+use "../tls/verify.cst" as verify;
+use "../core/bytes.cst" as bytes;
+use "../tls/client.cst" as tls;
+use "./vec_tls.cst" as v;
+
+// --- A Conn that replays a script and records what is written ----------
+//
+// One byte per read when `drip` is 1, which is how the split-read rule is
+// applied to a handshake rather than to a single parser.
+let is [4096]u8 as _in with mut;
+let is i64 as _inlen with mut = 0;
+let is i64 as _inoff with mut = 0;
+let is [4096]u8 as _out with mut;
+let is i64 as _outlen with mut = 0;
+let is i64 as _drip with mut = 0;
+let is i64 as _state with mut = 0;
+
+fn mock_read(ctx as *u8, buf as *u8, len as i64) as i64 {
+    let is i64 as avail = _inlen - _inoff;
+    if (avail <= 0) { return 0; }
+    let is i64 as n with mut = len;
+    if (n > avail) { n = avail; }
+    if (_drip == 1) { n = 1; }
+    let is i64 as i with mut = 0;
+    while (i < n) { buf[i] = _in[_inoff + i]; i = i + 1; }
+    _inoff = _inoff + n;
+    return n;
+}
+
+fn mock_write(ctx as *u8, buf as *u8, len as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < len) {
+        if (_outlen >= 4096) { return 0 - 1; }
+        _out[_outlen] = buf[i];
+        _outlen = _outlen + 1;
+        i = i + 1;
+    }
+    return len;
+}
+
+fn mock_close(ctx as *u8) as i64 { _state = conn.CONN_CLOSED; return 0; }
+fn mock_state(ctx as *u8) as i64 { return _state; }
+
+fn mock_conn(c as *conn.Conn) as void {
+    c.ctx = cast(*u8, 0);
+    c.read = fn_ptr(mock_read);
+    c.write = fn_ptr(mock_write);
+    c.close = fn_ptr(mock_close);
+    c.state = fn_ptr(mock_state);
+}
+
+fn feed(p as *u8, n as i64) as void {
+    let is i64 as i with mut = 0;
+    while (i < n) { _in[_inlen + i] = p[i]; i = i + 1; }
+    _inlen = _inlen + n;
+}
+
+fn reset_io() as void {
+    _inlen = 0;  _inoff = 0;  _outlen = 0;  _state = conn.CONN_OPEN;
+}
+
+fn eq(a as *u8, b as *u8, n as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn show(label as *u8, got as *u8, want as *u8, n as i64) as void {
+    io.printf("%s differs:\n  got ", label);
+    let is i64 as i with mut = 0;
+    while (i < n) { io.printf("%02x", cast(i64, got[i])); i = i + 1; }
+    io.printf("\n  want ");
+    i = 0;
+    while (i < n) { io.printf("%02x", cast(i64, want[i])); i = i + 1; }
+    io.printf("\n");
+}
+
+// --- The replay ---------------------------------------------------------
+
+// Storage for one RecordLayer. Module-level: 33 KB is not a stack frame.
+let is [16645]u8 as _rx with mut;
+let is [16385]u8 as _plain with mut;
+let is [4096]u8 as _brbuf with mut;
+
+// Run the whole trace. `drip` selects one byte per read. Returns 0, or the
+// numbered check that failed.
+fn replay(drip as i64) as i64 {
+    reset_io();
+    _drip = drip;
+    feed(v.SH_REC, v.SH_REC_N);
+    feed(v.SRV_FLIGHT, v.SRV_FLIGHT_N);
+
+    let is conn.Conn as c;
+    mock_conn(&c);
+    let is bufread.BufReader as br;
+    bufread.br_init(&br, &c, cast(*u8, &_brbuf), 4096);
+
+    let is record.RecordLayer as rl;
+    if (record.rl_init(&rl, &br, &c, cast(*u8, &_rx), 16645,
+                       cast(*u8, &_plain), 16385) < 0) { return 10; }
+
+    let is hs.Handshake as h;
+    // No trust store: the trace's certificate can never pass chain policy,
+    // and CertificateVerify — the part this exercises — is checked regardless.
+    if (hs.hs_init(&h, &rl, "rsa", cast(*trust.TrustStore, 0)) < 0) { return 11; }
+    hs.hs_set_private(&h, v.CLI_PRIV);
+    hs.hs_set_hello(&h, v.CH_MSG, v.CH_MSG_N);
+
+    // ===== ClientHello ==============================================
+    if (hs.hs_step(&h) != 0) { return 12; }
+    if (hs.hs_state(&h) != hs.ST_WAIT_SH) { return 13; }
+    // The public key the forced private key produces is the trace's.
+    if (eq(cast(*u8, &h.pub), v.CLI_PUB, 32) == 0) {
+        show("client public key", cast(*u8, &h.pub), v.CLI_PUB, 32);
+        return 14;
+    }
+    // And the record on the wire is the trace's.
+    //
+    // The BODY has to match exactly — it is what the transcript hashes. The
+    // header's version byte does not: RFC 8446 §5.1 lets an initial
+    // ClientHello carry 0x0301 for compatibility, which is what the trace
+    // does, or 0x0303, which is what this record layer writes for everything.
+    // Asserting the whole record here would be asserting a choice the RFC
+    // explicitly leaves open.
+    if (_outlen != v.CH_REC_N) { return 15; }
+    if (_out[0] != cast(u8, 0x16)) { return 16; }
+    if (_out[1] != cast(u8, 0x03)) { return 17; }
+    if (_out[2] != cast(u8, 0x01) && _out[2] != cast(u8, 0x03)) { return 18; }
+    if (_out[3] != v.CH_REC[3]) { return 19; }
+    if (_out[4] != v.CH_REC[4]) { return 20; }
+    if (eq(cast(*u8, cast(i64, &_out) + 5),
+           cast(*u8, cast(i64, v.CH_REC) + 5), v.CH_REC_N - 5) == 0) { return 21; }
+
+    // ===== ServerHello, and everything it unlocks ===================
+    let is i64 as rc with mut = hs.hs_step(&h);
+    if (rc != 0) {
+        io.printf("ServerHello: %s\n", hs.tls_err_name(rc));
+        return 22;
+    }
+    if (hs.hs_state(&h) != hs.ST_WAIT_EE) { return 23; }
+    if (h.suite != v.TRACE_SUITE) { return 24; }
+
+    if (eq(cast(*u8, &h.shared), v.ECDHE, 32) == 0) {
+        show("x25519 shared secret", cast(*u8, &h.shared), v.ECDHE, 32);
+        return 25;
+    }
+    if (eq(cast(*u8, &h.ks.handshake), v.SEC_HS, 32) == 0) {
+        show("handshake secret", cast(*u8, &h.ks.handshake), v.SEC_HS, 32);
+        return 26;
+    }
+    if (eq(cast(*u8, &h.ks.c_hs), v.C_HS, 32) == 0) {
+        show("c hs traffic", cast(*u8, &h.ks.c_hs), v.C_HS, 32);
+        return 27;
+    }
+    if (eq(cast(*u8, &h.ks.s_hs), v.S_HS, 32) == 0) {
+        show("s hs traffic", cast(*u8, &h.ks.s_hs), v.S_HS, 32);
+        return 28;
+    }
+    // The transcript through ServerHello, which is what those came from.
+    let is [48]u8 as th;
+    transcript.tr_digest(&h.tr, cast(*u8, &th));
+    if (eq(cast(*u8, &th), v.TH_SH, 32) == 0) {
+        show("transcript after ServerHello", cast(*u8, &th), v.TH_SH, 32);
+        return 29;
+    }
+    // The keys actually installed in the record layer, both directions.
+    if (eq(cast(*u8, &rl.rkey), v.S_HS_KEY, 16) == 0) {
+        show("server handshake key", cast(*u8, &rl.rkey), v.S_HS_KEY, 16);
+        return 30;
+    }
+    if (eq(cast(*u8, &rl.riv), v.S_HS_IV, 12) == 0) { return 31; }
+    if (eq(cast(*u8, &rl.wkey), v.C_HS_KEY, 16) == 0) { return 32; }
+    if (eq(cast(*u8, &rl.wiv), v.C_HS_IV, 12) == 0) { return 33; }
+
+    // ===== the server's encrypted flight, message by message ========
+    rc = hs.hs_step(&h);
+    if (rc != 0) { io.printf("EncryptedExtensions: %s\n", hs.tls_err_name(rc)); return 34; }
+    if (hs.hs_msglen(&h) != v.EE_MSG_N) { return 35; }
+    if (eq(hs.hs_msg(&h), v.EE_MSG, v.EE_MSG_N) == 0) { return 36; }
+
+    rc = hs.hs_step(&h);
+    if (rc != 0) { io.printf("Certificate: %s\n", hs.tls_err_name(rc)); return 37; }
+    if (hs.hs_msglen(&h) != v.CERT_MSG_N) { return 38; }
+    if (eq(hs.hs_msg(&h), v.CERT_MSG, v.CERT_MSG_N) == 0) { return 39; }
+    if (h.ncert != 1) { return 40; }
+    // The leaf really was parsed out of the message, not merely copied.
+    if (h.certs.len != v.LEAF_N) { return 41; }
+    if (eq(h.certs.buf, v.LEAF, v.LEAF_N) == 0) { return 42; }
+    if (h.certs.pk_alg != x509.PK_RSA) { return 43; }
+
+    rc = hs.hs_step(&h);
+    if (rc != 0) { io.printf("CertificateVerify: %s\n", hs.tls_err_name(rc)); return 44; }
+    if (hs.hs_msglen(&h) != v.CV_MSG_N) { return 45; }
+    if (eq(hs.hs_msg(&h), v.CV_MSG, v.CV_MSG_N) == 0) { return 46; }
+
+    rc = hs.hs_step(&h);
+    if (rc != 0) { io.printf("server Finished: %s\n", hs.tls_err_name(rc)); return 47; }
+    if (hs.hs_msglen(&h) != v.S_FIN_MSG_N) { return 48; }
+    if (eq(hs.hs_msg(&h), v.S_FIN_MSG, v.S_FIN_MSG_N) == 0) { return 49; }
+    if (hs.hs_state(&h) != hs.ST_SEND_FIN) { return 50; }
+
+    // The transcript through the server's Finished, saved for the
+    // application secrets.
+    if (eq(cast(*u8, &h.th_ap), v.TH_SF, 32) == 0) {
+        show("transcript after server Finished", cast(*u8, &h.th_ap), v.TH_SF, 32);
+        return 51;
+    }
+
+    // ===== our Finished, and the application keys ===================
+    _outlen = 0;
+    rc = hs.hs_step(&h);
+    if (rc != 0) { io.printf("client Finished: %s\n", hs.tls_err_name(rc)); return 52; }
+    if (hs.hs_state(&h) != hs.ST_DONE) { return 53; }
+
+    if (_outlen != v.C_FIN_REC_N) {
+        io.printf("client Finished record is %ld bytes, want %ld\n",
+                  _outlen, v.C_FIN_REC_N);
+        return 54;
+    }
+    if (eq(cast(*u8, &_out), v.C_FIN_REC, v.C_FIN_REC_N) == 0) {
+        show("client Finished record", cast(*u8, &_out), v.C_FIN_REC, v.C_FIN_REC_N);
+        return 55;
+    }
+
+    if (eq(cast(*u8, &h.ks.master), v.SEC_MASTER, 32) == 0) {
+        show("master secret", cast(*u8, &h.ks.master), v.SEC_MASTER, 32);
+        return 56;
+    }
+    if (eq(cast(*u8, &h.ks.c_ap), v.C_AP, 32) == 0) {
+        show("c ap traffic", cast(*u8, &h.ks.c_ap), v.C_AP, 32);
+        return 57;
+    }
+    if (eq(cast(*u8, &h.ks.s_ap), v.S_AP, 32) == 0) {
+        show("s ap traffic", cast(*u8, &h.ks.s_ap), v.S_AP, 32);
+        return 58;
+    }
+    if (eq(cast(*u8, &rl.wkey), v.C_AP_KEY, 16) == 0) { return 59; }
+    if (eq(cast(*u8, &rl.wiv), v.C_AP_IV, 12) == 0) { return 60; }
+    if (eq(cast(*u8, &rl.rkey), v.S_AP_KEY, 16) == 0) { return 61; }
+    if (eq(cast(*u8, &rl.riv), v.S_AP_IV, 12) == 0) { return 62; }
+
+    // ===== the transcript after our Finished ========================
+    transcript.tr_digest(&h.tr, cast(*u8, &th));
+    if (eq(cast(*u8, &th), v.TH_CF, 32) == 0) {
+        show("transcript after client Finished", cast(*u8, &th), v.TH_CF, 32);
+        return 63;
+    }
+
+    // ===== the first application record the server sent =============
+    // The read key and sequence are where the handshake left them: the
+    // NewSessionTicket record comes first under the application key, so the
+    // application_data record is seq 1. Getting that wrong is a nonce reuse.
+    _inlen = 0;  _inoff = 0;
+    feed(v.TICKET_REC, v.TICKET_REC_N);
+    feed(v.S_DATA_REC, v.S_DATA_REC_N);
+
+    let is i64 as ctype with mut = 0;
+    let is i64 as n with mut = record.rl_read_record(&rl, &ctype);
+    if (n < 0) { io.printf("ticket: %s\n", record.rec_err_name(n)); return 64; }
+    if (ctype != record.CT_HANDSHAKE) { return 65; }
+    if (rl.plain[0] != cast(u8, hs.HS_NEW_TICKET)) { return 66; }
+
+    n = record.rl_read_record(&rl, &ctype);
+    if (n < 0) { io.printf("app data: %s\n", record.rec_err_name(n)); return 67; }
+    if (ctype != record.CT_APPLICATION_DATA) { return 68; }
+    if (n != 50) { return 69; }
+    let is i64 as i with mut = 0;
+    while (i < 50) {
+        if (rl.plain[i] != cast(u8, i)) { return 70; }
+        i = i + 1;
+    }
+
+    hs.hs_free(&h);
+    return 0;
+}
+
+// =======================================================
+// Hostile flights.
+//
+// The trace above proves the happy path is byte-exact. It proves nothing at
+// all about what happens when a peer sends something wrong, because RFC 8448
+// is a correct handshake and every guard against a malformed one is dead code
+// as far as it is concerned.
+//
+// So: take the trace's own plaintext — EncryptedExtensions, Certificate,
+// CertificateVerify, Finished — change one thing, and RE-SEAL it under the
+// trace's server handshake key. The result is a flight the record layer will
+// happily decrypt and the handshake has to refuse, with the right reason. The
+// ServerHello needs no sealing at all: it goes out before any key exists, so
+// a byte can simply be changed in place.
+// =======================================================
+
+let is [4096]u8 as _flight with mut;      // the four messages, concatenated
+let is i64 as _flightlen with mut = 0;
+let is [4096]u8 as _sealed with mut;
+let is [16645]u8 as _srx with mut;
+let is [16385]u8 as _splain with mut;
+let is [256]u8 as _sh with mut;           // a mutable ServerHello record
+
+fn build_flight() as void {
+    _flightlen = 0;
+    let is i64 as i with mut = 0;
+    while (i < v.EE_MSG_N) { _flight[_flightlen + i] = v.EE_MSG[i]; i = i + 1; }
+    _flightlen = _flightlen + v.EE_MSG_N;
+    i = 0;
+    while (i < v.CERT_MSG_N) { _flight[_flightlen + i] = v.CERT_MSG[i]; i = i + 1; }
+    _flightlen = _flightlen + v.CERT_MSG_N;
+    i = 0;
+    while (i < v.CV_MSG_N) { _flight[_flightlen + i] = v.CV_MSG[i]; i = i + 1; }
+    _flightlen = _flightlen + v.CV_MSG_N;
+    i = 0;
+    while (i < v.S_FIN_MSG_N) { _flight[_flightlen + i] = v.S_FIN_MSG[i]; i = i + 1; }
+    _flightlen = _flightlen + v.S_FIN_MSG_N;
+}
+
+// Offsets of each message inside _flight.
+fn off_ee() as i64   { return 0; }
+fn off_cert() as i64 { return v.EE_MSG_N; }
+fn off_cv() as i64   { return v.EE_MSG_N + v.CERT_MSG_N; }
+fn off_fin() as i64  { return v.EE_MSG_N + v.CERT_MSG_N + v.CV_MSG_N; }
+
+// Seal _flight as one handshake record under the server's handshake key at
+// sequence zero — which is where it was in the trace.
+fn seal_flight(n as i64) as i64 {
+    let is conn.Conn as c;
+    mock_conn(&c);
+    let is bufread.BufReader as br2;
+    let is [64]u8 as tiny;
+    bufread.br_init(&br2, &c, cast(*u8, &tiny), 64);
+    let is record.RecordLayer as srl;
+    if (record.rl_init(&srl, &br2, &c, cast(*u8, &_srx), 16645,
+                       cast(*u8, &_splain), 16385) < 0) { return 0 - 1; }
+    if (record.rl_set_write_key(&srl, v.TRACE_SUITE, v.S_HS_KEY, v.S_HS_IV) < 0) {
+        return 0 - 1;
+    }
+    return record.rl_seal_record(&srl, record.CT_HANDSHAKE, cast(*u8, &_flight), n,
+                                 cast(*u8, &_sealed), 4096);
+}
+
+// Run the handshake against the current _sh and _sealed, and return the error
+// hs_run stopped with (0 if it somehow succeeded).
+fn run_hostile(sealed_len as i64) as i64 {
+    reset_io();
+    _drip = 0;
+    feed(cast(*u8, &_sh), v.SH_REC_N);
+    if (sealed_len > 0) { feed(cast(*u8, &_sealed), sealed_len); }
+
+    let is conn.Conn as c;
+    mock_conn(&c);
+    let is bufread.BufReader as br;
+    bufread.br_init(&br, &c, cast(*u8, &_brbuf), 4096);
+    let is record.RecordLayer as rl;
+    if (record.rl_init(&rl, &br, &c, cast(*u8, &_rx), 16645,
+                       cast(*u8, &_plain), 16385) < 0) { return 0 - 900001; }
+
+    let is hs.Handshake as h;
+    if (hs.hs_init(&h, &rl, "rsa", cast(*trust.TrustStore, 0)) < 0) { return 0 - 900002; }
+    hs.hs_set_private(&h, v.CLI_PRIV);
+    hs.hs_set_hello(&h, v.CH_MSG, v.CH_MSG_N);
+    let is i64 as rc = hs.hs_run(&h);
+    hs.hs_free(&h);
+    return rc;
+}
+
+// Reset _sh to the trace's ServerHello and _flight to the trace's messages.
+fn reset_hostile() as void {
+    let is i64 as i with mut = 0;
+    while (i < v.SH_REC_N) { _sh[i] = v.SH_REC[i]; i = i + 1; }
+    build_flight();
+}
+
+// A single byte of the ServerHello, changed. Returns the handshake's verdict.
+fn sh_mutate(at as i64, val as i64) as i64 {
+    reset_hostile();
+    _sh[at] = cast(u8, val);
+    let is i64 as n = seal_flight(_flightlen);
+    if (n < 0) { return 0 - 900003; }
+    return run_hostile(n);
+}
+
+fn main() as i32 {
+    // ===== the literal buffer dimensions ============================
+    if (hs.MAX_HS_MSG != 65536) { return 1; }
+    if (hs.MAX_CERTS != 8) { return 2; }
+    if (hs.MAX_HOST != 256) { return 3; }
+    if (hs.CV_PREFIX_N != 98) { return 4; }
+
+    // The CertificateVerify prefix is 64 spaces, a fixed string and a NUL.
+    // Written as one literal, so it is worth checking it is what it claims.
+    let is i64 as pi with mut = 0;
+    while (pi < 64) {
+        if (hs.CV_PREFIX[pi] != cast(u8, 32)) { return 5; }
+        pi = pi + 1;
+    }
+    if (hs.CV_PREFIX[64] != cast(u8, 84)) { return 6; }     // 'T'
+    if (hs.CV_PREFIX[97] != cast(u8, 0)) { return 7; }
+
+    // ===== the trace, whole ==========================================
+    let is i64 as rc with mut = replay(0);
+    if (rc != 0) { io.printf("whole-read replay failed at check %ld\n", rc); return cast(i32, rc); }
+
+    // ===== the trace, one byte per read ==============================
+    rc = replay(1);
+    if (rc != 0) { io.printf("one-byte-per-read replay failed at check %ld\n", rc); return cast(i32, rc); }
+
+    // ===== the extension builders, against the trace's ClientHello ===
+    // RFC 8448's ClientHello carries key_share, supported_versions,
+    // supported_groups and signature_algorithms. The bytes this library
+    // builds for the first two must be the bytes that are in it.
+    let is i64 as eo with mut = 0;
+    let is i64 as el with mut = 0;
+    // extensions start after: 4 header, 2 version, 32 random, 1+sid,
+    // 2+suites, 1+compression, 2 extensions length.
+    let is i64 as p with mut = 4 + 2 + 32;
+    p = p + 1 + cast(i64, v.CH_MSG[p]);
+    let is i64 as cs = (cast(i64, v.CH_MSG[p]) << 8) + cast(i64, v.CH_MSG[p + 1]);
+    p = p + 2 + cs;
+    p = p + 1 + cast(i64, v.CH_MSG[p]);
+    let is i64 as exn = (cast(i64, v.CH_MSG[p]) << 8) + cast(i64, v.CH_MSG[p + 1]);
+    p = p + 2;
+    if (p + exn != v.CH_MSG_N) { return 70; }
+    let is *u8 as exts = cast(*u8, cast(i64, v.CH_MSG) + p);
+
+    let is bytes.Bytes as b with mut = bytes.bytes_new(256);
+    if (cast(i64, b.ptr) == 0) { return 71; }
+
+    if (ext.ext_supported_versions_client(&b) != 0) { return 72; }
+    if (ext.ext_find(exts, exn, ext.EXT_SUPPORTED_VERS, &eo, &el) != 1) { return 73; }
+    if (b.len != el + 4) { return 74; }
+    if (eq(b.ptr, cast(*u8, cast(i64, exts) + eo - 4), b.len) == 0) {
+        show("supported_versions", b.ptr, cast(*u8, cast(i64, exts) + eo - 4), b.len);
+        return 75;
+    }
+
+    bytes.bytes_reset(&b);
+    if (ext.ext_key_share_client(&b, v.CLI_PUB) != 0) { return 76; }
+    if (ext.ext_find(exts, exn, ext.EXT_KEY_SHARE, &eo, &el) != 1) { return 77; }
+    if (b.len != el + 4) { return 78; }
+    if (eq(b.ptr, cast(*u8, cast(i64, exts) + eo - 4), b.len) == 0) {
+        show("key_share", b.ptr, cast(*u8, cast(i64, exts) + eo - 4), b.len);
+        return 79;
+    }
+
+    bytes.bytes_reset(&b);
+    if (ext.ext_supported_groups(&b) != 0) { return 80; }
+    if (ext.ext_find(exts, exn, ext.EXT_SUPPORTED_GROUPS, &eo, &el) != 1) { return 81; }
+    // The RFC offers four groups and this library offers one, so the bodies
+    // differ; what has to match is the shape — a two-byte list length, then
+    // two-byte group ids, with x25519 among them.
+    if (b.len != 8) { return 82; }
+    if (b.ptr[4] != cast(u8, 0)) { return 83; }
+    if (b.ptr[5] != cast(u8, 2)) { return 84; }
+    if (b.ptr[6] != cast(u8, 0)) { return 85; }
+    if (b.ptr[7] != cast(u8, 0x1d)) { return 86; }
+
+    // A hostname goes in as a host_name entry, length-prefixed three deep.
+    bytes.bytes_reset(&b);
+    if (ext.ext_server_name(&b, "example.com") != 0) { return 87; }
+    if (b.len != 4 + 2 + 1 + 2 + 11) { return 88; }
+    if (b.ptr[0] != cast(u8, 0)) { return 89; }
+    if (b.ptr[1] != cast(u8, 0)) { return 90; }
+    if (b.ptr[3] != cast(u8, 16)) { return 91; }    // extension length
+    if (b.ptr[5] != cast(u8, 14)) { return 92; }    // list length
+    if (b.ptr[6] != cast(u8, 0)) { return 93; }     // host_name
+    if (b.ptr[8] != cast(u8, 11)) { return 94; }
+    if (eq(cast(*u8, cast(i64, b.ptr) + 9), "example.com", 11) == 0) { return 95; }
+    // An empty host writes nothing rather than an empty extension: an
+    // extension with a zero-length name is not the same as no SNI at all.
+    bytes.bytes_reset(&b);
+    if (ext.ext_server_name(&b, "") != 0) { return 96; }
+    if (b.len != 0) { return 97; }
+
+    bytes.bytes_free(&b);
+
+    // ===== the extension reader on malformed input ===================
+    // A length that runs past the block is malformed, not "not found": the
+    // difference decides whether a missing key_share is a protocol error or
+    // an unreadable ServerHello.
+    let is [8]u8 as bad;
+    bad[0] = cast(u8, 0);  bad[1] = cast(u8, 43);
+    bad[2] = cast(u8, 0);  bad[3] = cast(u8, 200);
+    if (ext.ext_find(cast(*u8, &bad), 4, 43, &eo, &el) >= 0) { return 98; }
+    // A block that ends mid-header is malformed too.
+    if (ext.ext_find(cast(*u8, &bad), 3, 43, &eo, &el) >= 0) { return 99; }
+    // And an absent extension in a well-formed block is 0, not an error.
+    bad[3] = cast(u8, 0);
+    if (ext.ext_find(cast(*u8, &bad), 4, 99, &eo, &el) != 0) { return 100; }
+
+    // ===== chain policy, when a store IS supplied ====================
+    // The same trace, with the RFC's own certificate pinned as an anchor.
+    // It still has to be refused, because it has no SubjectAltName — and the
+    // answer has to say so rather than being folded into a generic failure.
+    let is trust.TrustStore as t;
+    if (trust.trust_new(&t, 8192) != 0) { return 101; }
+    if (trust.trust_add_der(&t, v.LEAF, v.LEAF_N) != 1) { return 102; }
+
+    let is x509.Cert as leaf;
+    if (x509.cert_parse(v.LEAF, v.LEAF_N, &leaf) < 0) { return 103; }
+    if (leaf.san_off >= 0) { return 104; }      // it really has no SAN
+    let is i64 as mid = leaf.not_before + (leaf.not_after - leaf.not_before) / 2;
+    if (verify.verify_chain(&t, &leaf, 1, "rsa", mid)
+        != verify.VERIFY_ERR_HOSTNAME) { return 105; }
+    // Still HOSTNAME once it is also expired, because verify_chain checks the
+    // name before the clock on purpose: "this certificate is for somebody
+    // else" is the more useful answer of the two, and a certificate that is
+    // both is not going to be accepted either way. Pinned here so the ordering
+    // is a decision rather than an accident of where the lines happen to sit.
+    if (verify.verify_chain(&t, &leaf, 1, "rsa", leaf.not_after + 1)
+        != verify.VERIFY_ERR_HOSTNAME) { return 106; }
+    trust.trust_free(&t);
+
+    // ===== hostile flights ===========================================
+    // First: the machinery itself. Re-sealing the UNCHANGED flight has to
+    // produce a handshake that still succeeds, or every rejection below would
+    // be a rejection of the test's own encryption.
+    reset_hostile();
+    let is i64 as sn with mut = seal_flight(_flightlen);
+    if (sn < 0) { return 112; }
+    if (run_hostile(sn) != 0) {
+        io.printf("re-sealed but unchanged flight was refused: %s\n",
+                  hs.tls_err_name(run_hostile(sn)));
+        return 113;
+    }
+
+    // --- the ServerHello, which needs no key ---------------------------
+    // Its handshake type byte.
+    if (sh_mutate(5, 3) != hs.TLS_ERR_PROTOCOL) { return 114; }
+    // Its random replaced by the HelloRetryRequest value. That is not a
+    // separate message type — a client that does not know the constant reads
+    // it as a ServerHello and fails somewhere much later.
+    reset_hostile();
+    let is i64 as i with mut = 0;
+    while (i < 32) { _sh[5 + 4 + 2 + i] = hs.HRR_RANDOM[i]; i = i + 1; }
+    sn = seal_flight(_flightlen);
+    if (run_hostile(sn) != hs.TLS_ERR_HRR) { return 115; }
+
+    // The supported_versions extension. In the trace it is the two bytes
+    // 03 04 at a known place; find it rather than hard-coding an offset.
+    reset_hostile();
+    let is i64 as vpos with mut = 0 - 1;
+    i = 5;
+    while (i + 5 < v.SH_REC_N) {
+        if (_sh[i] == cast(u8, 0) && _sh[i + 1] == cast(u8, 43)
+            && _sh[i + 2] == cast(u8, 0) && _sh[i + 3] == cast(u8, 2)
+            && _sh[i + 4] == cast(u8, 3) && _sh[i + 5] == cast(u8, 4)) {
+            vpos = i + 5;
+            break;
+        }
+        i = i + 1;
+    }
+    if (vpos < 0) { return 116; }
+    _sh[vpos] = cast(u8, 3);                    // 0x0303 — TLS 1.2
+    sn = seal_flight(_flightlen);
+    if (run_hostile(sn) != hs.TLS_ERR_VERSION) { return 117; }
+
+    // The key_share extension: its group, its length, and a low-order point.
+    reset_hostile();
+    let is i64 as kpos with mut = 0 - 1;
+    i = 5;
+    while (i + 4 < v.SH_REC_N) {
+        if (_sh[i] == cast(u8, 0) && _sh[i + 1] == cast(u8, 51)) { kpos = i + 4; break; }
+        i = i + 1;
+    }
+    if (kpos < 0) { return 118; }
+    if (_sh[kpos] != cast(u8, 0)) { return 119; }
+    if (_sh[kpos + 1] != cast(u8, 0x1d)) { return 120; }   // x25519
+    _sh[kpos + 1] = cast(u8, 0x17);                        // secp256r1
+    sn = seal_flight(_flightlen);
+    if (run_hostile(sn) != hs.TLS_ERR_KEYSHARE) { return 121; }
+
+    reset_hostile();
+    _sh[kpos + 3] = cast(u8, 31);                          // a 31-byte key
+    sn = seal_flight(_flightlen);
+    if (run_hostile(sn) != hs.TLS_ERR_KEYSHARE) { return 122; }
+
+    // An all-zero public key is a low-order point: x25519 gives an all-zero
+    // shared secret, which RFC 7748 §6.1 says to abort on. caustic-crypto
+    // does not check, so if this is accepted the connection has no secret in
+    // it at all and both sides believe it does.
+    reset_hostile();
+    i = 0;
+    while (i < 32) { _sh[kpos + 4 + i] = cast(u8, 0); i = i + 1; }
+    sn = seal_flight(_flightlen);
+    if (run_hostile(sn) != hs.TLS_ERR_KEYSHARE) { return 123; }
+
+    // --- the encrypted flight ------------------------------------------
+    // Each message's type byte in turn.
+    reset_hostile();
+    _flight[off_ee()] = cast(u8, 9);
+    sn = seal_flight(_flightlen);
+    if (run_hostile(sn) != hs.TLS_ERR_PROTOCOL) { return 124; }
+
+    reset_hostile();
+    _flight[off_cert()] = cast(u8, 12);
+    sn = seal_flight(_flightlen);
+    if (run_hostile(sn) != hs.TLS_ERR_PROTOCOL) { return 125; }
+
+    reset_hostile();
+    _flight[off_cv()] = cast(u8, 16);
+    sn = seal_flight(_flightlen);
+    if (run_hostile(sn) != hs.TLS_ERR_PROTOCOL) { return 126; }
+
+    reset_hostile();
+    _flight[off_fin()] = cast(u8, 21);
+    sn = seal_flight(_flightlen);
+    if (run_hostile(sn) != hs.TLS_ERR_PROTOCOL) { return 127; }
+
+    // One bit of the server's Finished MAC. This is the check that the peer
+    // knows the handshake secret, and the whole handshake rests on it.
+    reset_hostile();
+    _flight[off_fin() + 4] = cast(u8, cast(i64, _flight[off_fin() + 4]) ^ 1);
+    sn = seal_flight(_flightlen);
+    if (run_hostile(sn) != hs.TLS_ERR_FINISHED) { return 128; }
+
+    // A Finished whose length is not the hash length. Truncating it means
+    // rewriting the message's 24-bit length and dropping the last byte.
+    reset_hostile();
+    _flight[off_fin() + 3] = cast(u8, 31);
+    sn = seal_flight(_flightlen - 1);
+    if (run_hostile(sn) != hs.TLS_ERR_FINISHED) { return 129; }
+
+    // And one byte too LONG, with the real MAC still in the first 32 bytes.
+    // This is the case the length check exists for: a comparison over hlen
+    // bytes finds them all equal and says yes to a message that is not a
+    // Finished. Truncating it, above, is caught by the comparison itself.
+    reset_hostile();
+    _flight[off_fin() + 3] = cast(u8, 33);
+    _flight[_flightlen] = cast(u8, 0);
+    sn = seal_flight(_flightlen + 1);
+    if (run_hostile(sn) != hs.TLS_ERR_FINISHED) { return 135; }
+
+    // One bit of the CertificateVerify signature.
+    reset_hostile();
+    _flight[off_cv() + 8] = cast(u8, cast(i64, _flight[off_cv() + 8]) ^ 1);
+    sn = seal_flight(_flightlen);
+    if (run_hostile(sn) != hs.TLS_ERR_BADSIG) { return 130; }
+
+    // CertificateVerify claiming rsa_pkcs1_sha256. TLS 1.3 forbids PKCS#1
+    // v1.5 in CertificateVerify (RFC 8446 §4.4.3) even though the codepoint
+    // exists, and accepting it would be accepting a signature scheme with a
+    // published forgery history against implementations that pad loosely.
+    reset_hostile();
+    _flight[off_cv() + 4] = cast(u8, 0x04);
+    _flight[off_cv() + 5] = cast(u8, 0x01);
+    sn = seal_flight(_flightlen);
+    if (run_hostile(sn) != hs.TLS_ERR_SIGALG) { return 131; }
+
+    // A handshake message claiming a body larger than the reassembly buffer.
+    reset_hostile();
+    _flight[off_ee() + 1] = cast(u8, 0x01);     // 0x010000 = 65536
+    _flight[off_ee() + 2] = cast(u8, 0x00);
+    _flight[off_ee() + 3] = cast(u8, 0x00);
+    sn = seal_flight(_flightlen);
+    if (run_hostile(sn) != hs.TLS_ERR_MSGSIZE) { return 132; }
+
+    // A record of the wrong type in the middle of the handshake. The
+    // ServerHello goes out unencrypted, so an application_data record before
+    // it needs no key either.
+    reset_hostile();
+    _sh[0] = cast(u8, 23);                       // application_data
+    sn = seal_flight(_flightlen);
+    if (run_hostile(sn) != hs.TLS_ERR_PROTOCOL) { return 133; }
+
+    // And a flight that simply stops after the ServerHello.
+    reset_hostile();
+    if (run_hostile(0) == 0) { return 134; }
+
+    // ===== the Conn context fits in one allocation ===================
+    // core/conn.cst's conn_free releases exactly one ctx pointer, so the whole
+    // TLS state has to be one block — and cn_alloc's largest size class is
+    // 65536, above which it returns null in silence. This is the check that
+    // turns "the struct grew" into a test failure instead of a null pointer at
+    // the first https request.
+    let is i64 as ctxsz = tls.tls_ctx_size();
+    if (ctxsz <= 0) { return 107; }
+    if (ctxsz > 60000) {
+        io.printf("TlsCtx is %ld bytes; cn_alloc tops out at 65536\n", ctxsz);
+        return 108;
+    }
+    let is *u8 as probe = conn.cn_alloc(ctxsz);
+    if (cast(i64, probe) == 0) { return 109; }
+    conn.cn_free(probe);
+
+    // A null socket in gives a null Conn out and a named reason, rather than
+    // a Conn whose reads all fail later.
+    if (cast(i64, tls.tls_client(cast(*conn.Conn, 0), "example.com",
+                                 cast(*trust.TrustStore, 0))) != 0) { return 110; }
+    if (tls.tls_last_err() != tls.CLIENT_ERR_ALLOC) { return 111; }
+
+    io.printf("tls ok: RFC 8448 replayed whole and one byte per read, TlsCtx %ld bytes\n",
+              ctxsz);
+    return 0;
+}

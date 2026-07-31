@@ -1,0 +1,357 @@
+// =======================================================
+// caustic-net/tls/client.cst
+// A TLS connection, wearing the same face as a TCP one.
+//
+//     let is *conn.Conn as c = tls_client(tp.dial_host(host, 443), host, &t);
+//
+// and everything above — bufread, http1, fetch — cannot tell the difference.
+// That was the claim core/conn.cst was built on, and this file is where it is
+// either true or it is not.
+//
+// ONE ALLOCATION. core/conn.cst's conn_free releases exactly one ctx pointer,
+// so the whole TLS state lives in a single TlsCtx: the record buffers, the
+// reader's buffer, the key schedule, the host. It comes to about 37 KB, and
+// cn_alloc's largest size class is 65536 — tests/test_client.cst prints the
+// real number and fails past 60 KB, so growing this struct past what the
+// allocator can serve is a test failure and not a silent null.
+//
+// The inner Conn is freed by _tls_close rather than by conn_free, because
+// conn_free only knows about the one pointer it was given. That is why
+// closing a TLS Conn closes the socket under it and freeing it does not leak
+// one.
+//
+// TUNING GOES ON THE SOCKET, NOT ON THIS. transport's set_nodelay and the
+// rest cast ctx to a *TcpCtx without asking, so calling them on a TLS Conn
+// reads this struct as if it were a file descriptor. Apply them to the Conn
+// returned by dial_host BEFORE wrapping it.
+// =======================================================
+
+use "std/mem.cst" as mem;
+use "../core/conn.cst" as conn;
+use "../core/bufread.cst" as bufread;
+use "../core/errno.cst" as errno;
+use "./record.cst" as record;
+use "./keysched.cst" as keysched;
+use "./handshake.cst" as handshake;
+use "./trust.cst" as trust;
+
+// --- Errors (the -1530 block) ------------------------------------------
+let is i64 as CLIENT_ERR_ALLOC   with imut = 0 - 1540;
+let is i64 as CLIENT_ERR_TRUNC   with imut = 0 - 1541;   // EOF without close_notify
+let is i64 as CLIENT_ERR_KEYUPD  with imut = 0 - 1542;   // KeyUpdate we could not follow
+
+// Literal dimensions, per the note in proto/dns.cst.
+let is i64 as CTX_RX    with imut = 16645;   // record.HDR_LEN + record.MAX_CIPHER
+let is i64 as CTX_PLAIN with imut = 16385;   // record.MAX_PLAIN + 1
+let is i64 as CTX_BR    with imut = 4096;
+let is i64 as CTX_HOST  with imut = 256;
+
+struct TlsCtx {
+    inner as *conn.Conn;
+    br    as bufread.BufReader;
+    rl    as record.RecordLayer;
+    ks    as keysched.Secrets;
+
+    st     as i64;      // conn.CONN_*
+    err    as i64;
+    suite  as i64;
+    closed as i64;      // 1 once close_notify has gone out and inner is freed
+    saw_close as i64;   // 1 once the peer's close_notify has arrived
+
+    // How much of the current record's plaintext the caller has taken.
+    rpos as i64;   rlen as i64;
+
+    s_ap as [48]u8;   c_ap as [48]u8;   // kept for KeyUpdate
+    host as [256]u8;
+    alpn as [16]u8;
+
+    brbuf as [4096]u8;
+    rx    as [16645]u8;
+    plain as [16385]u8;
+}
+
+let is i64 as _last_err with mut = 0;
+fn tls_last_err() as i64 { return _last_err; }
+
+fn tls_ctx_size() as i64 { return sizeof(TlsCtx); }
+
+fn _key_len(suite as i64) as i64 {
+    if (suite == record.SUITE_AES_128_GCM_SHA256) { return 16; }
+    return 32;
+}
+
+// --- The vtable ---------------------------------------------------------
+//
+// Four backends, registered by the same five field assignments tcp_conn uses.
+// No fifth call() site anywhere: dispatch stays in core/conn.cst.
+
+fn _tls_read(ctx as *u8, buf as *u8, len as i64) as i64 {
+    let is *TlsCtx as t = cast(*TlsCtx, ctx);
+    if (len <= 0) { return 0; }
+    if (t.saw_close == 1) { return 0; }
+
+    while (t.rpos >= t.rlen) {
+        let is i64 as ctype with mut = 0;
+        let is i64 as n = record.rl_read_record(&t.rl, &ctype);
+        if (n < 0) {
+            if (n == record.REC_ERR_CLOSED) { t.saw_close = 1; t.st = conn.CONN_EOF; return 0; }
+            t.err = n;
+            t.st = conn.CONN_ERROR;
+            return n;
+        }
+        if (n == 0) {
+            // A record with nothing in it: a ChangeCipherSpec the layer
+            // dropped, or a zero-length application_data record, which is
+            // legal and means nothing. Neither is EOF.
+            if (t.rl.closed == 1) { t.saw_close = 1; t.st = conn.CONN_EOF; return 0; }
+            if (bufread.br_eof(&t.br) == 1) {
+                // The socket ended without a close_notify. For a body with a
+                // declared length that is survivable; for one framed by the
+                // connection closing it is a truncation attack. The caller is
+                // told which by the state, not by a silent zero.
+                t.st = conn.CONN_EOF;
+                t.err = CLIENT_ERR_TRUNC;
+                return 0;
+            }
+            continue;
+        }
+
+        if (ctype == record.CT_ALERT) {
+            // rl_read_record already recognised close_notify and set closed.
+            if (t.rl.closed == 1) { t.saw_close = 1; t.st = conn.CONN_EOF; return 0; }
+            t.err = record.REC_ERR_CLOSED;
+            t.st = conn.CONN_ERROR;
+            return record.REC_ERR_CLOSED;
+        }
+
+        if (ctype == record.CT_HANDSHAKE) {
+            // Post-handshake messages arrive on the same stream as data.
+            let is i64 as mt = cast(i64, t.rl.plain[0]);
+            if (mt == handshake.HS_NEW_TICKET) { continue; }   // resumption, unused
+            if (mt == handshake.HS_KEY_UPDATE) {
+                // Not optional. A peer that rekeys and is ignored keeps
+                // sending under a key we no longer have, and the connection
+                // dies several megabytes later for no visible reason.
+                let is i64 as rc = _key_update(t, n);
+                if (rc < 0) { t.err = rc; t.st = conn.CONN_ERROR; return rc; }
+                continue;
+            }
+            continue;
+        }
+
+        if (ctype != record.CT_APPLICATION_DATA) { continue; }
+        t.rpos = 0;
+        t.rlen = n;
+    }
+
+    let is i64 as avail = t.rlen - t.rpos;
+    let is i64 as take with mut = len;
+    if (take > avail) { take = avail; }
+    let is i64 as i with mut = 0;
+    while (i < take) { buf[i] = t.rl.plain[t.rpos + i]; i = i + 1; }
+    t.rpos = t.rpos + take;
+    return take;
+}
+
+// RFC 8446 §7.2: the next secret is HKDF-Expand-Label(current, "traffic upd").
+// A key_update_request of 1 asks us to rekey our own side and answer.
+fn _key_update(t as *TlsCtx, n as i64) as i64 {
+    if (n < 5) { return CLIENT_ERR_KEYUPD; }
+    let is i64 as req = cast(i64, t.rl.plain[4]);
+
+    let is [48]u8 as next;
+    if (keysched.ks_update_secret(&t.ks, cast(*u8, &t.s_ap), cast(*u8, &next)) < 0) {
+        return CLIENT_ERR_KEYUPD;
+    }
+    let is i64 as i with mut = 0;
+    while (i < 48) { t.s_ap[i] = next[i]; i = i + 1; }
+
+    let is [32]u8 as key;
+    let is [12]u8 as iv;
+    let is i64 as kl = _key_len(t.suite);
+    if (keysched.ks_traffic_keys(&t.ks, cast(*u8, &t.s_ap), cast(*u8, &key),
+                                 kl, cast(*u8, &iv), 12) < 0) { return CLIENT_ERR_KEYUPD; }
+    if (record.rl_set_read_key(&t.rl, t.suite, cast(*u8, &key), cast(*u8, &iv)) < 0) {
+        return CLIENT_ERR_KEYUPD;
+    }
+
+    if (req != 1) { return 0; }
+
+    // Answer with update_not_requested, then rekey our write side. The order
+    // matters: the reply goes out under the OLD key, because the peer has not
+    // been told to change yet.
+    let is [5]u8 as msg;
+    msg[0] = cast(u8, handshake.HS_KEY_UPDATE);
+    msg[1] = cast(u8, 0);  msg[2] = cast(u8, 0);  msg[3] = cast(u8, 1);
+    msg[4] = cast(u8, 0);
+    if (record.rl_write_record(&t.rl, record.CT_HANDSHAKE, cast(*u8, &msg), 5) < 0) {
+        return CLIENT_ERR_KEYUPD;
+    }
+    if (keysched.ks_update_secret(&t.ks, cast(*u8, &t.c_ap), cast(*u8, &next)) < 0) {
+        return CLIENT_ERR_KEYUPD;
+    }
+    i = 0;
+    while (i < 48) { t.c_ap[i] = next[i]; i = i + 1; }
+    if (keysched.ks_traffic_keys(&t.ks, cast(*u8, &t.c_ap), cast(*u8, &key),
+                                 kl, cast(*u8, &iv), 12) < 0) { return CLIENT_ERR_KEYUPD; }
+    if (record.rl_set_write_key(&t.rl, t.suite, cast(*u8, &key), cast(*u8, &iv)) < 0) {
+        return CLIENT_ERR_KEYUPD;
+    }
+    return 0;
+}
+
+fn _tls_write(ctx as *u8, buf as *u8, len as i64) as i64 {
+    let is *TlsCtx as t = cast(*TlsCtx, ctx);
+    if (len <= 0) { return 0; }
+    if (t.closed == 1) { return 0 - errno.EPIPE; }
+
+    let is i64 as sent with mut = 0;
+    while (sent < len) {
+        let is i64 as chunk with mut = len - sent;
+        if (chunk > record.MAX_PLAIN) { chunk = record.MAX_PLAIN; }
+        let is i64 as rc = record.rl_write_record(&t.rl, record.CT_APPLICATION_DATA,
+                                                  cast(*u8, cast(i64, buf) + sent),
+                                                  chunk);
+        if (rc < 0) {
+            if (sent > 0) { return sent; }
+            t.err = rc;
+            t.st = conn.CONN_ERROR;
+            return rc;
+        }
+        sent = sent + chunk;
+    }
+    return sent;
+}
+
+fn _tls_close(ctx as *u8) as i64 {
+    let is *TlsCtx as t = cast(*TlsCtx, ctx);
+    if (t.closed == 1) { return 0; }
+    t.closed = 1;
+
+    // close_notify: warning level, description 0. Best effort — a peer that
+    // has already gone makes this fail, and that is not an error worth
+    // reporting from a close.
+    let is [2]u8 as alert;
+    alert[0] = cast(u8, 1);
+    alert[1] = cast(u8, 0);
+    record.rl_write_record(&t.rl, record.CT_ALERT, cast(*u8, &alert), 2);
+
+    // The socket under us is ours to release. conn_free on the wrapper frees
+    // exactly one ctx — this struct — and would otherwise leave the inner
+    // Conn and its file descriptor behind.
+    if (cast(i64, t.inner) != 0) {
+        conn.conn_free(t.inner);
+        t.inner = cast(*conn.Conn, 0);
+    }
+    if (t.st == conn.CONN_OPEN) { t.st = conn.CONN_CLOSED; }
+    return 0;
+}
+
+fn _tls_state(ctx as *u8) as i64 {
+    let is *TlsCtx as t = cast(*TlsCtx, ctx);
+    return t.st;
+}
+
+// --- Construction --------------------------------------------------------
+
+// Wrap `inner` in TLS for `host`, verifying against `t`.
+//
+// On success the caller owns exactly one Conn and closing it closes the
+// socket. On failure `inner` is closed and freed here — returning a half-open
+// socket alongside a null would be a leak the caller cannot even name.
+// tls_last_err() says why.
+fn tls_client(inner as *conn.Conn, host as *u8,
+              t as *trust.TrustStore) as *conn.Conn {
+    _last_err = 0;
+    if (cast(i64, inner) == 0) { _last_err = CLIENT_ERR_ALLOC; return cast(*conn.Conn, 0); }
+
+    let is *conn.Conn as c = conn.conn_new();
+    if (cast(i64, c) == 0) {
+        conn.conn_free(inner);
+        _last_err = CLIENT_ERR_ALLOC;
+        return cast(*conn.Conn, 0);
+    }
+
+    let is *TlsCtx as x = cast(*TlsCtx, conn.cn_alloc(sizeof(TlsCtx)));
+    if (cast(i64, x) == 0) {
+        conn.cn_free(cast(*u8, c));
+        conn.conn_free(inner);
+        _last_err = CLIENT_ERR_ALLOC;
+        return cast(*conn.Conn, 0);
+    }
+    mem.core.memset(cast(*u8, x), cast(i32, 0), sizeof(TlsCtx));
+
+    x.inner = inner;
+    x.st = conn.CONN_OPEN;
+    x.err = 0;
+    x.closed = 0;
+    x.saw_close = 0;
+    x.rpos = 0;
+    x.rlen = 0;
+
+    let is i64 as i with mut = 0;
+    while (i < 255 && host[i] != 0) { x.host[i] = host[i]; i = i + 1; }
+    x.host[i] = cast(u8, 0);
+
+    bufread.br_init(&x.br, inner, cast(*u8, &x.brbuf), CTX_BR);
+    if (record.rl_init(&x.rl, &x.br, inner, cast(*u8, &x.rx), CTX_RX,
+                       cast(*u8, &x.plain), CTX_PLAIN) < 0) {
+        conn.cn_free(cast(*u8, x));
+        conn.cn_free(cast(*u8, c));
+        conn.conn_free(inner);
+        _last_err = CLIENT_ERR_ALLOC;
+        return cast(*conn.Conn, 0);
+    }
+
+    let is handshake.Handshake as h;
+    let is i64 as rc with mut = handshake.hs_init(&h, &x.rl, cast(*u8, &x.host), t);
+    if (rc == 0) { rc = handshake.hs_run(&h); }
+    if (rc < 0) {
+        _last_err = rc;
+        // A refused chain says which way it was refused; the handshake error
+        // alone would collapse "expired", "wrong name" and "unknown issuer"
+        // into one code, and a browser needs the three apart.
+        if (rc == handshake.TLS_ERR_CERT) { _last_err = handshake.hs_verr(&h); }
+        handshake.hs_free(&h);
+        conn.cn_free(cast(*u8, x));
+        conn.cn_free(cast(*u8, c));
+        conn.conn_free(inner);
+        return cast(*conn.Conn, 0);
+    }
+
+    // The application secrets and the schedule follow the handshake out, so a
+    // KeyUpdate arriving mid-stream can be answered.
+    x.suite = h.suite;
+    x.ks = h.ks;
+    let is *u8 as ap = handshake.hs_alpn(&h);
+    let is i64 as k with mut = 0;
+    while (k < 15 && ap[k] != 0) { x.alpn[k] = ap[k]; k = k + 1; }
+    x.alpn[k] = cast(u8, 0);
+    i = 0;
+    while (i < 48) { x.c_ap[i] = h.ks.c_ap[i]; x.s_ap[i] = h.ks.s_ap[i]; i = i + 1; }
+    handshake.hs_free(&h);
+
+    c.ctx = cast(*u8, x);
+    c.read = fn_ptr(_tls_read);
+    c.write = fn_ptr(_tls_write);
+    c.close = fn_ptr(_tls_close);
+    c.state = fn_ptr(_tls_state);
+    return c;
+}
+
+// The protocol ALPN settled on, or "" if the server said nothing — which
+// means it accepted the only one offered. A caller that speaks more than
+// HTTP/1.1 has to look, because a server may pick h2 and then proto/http1
+// would read frames as a status line.
+fn tls_alpn(c as *conn.Conn) as *u8 {
+    if (cast(i64, c) == 0) { return ""; }
+    let is *TlsCtx as t = cast(*TlsCtx, c.ctx);
+    return cast(*u8, &t.alpn);
+}
+
+fn client_err_name(e as i64) as *u8 {
+    if (e == CLIENT_ERR_ALLOC)  { return "CLIENT_ERR_ALLOC"; }
+    if (e == CLIENT_ERR_TRUNC)  { return "CLIENT_ERR_TRUNC"; }
+    if (e == CLIENT_ERR_KEYUPD) { return "CLIENT_ERR_KEYUPD"; }
+    return "CLIENT_ERR_UNKNOWN";
+}
