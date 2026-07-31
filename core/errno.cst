@@ -7,6 +7,7 @@
 
 // Linux x86_64 errno values (positive; I/O returns them negated).
 let is i64 as EINTR        with imut = 4;
+let is i64 as EIO          with imut = 5;
 let is i64 as EBADF        with imut = 9;
 let is i64 as EAGAIN       with imut = 11;   // == EWOULDBLOCK on Linux
 let is i64 as EWOULDBLOCK  with imut = 11;
@@ -43,6 +44,7 @@ fn err_name(ret as i64) as *u8 {
     let is i64 as e with mut = ret;
     if (e < 0) { e = 0 - e; }
     if (e == EINTR)        { return "EINTR"; }
+    if (e == EIO)          { return "EIO"; }
     if (e == EBADF)        { return "EBADF"; }
     if (e == EAGAIN)       { return "EAGAIN"; }
     if (e == EFAULT)       { return "EFAULT"; }

@@ -8,7 +8,9 @@
 use "std/net.cst" as net;
 use "std/mem.cst" only bins, core as mem;
 use "./tcp_conn.cst" as tcpc;
+use "./resolver.cst" as res;
 use "../core/conn.cst" as conn;
+use "../core/errno.cst" as errno;
 
 // One-time WSAStartup on Windows; no-op on Linux. Safe to call repeatedly.
 fn init() as i32 {
@@ -22,6 +24,54 @@ fn dial(ip_str as *u8, port as i64) as *conn.Conn {
     let is i64 as fd = net.dial(ip_str, port);
     if (fd < 0) { return cast(*conn.Conn, 0); }
     return tcpc.conn_from_fd(fd);
+}
+
+// One resolver for the process. A Resolver is configuration and a cache, not a
+// connection, so sharing it is what makes the cache worth having — and it is
+// what `dial_host` uses when the caller has not brought their own.
+let is res.Resolver as _res with mut;
+
+fn resolver() as *res.Resolver {
+    if (_res.ready == 0) { res.resolver_init(&_res); }
+    return &_res;
+}
+
+// Blocking connect to a HOST NAME and port — the call everything above the
+// transport actually wants, since a URL carries a name and `dial` takes a
+// dotted quad. Resolves through /etc/hosts, the cache and DNS, then connects.
+//
+// Returns *Conn, or null. The reason is available from `dial_host_err()`:
+// telling "the name does not exist" from "the host refused the connection"
+// is the difference between two error pages, and squeezing both into a null
+// pointer would throw that away.
+let is i64 as _dial_err with mut = 0;
+
+fn dial_host_err() as i64 { return _dial_err; }
+
+fn dial_host(host as *u8, port as i64) as *conn.Conn {
+    _dial_err = 0;
+    let is [16]u8 as addr;
+    let is i64 as n = res.resolve(resolver(), host, cast(*u8, &addr), 0);
+    if (n < 0) { _dial_err = n; return cast(*conn.Conn, 0); }
+
+    if (n == 4) {
+        let is i64 as ip = (cast(i64, addr[0]) << 24) + (cast(i64, addr[1]) << 16)
+                         + (cast(i64, addr[2]) << 8) + cast(i64, addr[3]);
+        let is *conn.Conn as k = connect_ip4(ip, port);
+        if (cast(i64, k) == 0) { _dial_err = 0 - errno.ECONNREFUSED; }
+        return k;
+    }
+
+    if (n == 16) {
+        let is [28]u8 as buf6;
+        let is net.Addr6 as a6 = net.addr6_init(cast(*u8, &buf6), cast(*u8, &addr), port);
+        let is i64 as fd = net.tcp_connect6(a6);
+        if (fd < 0) { _dial_err = fd; return cast(*conn.Conn, 0); }
+        return tcpc.conn_from_fd(fd);
+    }
+
+    _dial_err = 0 - errno.EINVAL;
+    return cast(*conn.Conn, 0);
 }
 
 // Blocking connect to a host-byte-order IPv4 + port. Returns *Conn or null.

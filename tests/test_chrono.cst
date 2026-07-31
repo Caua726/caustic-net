@@ -1,0 +1,269 @@
+// =======================================================
+// tests/test_chrono.cst — core/chrono.cst
+//
+// Two kinds of check, because calendar code fails in two ways.
+//
+// The arithmetic is checked EXHAUSTIVELY: every day from 1888 to 2106 is
+// converted to a civil date and back, and must land on itself. That is 80 000
+// days, and it needs no oracle — a round trip is its own proof, and it covers
+// every month length, every leap year, every century rule and every February
+// 29 in the range without any of them being named.
+//
+// The formats are checked against FIXED CONSTANTS taken from an independent
+// implementation, not from this one. A parser tested only against its own
+// formatter agrees with itself perfectly while being uniformly wrong, and the
+// consequence here is a certificate whose expiry this library reads
+// differently from the CA that signed it.
+//
+// Exit 0 = all pass. Non-zero = the numbered check that failed.
+// =======================================================
+
+use "../core/chrono.cst" as ch;
+
+fn slen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+fn streq(a as *u8, b as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (a[i] != 0 && b[i] != 0) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    if (a[i] != b[i]) { return 0; }
+    return 1;
+}
+
+// Parse s as an HTTP-date, using its NUL-terminated length.
+fn hd(s as *u8) as i64 {
+    return ch.http_date_parse(s, slen(s));
+}
+
+fn main() as i32 {
+    // --- days_from_civil, against known values ---------------------------
+    if (ch.days_from_civil(1970, 1, 1) != 0) { return 1; }
+    if (ch.days_from_civil(1970, 1, 2) != 1) { return 2; }
+    if (ch.days_from_civil(1969, 12, 31) != 0 - 1) { return 3; }
+    if (ch.days_from_civil(2000, 1, 1) != 10957) { return 4; }
+    if (ch.days_from_civil(2000, 2, 29) != 11016) { return 5; }
+    if (ch.days_from_civil(2024, 2, 29) != 19782) { return 6; }
+    if (ch.days_from_civil(1900, 1, 1) != 0 - 25567) { return 7; }
+    if (ch.days_from_civil(2100, 3, 1) != 47541) { return 8; }
+    if (ch.days_from_civil(2038, 1, 19) != 24855) { return 9; }
+    if (ch.days_from_civil(1950, 1, 1) != 0 - 7305) { return 10; }
+
+    // --- Weekday. 1970-01-01 was a Thursday; the rest follow from it. ----
+    if (ch.weekday_from_days(0) != 4) { return 11; }
+    if (ch.weekday_from_days(1) != 5) { return 12; }
+    if (ch.weekday_from_days(0 - 1) != 3) { return 13; }        // before the epoch
+    if (ch.weekday_from_days(0 - 25567) != 1) { return 14; }    // 1900-01-01, a Monday
+    if (ch.weekday_from_days(10957) != 6) { return 15; }        // 2000-01-01, a Saturday
+
+    // --- The exhaustive round trip ---------------------------------------
+    // 1888-ish to 2106-ish, one day at a time. Also asserts the intermediate
+    // date is well formed, so a pair of errors that cancel on the way back
+    // still fails here.
+    let is i64 as y with mut = 0;
+    let is i64 as m with mut = 0;
+    let is i64 as d with mut = 0;
+    let is i64 as z with mut = 0 - 30000;
+    while (z < 50000) {
+        ch.civil_from_days(z, &y, &m, &d);
+        if (m < 1 || m > 12) { return 16; }
+        if (d < 1 || d > ch.days_in_month(y, m)) { return 17; }
+        if (ch.days_from_civil(y, m, d) != z) { return 18; }
+        z = z + 1;
+    }
+
+    // --- The leap-year rule at its three interesting points ---------------
+    if (ch.is_leap(2024) != 1) { return 19; }
+    if (ch.is_leap(2023) != 0) { return 20; }
+    if (ch.is_leap(2000) != 1) { return 21; }      // /400 -> leap
+    if (ch.is_leap(1900) != 0) { return 22; }      // /100 -> not
+    if (ch.is_leap(2100) != 0) { return 23; }      // /100 -> not
+    if (ch.days_in_month(2024, 2) != 29) { return 24; }
+    if (ch.days_in_month(2100, 2) != 28) { return 25; }
+    if (ch.days_in_month(2024, 4) != 30) { return 26; }
+    if (ch.days_in_month(2024, 12) != 31) { return 27; }
+
+    // Every Feb 29 in 1970..2100 is a real date, and every Feb 29 in a
+    // non-leap year is not. Off-by-one in the century rule fails here.
+    let is i64 as leaps with mut = 0;
+    y = 1970;
+    while (y <= 2100) {
+        let is i64 as e = ch.epoch_from(y, 2, 29, 0, 0, 0);
+        if (ch.is_leap(y) == 1) {
+            if (e == ch.TIME_ERR) { return 28; }
+            leaps = leaps + 1;
+        } else {
+            if (e != ch.TIME_ERR) { return 29; }
+        }
+        y = y + 1;
+    }
+    if (leaps != 32) { return 30; }
+
+    // --- epoch_from, against known instants -------------------------------
+    if (ch.epoch_from(1970, 1, 1, 0, 0, 0) != 0) { return 31; }
+    if (ch.epoch_from(2001, 9, 9, 1, 46, 40) != 1000000000) { return 32; }
+    if (ch.epoch_from(2038, 1, 19, 3, 14, 7) != 2147483647) { return 33; }
+    if (ch.epoch_from(1994, 11, 6, 8, 49, 37) != 784111777) { return 34; }
+    if (ch.epoch_from(1950, 1, 1, 0, 0, 0) != 0 - 631152000) { return 35; }
+    if (ch.epoch_from(2049, 12, 31, 23, 59, 59) != 2524607999) { return 36; }
+    if (ch.epoch_from(2099, 12, 31, 23, 59, 59) != 4102444799) { return 37; }
+
+    // --- epoch_from rejects what is not an instant ------------------------
+    // Every one of these produces a plausible number if the field is simply
+    // multiplied out instead of validated, and every one of them would move a
+    // certificate's expiry.
+    if (ch.epoch_from(2024, 0, 1, 0, 0, 0) != ch.TIME_ERR) { return 38; }
+    if (ch.epoch_from(2024, 13, 1, 0, 0, 0) != ch.TIME_ERR) { return 39; }
+    if (ch.epoch_from(2024, 1, 0, 0, 0, 0) != ch.TIME_ERR) { return 40; }
+    if (ch.epoch_from(2024, 1, 32, 0, 0, 0) != ch.TIME_ERR) { return 41; }
+    if (ch.epoch_from(2024, 4, 31, 0, 0, 0) != ch.TIME_ERR) { return 42; }   // April has 30
+    if (ch.epoch_from(2023, 2, 29, 0, 0, 0) != ch.TIME_ERR) { return 43; }
+    if (ch.epoch_from(2024, 1, 1, 24, 0, 0) != ch.TIME_ERR) { return 44; }
+    if (ch.epoch_from(2024, 1, 1, 0, 60, 0) != ch.TIME_ERR) { return 45; }
+    if (ch.epoch_from(2024, 1, 1, 0, 0, 61) != ch.TIME_ERR) { return 46; }
+    if (ch.epoch_from(0, 1, 1, 0, 0, 0) != ch.TIME_ERR) { return 47; }
+    // A leap second is folded, not rejected: it is a real timestamp.
+    if (ch.epoch_from(2016, 12, 31, 23, 59, 60) != ch.epoch_from(2016, 12, 31, 23, 59, 59)) { return 48; }
+
+    // --- ASN.1 UTCTime ----------------------------------------------------
+    if (ch.asn1_utctime("700101000000Z", 13) != 0) { return 49; }
+    if (ch.asn1_utctime("941106084937Z", 13) != 784111777) { return 50; }
+
+    // The pivot is 50, per RFC 5280 §4.1.2.5.1 — not 70, and not 69. Both
+    // sides of it, and the two extremes of the representable window.
+    if (ch.asn1_utctime("500101000000Z", 13) != 0 - 631152000) { return 51; }   // 1950
+    if (ch.asn1_utctime("491231235959Z", 13) != 2524607999) { return 52; }      // 2049
+    // The pair that pins the pivot: "49" is 2049 and "50" is 1950, so the
+    // LATER two-digit year is the EARLIER instant. Under a 70-pivot both would
+    // land in the 1900s and this ordering would reverse.
+    let is i64 as a49 = ch.asn1_utctime("490101000000Z", 13);
+    let is i64 as a50 = ch.asn1_utctime("500101000000Z", 13);
+    if (a49 < a50) { return 53; }
+
+    // Strictness: RFC 5280 forbids every one of these, and accepting any of
+    // them means reading a notAfter the CA did not write.
+    if (ch.asn1_utctime("7001010000Z", 11) != ch.TIME_ERR) { return 54; }        // no seconds
+    if (ch.asn1_utctime("700101000000", 12) != ch.TIME_ERR) { return 55; }       // no Z
+    if (ch.asn1_utctime("700101000000+0100", 17) != ch.TIME_ERR) { return 56; }  // offset
+    if (ch.asn1_utctime("70010100000.0Z", 14) != ch.TIME_ERR) { return 57; }     // fractional
+    if (ch.asn1_utctime("7O0101000000Z", 13) != ch.TIME_ERR) { return 58; }      // letter O
+    if (ch.asn1_utctime("701301000000Z", 13) != ch.TIME_ERR) { return 59; }      // month 13
+    if (ch.asn1_utctime("700230000000Z", 13) != ch.TIME_ERR) { return 60; }      // Feb 30
+
+    // Right length, wrong terminator. Without this the Z check can be deleted
+    // outright and every other case still passes, because they all fail on
+    // length first — which is how a "strict" parser quietly stops being one.
+    if (ch.asn1_utctime("700101000000X", 13) != ch.TIME_ERR) { return 102; }
+    if (ch.asn1_utctime("700101000000 ", 13) != ch.TIME_ERR) { return 103; }
+
+    // The declared length is authoritative, not the buffer. A DER field
+    // arrives as (pointer, length) carved out of a larger certificate, so a
+    // parser that reads to the buffer's own end instead of to `n` reads the
+    // bytes of whatever field comes next.
+    if (ch.asn1_utctime("941106084937Z", 12) != ch.TIME_ERR) { return 104; }
+    // And the other direction. A length test written as `n < 13` instead of
+    // `n != 13` passes every short case and silently accepts trailing bytes,
+    // so both sides of the bound need their own case.
+    if (ch.asn1_utctime("941106084937Z00", 15) != ch.TIME_ERR) { return 109; }
+
+    // --- ASN.1 GeneralizedTime --------------------------------------------
+    if (ch.asn1_gentime("19700101000000Z", 15) != 0) { return 61; }
+    if (ch.asn1_gentime("19941106084937Z", 15) != 784111777) { return 62; }
+    if (ch.asn1_gentime("20991231235959Z", 15) != 4102444799) { return 63; }
+    if (ch.asn1_gentime("21000229000000Z", 15) != ch.TIME_ERR) { return 64; }   // 2100 not leap
+    if (ch.asn1_gentime("1970010100000Z", 14) != ch.TIME_ERR) { return 65; }
+    if (ch.asn1_gentime("19700101000000", 14) != ch.TIME_ERR) { return 66; }
+    if (ch.asn1_gentime("197001010000Z", 13) != ch.TIME_ERR) { return 67; }
+
+    // Same two holes as UTCTime above: wrong terminator at the right offset,
+    // and a declared length that disagrees with the buffer in both directions.
+    if (ch.asn1_gentime("19700101000000X", 15) != ch.TIME_ERR) { return 105; }
+    if (ch.asn1_gentime("19700101000000Z", 14) != ch.TIME_ERR) { return 106; }
+    if (ch.asn1_gentime("19700101000000Z00", 17) != ch.TIME_ERR) { return 107; }
+    // Fractional seconds — legal ASN.1, forbidden by RFC 5280, and 17 bytes.
+    if (ch.asn1_gentime("19700101000000.5Z", 17) != ch.TIME_ERR) { return 108; }
+
+    // The two ASN.1 forms must agree on the same instant. They are chosen by
+    // the year, so a certificate near the boundary is read by one or the other
+    // and both must produce the same number.
+    if (ch.asn1_utctime("241106084937Z", 13) != ch.asn1_gentime("20241106084937Z", 15)) { return 68; }
+
+    // --- HTTP-date: RFC 7231 §7.1.1.1, all three forms, one instant --------
+    if (hd("Sun, 06 Nov 1994 08:49:37 GMT") != 784111777) { return 69; }
+    if (hd("Sunday, 06-Nov-94 08:49:37 GMT") != 784111777) { return 70; }
+    if (hd("Sun Nov  6 08:49:37 1994") != 784111777) { return 71; }
+
+    // asctime with a two-digit day, where the space padding is gone.
+    if (hd("Sun Nov 16 08:49:37 1994") != 784111777 + 10 * 86400) { return 72; }
+
+    // RFC 850's two-digit year pivots at 70 (RFC 6265 §5.1.1) — a DIFFERENT
+    // rule from ASN.1's 50. Getting these two crossed puts a cookie's expiry
+    // half a century out.
+    if (hd("Sun, 01-Jan-70 00:00:00 GMT") != 0) { return 73; }
+    if (hd("Sun, 01-Jan-69 00:00:00 GMT") != ch.epoch_from(2069, 1, 1, 0, 0, 0)) { return 74; }
+    if (hd("Sun, 01-Jan-99 00:00:00 GMT") != ch.epoch_from(1999, 1, 1, 0, 0, 0)) { return 75; }
+
+    // UTC is taken as GMT; anything else is refused rather than guessed at.
+    if (hd("Sun, 06 Nov 1994 08:49:37 UTC") != 784111777) { return 76; }
+    if (hd("Sun, 06 Nov 1994 08:49:37 EST") != ch.TIME_ERR) { return 77; }
+    if (hd("Sun, 06 Nov 1994 08:49:37 +0100") != ch.TIME_ERR) { return 78; }
+
+    // Malformed input must not parse into a plausible date.
+    if (hd("") != ch.TIME_ERR) { return 79; }
+    if (hd("garbage") != ch.TIME_ERR) { return 80; }
+    if (hd("Sun, 06 Xxx 1994 08:49:37 GMT") != ch.TIME_ERR) { return 81; }
+    if (hd("Sun, 32 Nov 1994 08:49:37 GMT") != ch.TIME_ERR) { return 82; }
+    if (hd("Sun, 06 Nov 1994 25:49:37 GMT") != ch.TIME_ERR) { return 83; }
+    if (hd("Sun, 06 Nov 1994 08-49-37 GMT") != ch.TIME_ERR) { return 84; }
+    if (hd("Sun, 06 Nov 1994 08:49:37 GM") != ch.TIME_ERR) { return 85; }   // truncated
+
+    // --- http_date_format --------------------------------------------------
+    let is [64]u8 as buf;
+    if (ch.http_date_format(784111777, cast(*u8, &buf), 64) != 29) { return 86; }
+    if (streq(cast(*u8, &buf), "Sun, 06 Nov 1994 08:49:37 GMT") == 0) { return 87; }
+
+    if (ch.http_date_format(0, cast(*u8, &buf), 64) != 29) { return 88; }
+    if (streq(cast(*u8, &buf), "Thu, 01 Jan 1970 00:00:00 GMT") == 0) { return 89; }
+
+    if (ch.http_date_format(1000000000, cast(*u8, &buf), 64) != 29) { return 90; }
+    if (streq(cast(*u8, &buf), "Sun, 09 Sep 2001 01:46:40 GMT") == 0) { return 91; }
+
+    // A buffer one byte short must refuse, not truncate: a half-written date
+    // is a date, and it would be a wrong one.
+    if (ch.http_date_format(0, cast(*u8, &buf), 29) != ch.TIME_ERR) { return 92; }
+    if (ch.http_date_format(0, cast(*u8, &buf), 30) != 29) { return 93; }
+
+    // --- format -> parse round trip ---------------------------------------
+    // Every ~19 days across 1970..2080, plus the exact instants above. This is
+    // the check that would catch a formatter and a parser that disagree on a
+    // field neither of the fixed cases happens to exercise.
+    let is i64 as t with mut = 0;
+    while (t < 3500000000) {
+        if (ch.http_date_format(t, cast(*u8, &buf), 64) != 29) { return 94; }
+        if (hd(cast(*u8, &buf)) != t) { return 95; }
+        t = t + 1666667;
+    }
+
+    // Before the epoch, where the division toward the day boundary and the
+    // weekday modulo both have to go the right way — truncating toward zero
+    // instead of flooring puts this one day late.
+    //
+    // This instant is also the documented TIME_ERR collision, so the parse
+    // below is asserting the value and not the success. It is the only second
+    // in history where those are the same thing.
+    if (ch.http_date_format(0 - 1, cast(*u8, &buf), 64) != 29) { return 96; }
+    if (streq(cast(*u8, &buf), "Wed, 31 Dec 1969 23:59:59 GMT") == 0) { return 97; }
+    if (hd(cast(*u8, &buf)) != 0 - 1) { return 98; }
+
+    // One day earlier, which is unambiguous, checks the same arithmetic.
+    if (ch.http_date_format(0 - 86400, cast(*u8, &buf), 64) != 29) { return 99; }
+    if (streq(cast(*u8, &buf), "Wed, 31 Dec 1969 00:00:00 GMT") == 0) { return 100; }
+    if (hd(cast(*u8, &buf)) != 0 - 86400) { return 101; }
+
+    return 0;
+}

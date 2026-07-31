@@ -1,0 +1,427 @@
+// =======================================================
+// caustic-net/core/chrono.cst
+// Calendar time: epoch <-> civil date, and the two date formats this library
+// has to read.
+//
+// The standard library has no calendar at all. time.unix_time() gives epoch
+// seconds and that is the whole of it — no gmtime, no broken-down time, no
+// month lengths, no leap-year rule. Two very distant parts of this library
+// need one anyway:
+//
+//   * X.509 notBefore/notAfter, as ASN.1 UTCTime or GeneralizedTime. Comparing
+//     a certificate's validity window against "now" is a security check, not a
+//     formatting nicety: get it wrong and an expired certificate is accepted.
+//   * HTTP-date, for a cookie's Expires and for Date / If-Modified-Since.
+//
+// So it is written once, here, and tested once — rather than twice, badly, in
+// tls/x509.cst and proto/cookie.cst.
+//
+// Errors: a parse returns TIME_ERR. That value is also a legal instant
+// (1969-12-31T23:59:59Z), which is a collision this library accepts on the
+// grounds that no certificate and no Expires header will ever carry it; the
+// alternative is an out-parameter on every call site for one unreachable
+// second.
+// =======================================================
+
+let is i64 as TIME_ERR with imut = 0 - 1;
+
+let is i64 as SEC_MIN  with imut = 60;
+let is i64 as SEC_HOUR with imut = 3600;
+let is i64 as SEC_DAY  with imut = 86400;
+
+// --- Civil <-> days ---------------------------------------------------
+//
+// Howard Hinnant's days_from_civil / civil_from_days, which are exact for the
+// proleptic Gregorian calendar over any range that fits in the integer type —
+// no lookup tables, no month-length array, and no special case for February.
+// The trick is shifting the year to start in March, which puts the leap day at
+// the END of the year where it perturbs nothing.
+//
+// Divisions here are on non-negative values only (the era shift guarantees it
+// for any year >= 1), so they do not depend on which way the language
+// truncates a negative quotient.
+
+// Days since 1970-01-01. Negative before it. y is a full year (1999, not 99).
+fn days_from_civil(y as i64, m as i64, d as i64) as i64 {
+    let is i64 as yy with mut = y;
+    if (m <= 2) { yy = yy - 1; }
+
+    let is i64 as era with mut = yy;
+    if (era < 0) { era = era - 399; }
+    era = era / 400;
+
+    let is i64 as yoe = yy - era * 400;              // [0, 399]
+
+    let is i64 as mp with mut = m;                   // March-based month
+    if (m > 2) { mp = mp - 3; } else { mp = mp + 9; }
+    let is i64 as doy = (153 * mp + 2) / 5 + d - 1;  // [0, 365]
+
+    let is i64 as doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;   // [0, 146096]
+    return era * 146097 + doe - 719468;
+}
+
+fn civil_from_days(z as i64, y as *i64, m as *i64, d as *i64) as void {
+    let is i64 as zz = z + 719468;
+
+    let is i64 as era with mut = zz;
+    if (era < 0) { era = era - 146096; }
+    era = era / 146097;
+
+    let is i64 as doe = zz - era * 146097;                                 // [0, 146096]
+    let is i64 as yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;   // [0, 399]
+    let is i64 as yy = yoe + era * 400;
+    let is i64 as doy = doe - (365 * yoe + yoe / 4 - yoe / 100);           // [0, 365]
+    let is i64 as mp = (5 * doy + 2) / 153;                                // [0, 11]
+
+    let is i64 as dd = doy - (153 * mp + 2) / 5 + 1;                       // [1, 31]
+    let is i64 as mm with mut = mp;
+    if (mp < 10) { mm = mm + 3; } else { mm = mm - 9; }                    // [1, 12]
+
+    let is i64 as fy with mut = yy;
+    if (mm <= 2) { fy = fy + 1; }
+
+    *y = fy;
+    *m = mm;
+    *d = dd;
+}
+
+fn is_leap(y as i64) as i64 {
+    if (y % 4 != 0) { return 0; }
+    if (y % 100 != 0) { return 1; }
+    if (y % 400 != 0) { return 0; }
+    return 1;
+}
+
+fn days_in_month(y as i64, m as i64) as i64 {
+    if (m == 1 || m == 3 || m == 5 || m == 7 || m == 8 || m == 10 || m == 12) { return 31; }
+    if (m == 4 || m == 6 || m == 9 || m == 11) { return 30; }
+    if (m == 2) {
+        if (is_leap(y) == 1) { return 29; }
+        return 28;
+    }
+    return 0;
+}
+
+// Day of week for a day count since the epoch: 0 = Sunday. 1970-01-01 was a
+// Thursday, hence the +4. The extra 7 keeps the operand non-negative for dates
+// before the epoch, where % would otherwise depend on the language's sign rule.
+fn weekday_from_days(z as i64) as i64 {
+    let is i64 as w with mut = (z + 4) % 7;
+    if (w < 0) { w = w + 7; }
+    return w;
+}
+
+// Seconds since the epoch, or TIME_ERR if the fields are not a real instant.
+// The range check is not decoration: an unvalidated month of 13 or day of 32
+// still produces a number, and that number would silently move a certificate's
+// expiry.
+fn epoch_from(y as i64, mo as i64, d as i64, h as i64, mi as i64, s as i64) as i64 {
+    if (y < 1 || y > 9999) { return TIME_ERR; }
+    if (mo < 1 || mo > 12) { return TIME_ERR; }
+    if (d < 1 || d > days_in_month(y, mo)) { return TIME_ERR; }
+    if (h < 0 || h > 23) { return TIME_ERR; }
+    if (mi < 0 || mi > 59) { return TIME_ERR; }
+    // 60 is a leap second. POSIX time has no room for one, and neither does
+    // any certificate; accepted and folded to :59 rather than rejected, since
+    // rejecting would turn a real timestamp into a validation failure.
+    if (s < 0 || s > 60) { return TIME_ERR; }
+    let is i64 as ss with mut = s;
+    if (ss == 60) { ss = 59; }
+
+    return days_from_civil(y, mo, d) * SEC_DAY + h * SEC_HOUR + mi * SEC_MIN + ss;
+}
+
+// --- Small text helpers -----------------------------------------------
+
+fn _is_digit(c as u8) as i64 {
+    if (c >= 48 && c <= 57) { return 1; }
+    return 0;
+}
+
+// n digits at p as an integer, or -1 if any of them is not a digit. Used
+// everywhere below, because "20xx" sliced out of a malformed field parses as a
+// plausible year if the non-digits are simply skipped.
+fn _num(p as *u8, n as i64) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (_is_digit(p[i]) == 0) { return 0 - 1; }
+        v = v * 10 + (cast(i64, p[i]) - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn _eq3(p as *u8, s as *u8) as i64 {
+    if (p[0] != s[0]) { return 0; }
+    if (p[1] != s[1]) { return 0; }
+    if (p[2] != s[2]) { return 0; }
+    return 1;
+}
+
+fn _month_from(p as *u8) as i64 {
+    if (_eq3(p, "Jan") == 1) { return 1; }
+    if (_eq3(p, "Feb") == 1) { return 2; }
+    if (_eq3(p, "Mar") == 1) { return 3; }
+    if (_eq3(p, "Apr") == 1) { return 4; }
+    if (_eq3(p, "May") == 1) { return 5; }
+    if (_eq3(p, "Jun") == 1) { return 6; }
+    if (_eq3(p, "Jul") == 1) { return 7; }
+    if (_eq3(p, "Aug") == 1) { return 8; }
+    if (_eq3(p, "Sep") == 1) { return 9; }
+    if (_eq3(p, "Oct") == 1) { return 10; }
+    if (_eq3(p, "Nov") == 1) { return 11; }
+    if (_eq3(p, "Dec") == 1) { return 12; }
+    return 0;
+}
+
+fn month_name(m as i64) as *u8 {
+    if (m == 1)  { return "Jan"; }
+    if (m == 2)  { return "Feb"; }
+    if (m == 3)  { return "Mar"; }
+    if (m == 4)  { return "Apr"; }
+    if (m == 5)  { return "May"; }
+    if (m == 6)  { return "Jun"; }
+    if (m == 7)  { return "Jul"; }
+    if (m == 8)  { return "Aug"; }
+    if (m == 9)  { return "Sep"; }
+    if (m == 10) { return "Oct"; }
+    if (m == 11) { return "Nov"; }
+    if (m == 12) { return "Dec"; }
+    return "???";
+}
+
+fn day_name(w as i64) as *u8 {
+    if (w == 0) { return "Sun"; }
+    if (w == 1) { return "Mon"; }
+    if (w == 2) { return "Tue"; }
+    if (w == 3) { return "Wed"; }
+    if (w == 4) { return "Thu"; }
+    if (w == 5) { return "Fri"; }
+    if (w == 6) { return "Sat"; }
+    return "???";
+}
+
+// --- ASN.1 times ------------------------------------------------------
+//
+// Both are parsed strictly, to RFC 5280 §4.1.2.5, and that strictness is the
+// point. The generic ASN.1 forms permit fractional seconds, an omitted seconds
+// field, and a +hhmm offset; a certificate is forbidden all three and must end
+// in Z. Accepting the loose forms here would mean a parser that reads a
+// notAfter one way while the CA that signed it meant another — and the whole
+// value of the field is that both sides read it identically.
+
+// "YYMMDDHHMMSSZ" — exactly 13 bytes.
+//
+// The two-digit year pivots at 50: 50..99 is 19xx, 00..49 is 20xx. Not at 70,
+// not at 69 — RFC 5280 §4.1.2.5.1 fixes it at 50, so this parser's window is
+// 1950..2049. Certificates outside it are required to use GeneralizedTime.
+fn asn1_utctime(p as *u8, n as i64) as i64 {
+    if (n != 13) { return TIME_ERR; }
+    if (p[12] != cast(u8, 90)) { return TIME_ERR; }          // 'Z'
+
+    let is i64 as yy = _num(p, 2);
+    if (yy < 0) { return TIME_ERR; }
+    let is i64 as y with mut = 2000 + yy;
+    if (yy >= 50) { y = 1900 + yy; }
+
+    let is i64 as mo = _num(cast(*u8, cast(i64, p) + 2), 2);
+    let is i64 as d  = _num(cast(*u8, cast(i64, p) + 4), 2);
+    let is i64 as h  = _num(cast(*u8, cast(i64, p) + 6), 2);
+    let is i64 as mi = _num(cast(*u8, cast(i64, p) + 8), 2);
+    let is i64 as s  = _num(cast(*u8, cast(i64, p) + 10), 2);
+    if (mo < 0 || d < 0 || h < 0 || mi < 0 || s < 0) { return TIME_ERR; }
+
+    return epoch_from(y, mo, d, h, mi, s);
+}
+
+// "YYYYMMDDHHMMSSZ" — exactly 15 bytes.
+fn asn1_gentime(p as *u8, n as i64) as i64 {
+    if (n != 15) { return TIME_ERR; }
+    if (p[14] != cast(u8, 90)) { return TIME_ERR; }          // 'Z'
+
+    let is i64 as y  = _num(p, 4);
+    let is i64 as mo = _num(cast(*u8, cast(i64, p) + 4), 2);
+    let is i64 as d  = _num(cast(*u8, cast(i64, p) + 6), 2);
+    let is i64 as h  = _num(cast(*u8, cast(i64, p) + 8), 2);
+    let is i64 as mi = _num(cast(*u8, cast(i64, p) + 10), 2);
+    let is i64 as s  = _num(cast(*u8, cast(i64, p) + 12), 2);
+    if (y < 0 || mo < 0 || d < 0 || h < 0 || mi < 0 || s < 0) { return TIME_ERR; }
+
+    return epoch_from(y, mo, d, h, mi, s);
+}
+
+// --- HTTP-date --------------------------------------------------------
+//
+// RFC 7231 §7.1.1.1 requires a sender to emit IMF-fixdate and a recipient to
+// accept all three historical forms:
+//
+//   IMF-fixdate  Sun, 06 Nov 1994 08:49:37 GMT      (29 bytes, fixed)
+//   RFC 850      Sunday, 06-Nov-94 08:49:37 GMT     (two-digit year)
+//   asctime      Sun Nov  6 08:49:37 1994           (day may be space-padded)
+//
+// Only the last two are ambiguous. asctime carries no zone at all and is
+// defined to be GMT here; RFC 850's two-digit year pivots per RFC 6265 §5.1.1,
+// which is a DIFFERENT rule from ASN.1's: 00..69 is 20xx, 70..99 is 19xx. A
+// cookie is the only thing that still emits this form, so the cookie rule is
+// the right one.
+
+fn _http_year2(yy as i64) as i64 {
+    if (yy >= 70) { return 1900 + yy; }
+    return 2000 + yy;
+}
+
+// "HH:MM:SS" at p. Returns seconds-of-day, or -1.
+fn _hms(p as *u8) as i64 {
+    let is i64 as h  = _num(p, 2);
+    let is i64 as mi = _num(cast(*u8, cast(i64, p) + 3), 2);
+    let is i64 as s  = _num(cast(*u8, cast(i64, p) + 6), 2);
+    if (h < 0 || mi < 0 || s < 0) { return 0 - 1; }
+    if (p[2] != cast(u8, 58) || p[5] != cast(u8, 58)) { return 0 - 1; }   // ':'
+    if (h > 23 || mi > 59 || s > 60) { return 0 - 1; }
+    let is i64 as ss with mut = s;
+    if (ss == 60) { ss = 59; }
+    return h * SEC_HOUR + mi * SEC_MIN + ss;
+}
+
+// RFC 7231 says the zone is the literal "GMT". UTC is accepted as the same
+// instant because senders emit it; a numeric offset is not, because applying
+// one silently would mean this parser and the server disagree about when a
+// cookie dies, and refusing means the caller treats it as a session cookie —
+// the safe direction to be wrong in.
+fn _zone_ok(p as *u8) as i64 {
+    if (_eq3(p, "GMT") == 1) { return 1; }
+    if (_eq3(p, "UTC") == 1) { return 1; }
+    return 0;
+}
+
+// Offset of the first comma in the first `lim` bytes, or -1.
+fn _comma(p as *u8, lim as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < lim) {
+        if (p[i] == cast(u8, 44)) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn http_date_parse(p as *u8, n as i64) as i64 {
+    if (n < 24) { return TIME_ERR; }
+
+    let is i64 as c = _comma(p, n);
+
+    if (c < 0) {
+        // asctime: "Sun Nov  6 08:49:37 1994" — 24 bytes, day right-aligned in
+        // two columns, so a single-digit day arrives as a leading space.
+        if (n != 24) { return TIME_ERR; }
+        let is i64 as mo = _month_from(cast(*u8, cast(i64, p) + 4));
+        if (mo == 0) { return TIME_ERR; }
+        let is i64 as d with mut = 0;
+        if (p[8] == cast(u8, 32)) { d = _num(cast(*u8, cast(i64, p) + 9), 1); }
+        else { d = _num(cast(*u8, cast(i64, p) + 8), 2); }
+        if (d < 0) { return TIME_ERR; }
+        let is i64 as tod = _hms(cast(*u8, cast(i64, p) + 11));
+        if (tod < 0) { return TIME_ERR; }
+        let is i64 as y = _num(cast(*u8, cast(i64, p) + 20), 4);
+        if (y < 0) { return TIME_ERR; }
+        let is i64 as base = epoch_from(y, mo, d, 0, 0, 0);
+        if (base == TIME_ERR) { return TIME_ERR; }
+        return base + tod;
+    }
+
+    // Both comma forms put the date immediately after ", ".
+    let is i64 as q = c + 2;
+    if (c + 1 >= n) { return TIME_ERR; }
+    if (p[c + 1] != cast(u8, 32)) { return TIME_ERR; }
+    if (q + 18 > n) { return TIME_ERR; }
+
+    let is *u8 as r = cast(*u8, cast(i64, p) + q);
+
+    // IMF-fixdate has "06 Nov 1994"; RFC 850 has "06-Nov-94". The separator at
+    // offset 2 is what tells them apart, and it is the only difference that
+    // matters — everything else lines up.
+    let is i64 as d = _num(r, 2);
+    if (d < 0) { return TIME_ERR; }
+
+    if (r[2] == cast(u8, 32)) {
+        // "06 Nov 1994 08:49:37 GMT" — 24 bytes from r.
+        if (q + 24 > n) { return TIME_ERR; }
+        let is i64 as mo = _month_from(cast(*u8, cast(i64, r) + 3));
+        if (mo == 0) { return TIME_ERR; }
+        if (r[6] != cast(u8, 32)) { return TIME_ERR; }
+        let is i64 as y = _num(cast(*u8, cast(i64, r) + 7), 4);
+        if (y < 0) { return TIME_ERR; }
+        if (r[11] != cast(u8, 32)) { return TIME_ERR; }
+        let is i64 as tod = _hms(cast(*u8, cast(i64, r) + 12));
+        if (tod < 0) { return TIME_ERR; }
+        if (r[20] != cast(u8, 32)) { return TIME_ERR; }
+        if (_zone_ok(cast(*u8, cast(i64, r) + 21)) == 0) { return TIME_ERR; }
+        let is i64 as base = epoch_from(y, mo, d, 0, 0, 0);
+        if (base == TIME_ERR) { return TIME_ERR; }
+        return base + tod;
+    }
+
+    if (r[2] == cast(u8, 45)) {                                   // '-'
+        // "06-Nov-94 08:49:37 GMT" — 22 bytes from r.
+        if (q + 22 > n) { return TIME_ERR; }
+        let is i64 as mo = _month_from(cast(*u8, cast(i64, r) + 3));
+        if (mo == 0) { return TIME_ERR; }
+        if (r[6] != cast(u8, 45)) { return TIME_ERR; }
+        let is i64 as yy = _num(cast(*u8, cast(i64, r) + 7), 2);
+        if (yy < 0) { return TIME_ERR; }
+        if (r[9] != cast(u8, 32)) { return TIME_ERR; }
+        let is i64 as tod = _hms(cast(*u8, cast(i64, r) + 10));
+        if (tod < 0) { return TIME_ERR; }
+        if (r[18] != cast(u8, 32)) { return TIME_ERR; }
+        if (_zone_ok(cast(*u8, cast(i64, r) + 19)) == 0) { return TIME_ERR; }
+        let is i64 as base = epoch_from(_http_year2(yy), mo, d, 0, 0, 0);
+        if (base == TIME_ERR) { return TIME_ERR; }
+        return base + tod;
+    }
+
+    return TIME_ERR;
+}
+
+fn _put2(out as *u8, at as i64, v as i64) as void {
+    out[at] = cast(u8, 48 + (v / 10) % 10);
+    out[at + 1] = cast(u8, 48 + v % 10);
+}
+
+// IMF-fixdate, the only form a sender may emit. Writes 29 bytes plus a NUL, so
+// `max` must be at least 30. Returns the length written, or TIME_ERR.
+fn http_date_format(epoch as i64, out as *u8, max as i64) as i64 {
+    if (max < 30) { return TIME_ERR; }
+
+    // Floor-divide toward negative infinity, so an instant before the epoch
+    // lands on the right day rather than the one after it.
+    let is i64 as days with mut = epoch / SEC_DAY;
+    let is i64 as tod with mut = epoch - days * SEC_DAY;
+    if (tod < 0) { days = days - 1; tod = tod + SEC_DAY; }
+
+    let is i64 as y with mut = 0;
+    let is i64 as mo with mut = 0;
+    let is i64 as d with mut = 0;
+    civil_from_days(days, &y, &mo, &d);
+    if (y < 1 || y > 9999) { return TIME_ERR; }
+
+    let is *u8 as dn = day_name(weekday_from_days(days));
+    out[0] = dn[0]; out[1] = dn[1]; out[2] = dn[2];
+    out[3] = cast(u8, 44); out[4] = cast(u8, 32);            // ", "
+    _put2(out, 5, d);
+    out[7] = cast(u8, 32);
+    let is *u8 as mn = month_name(mo);
+    out[8] = mn[0]; out[9] = mn[1]; out[10] = mn[2];
+    out[11] = cast(u8, 32);
+    _put2(out, 12, y / 100);
+    _put2(out, 14, y % 100);
+    out[16] = cast(u8, 32);
+    _put2(out, 17, tod / SEC_HOUR);
+    out[19] = cast(u8, 58);
+    _put2(out, 20, (tod / SEC_MIN) % 60);
+    out[22] = cast(u8, 58);
+    _put2(out, 23, tod % 60);
+    out[25] = cast(u8, 32);
+    out[26] = cast(u8, 71); out[27] = cast(u8, 77); out[28] = cast(u8, 84);   // "GMT"
+    out[29] = cast(u8, 0);
+    return 29;
+}

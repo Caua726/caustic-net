@@ -1,0 +1,349 @@
+// =======================================================
+// tests/test_dns.cst — proto/dns.cst
+//
+// Two live captures and fifteen hostile packets.
+//
+// The captures are real datagrams off 1.1.1.1, embedded byte for byte, so the
+// decoder is measured against what a resolver actually sends rather than
+// against what this repository's own encoder produces. www.github.com is the
+// valuable one: a CNAME chain whose RDATA is itself a compression pointer, so
+// following it exercises the name decoder from inside a record.
+//
+// The hostile packets are the point of the file. A resolver parses
+// attacker-chosen bytes off a connectionless socket, and every one of these is
+// a packet a real one has to survive. P_CYCLE especially — see below.
+//
+// Exit 0 = all pass. Non-zero = the numbered check that failed.
+// =======================================================
+
+use "../proto/dns.cst" as dns;
+
+// ===== live captures ==================================================
+
+// example.com A, from 1.1.1.1. Two A records, both TTL 68.
+let is *u8 as R_EXAMPLE with imut = "\x12\x34\x81\x80\x00\x01\x00\x02\x00\x00\x00\x00\x07\x65\x78\x61\x6d\x70\x6c\x65\x03\x63\x6f\x6d\x00\x00\x01\x00\x01\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x44\x00\x04\xac\x42\x93\xf3\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x44\x00\x04\x68\x14\x17\x9a";
+let is i64 as R_EXAMPLE_N with imut = 61;
+
+// www.github.com A, from 1.1.1.1. CNAME -> github.com -> A, and the CNAME's
+// RDATA is a pointer (\xc0\x10) rather than a literal name.
+let is *u8 as R_CNAME with imut = "\x56\x78\x81\x80\x00\x01\x00\x02\x00\x00\x00\x00\x03\x77\x77\x77\x06\x67\x69\x74\x68\x75\x62\x03\x63\x6f\x6d\x00\x00\x01\x00\x01\xc0\x0c\x00\x05\x00\x01\x00\x00\x0d\xc1\x00\x02\xc0\x10\xc0\x10\x00\x01\x00\x01\x00\x00\x00\x2d\x00\x04\x04\xe4\x1f\x96";
+let is i64 as R_CNAME_N with imut = 62;
+
+// What dns_encode_query must produce for example.com A with ID 0x1234.
+let is *u8 as Q_EXAMPLE with imut = "\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07\x65\x78\x61\x6d\x70\x6c\x65\x03\x63\x6f\x6d\x00\x00\x01\x00\x01";
+let is i64 as Q_EXAMPLE_N with imut = 29;
+
+// ===== hostile packets ================================================
+
+// A name that is a pointer to itself.
+let is *u8 as P_SELF with imut = "\x12\x34\x81\x80\x00\x01\x00\x00\x00\x00\x00\x00\xc0\x0c";
+let is i64 as P_SELF_N with imut = 14;
+
+// Two pointers aimed at each other.
+let is *u8 as P_MUTUAL with imut = "\x12\x34\x81\x80\x00\x01\x00\x00\x00\x00\x00\x00\xc0\x10\x00\x00\xc0\x0c";
+let is i64 as P_MUTUAL_N with imut = 18;
+
+// THE ONE THAT MATTERS.
+//
+// Every pointer here targets an offset strictly BELOW its own position — the
+// rule most implementations use. Walk it:
+//
+//     read from 50 -> pointer at 50 targets 30            (30 < 50)
+//     from 30, read forward -> pointer at 35 targets 20   (20 < 35)
+//     from 20, read forward -> pointer at 40 targets 30   (30 < 40)
+//     ...and 30 is where we already were.
+//
+// The target sequence is 30, 20, 30, 20, forever, and each revolution emits a
+// label. Verified by mutation, in three stages:
+//
+//   * usual rule, jump cap and name cap removed  -> SIGSEGV, writing forever
+//   * usual rule, jump cap removed               -> stopped by the 255 cap
+//   * usual rule                                 -> stopped by the jump cap
+//
+// So this packet does not isolate the strictly-decreasing rule; what it proves
+// is that the walk is genuinely unbounded and that three limits are covering
+// each other. The decreasing rule's contribution is rejecting it at the first
+// repeat rather than after ten revolutions of writing into the caller's buffer.
+let is *u8 as P_CYCLE with imut = "\x12\x34\x81\x80\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x13\x7a\x7a\x7a\x7a\x7a\x7a\x7a\x7a\x7a\x04\x79\x79\x79\x79\xc0\x14\x7a\x7a\x7a\xc0\x1e\x00\x00\x00\x00\x00\x00\x00\x00\xc0\x1e";
+let is i64 as P_CYCLE_N with imut = 52;
+let is i64 as P_CYCLE_AT with imut = 50;
+
+// A pointer aimed forward.
+let is *u8 as P_FWD with imut = "\x12\x34\x81\x80\x00\x01\x00\x00\x00\x00\x00\x00\xc0\x20\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+let is i64 as P_FWD_N with imut = 34;
+
+// A length byte with the reserved 0b10 prefix.
+let is *u8 as P_RESERVED with imut = "\x12\x34\x81\x80\x00\x01\x00\x00\x00\x00\x00\x00\x80\x00";
+let is i64 as P_RESERVED_N with imut = 14;
+
+// A label claiming 20 bytes with 3 left in the datagram.
+let is *u8 as P_OVERRUN with imut = "\x12\x34\x81\x80\x00\x01\x00\x00\x00\x00\x00\x00\x14\x61\x62\x63";
+let is i64 as P_OVERRUN_N with imut = 16;
+
+// Five labels of 63: 319 characters decompressed, past the 255 limit.
+let is *u8 as P_LONGINLINE with imut = "\x12\x34\x81\x80\x00\x01\x00\x00\x00\x00\x00\x00\x3f\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x3f\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x3f\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x3f\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x3f\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x78\x00";
+let is i64 as P_LONGINLINE_N with imut = 333;
+
+// Twelve 20-byte labels chained by pointers: 251 characters, which is LEGAL.
+// Here to prove the loop guard does not reject legitimate deep compression —
+// a guard that rejects everything is not a guard, it is an outage.
+let is *u8 as P_LONGPTR with imut = "\x12\x34\x81\x80\x00\x01\x00\x00\x00\x00\x00\x00\x14\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x00\x00\x14\x62\x62\x62\x62\x62\x62\x62\x62\x62\x62\x62\x62\x62\x62\x62\x62\x62\x62\x62\x62\xc0\x0c\x14\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\x63\xc0\x23\x14\x64\x64\x64\x64\x64\x64\x64\x64\x64\x64\x64\x64\x64\x64\x64\x64\x64\x64\x64\x64\xc0\x3a\x14\x65\x65\x65\x65\x65\x65\x65\x65\x65\x65\x65\x65\x65\x65\x65\x65\x65\x65\x65\x65\xc0\x51\x14\x66\x66\x66\x66\x66\x66\x66\x66\x66\x66\x66\x66\x66\x66\x66\x66\x66\x66\x66\x66\xc0\x68\x14\x67\x67\x67\x67\x67\x67\x67\x67\x67\x67\x67\x67\x67\x67\x67\x67\x67\x67\x67\x67\xc0\x7f\x14\x68\x68\x68\x68\x68\x68\x68\x68\x68\x68\x68\x68\x68\x68\x68\x68\x68\x68\x68\x68\xc0\x96\x14\x69\x69\x69\x69\x69\x69\x69\x69\x69\x69\x69\x69\x69\x69\x69\x69\x69\x69\x69\x69\xc0\xad\x14\x6a\x6a\x6a\x6a\x6a\x6a\x6a\x6a\x6a\x6a\x6a\x6a\x6a\x6a\x6a\x6a\x6a\x6a\x6a\x6a\xc0\xc4\x14\x6b\x6b\x6b\x6b\x6b\x6b\x6b\x6b\x6b\x6b\x6b\x6b\x6b\x6b\x6b\x6b\x6b\x6b\x6b\x6b\xc0\xdb\x14\x6c\x6c\x6c\x6c\x6c\x6c\x6c\x6c\x6c\x6c\x6c\x6c\x6c\x6c\x6c\x6c\x6c\x6c\x6c\x6c\xc0\xf2";
+let is i64 as P_LONGPTR_N with imut = 288;
+let is i64 as P_LONGPTR_AT with imut = 265;
+
+// RDLENGTH says 100; four bytes remain.
+let is *u8 as P_RDOVER with imut = "\x12\x34\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00\x01\x61\x03\x63\x6f\x6d\x00\x00\x01\x00\x01\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x64\x01\x02\x03\x04";
+let is i64 as P_RDOVER_N with imut = 39;
+
+let is *u8 as P_TRUNC with imut = "\x12\x34\x83\x80\x00\x01\x00\x00\x00\x00\x00\x00\x01\x61\x03\x63\x6f\x6d\x00\x00\x01\x00\x01";
+let is i64 as P_TRUNC_N with imut = 23;
+
+let is *u8 as P_NXDOMAIN with imut = "\x12\x34\x81\x83\x00\x01\x00\x00\x00\x00\x00\x00\x04\x6e\x6f\x70\x65\x07\x65\x78\x61\x6d\x70\x6c\x65\x00\x00\x01\x00\x01";
+let is i64 as P_NXDOMAIN_N with imut = 30;
+
+let is *u8 as P_SERVFAIL with imut = "\x12\x34\x81\x82\x00\x01\x00\x00\x00\x00\x00\x00\x01\x61\x03\x63\x6f\x6d\x00\x00\x01\x00\x01";
+let is i64 as P_SERVFAIL_N with imut = 23;
+
+let is *u8 as P_TWOQ with imut = "\x12\x34\x81\x80\x00\x02\x00\x00\x00\x00\x00\x00\x01\x61\x03\x63\x6f\x6d\x00\x00\x01\x00\x01\x01\x62\x03\x63\x6f\x6d\x00\x00\x01\x00\x01";
+let is i64 as P_TWOQ_N with imut = 34;
+
+let is *u8 as P_SHORT with imut = "\x12\x34\x81\x80\x00\x01\x00\x00";
+let is i64 as P_SHORT_N with imut = 8;
+
+// An A record whose RDATA is five bytes.
+let is *u8 as P_BADA with imut = "\x12\x34\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00\x01\x61\x03\x63\x6f\x6d\x00\x00\x01\x00\x01\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x05\x01\x02\x03\x04\x05";
+let is i64 as P_BADA_N with imut = 40;
+
+// a.com CNAME b.com CNAME a.com — the compression cycle one level up.
+let is *u8 as P_CNAMELOOP with imut = "\x12\x34\x81\x80\x00\x01\x00\x02\x00\x00\x00\x00\x01\x61\x03\x63\x6f\x6d\x00\x00\x01\x00\x01\xc0\x0c\x00\x05\x00\x01\x00\x00\x00\x3c\x00\x07\x01\x62\x03\x63\x6f\x6d\x00\xc0\x23\x00\x05\x00\x01\x00\x00\x00\x3c\x00\x02\xc0\x0c";
+let is i64 as P_CNAMELOOP_N with imut = 56;
+
+// ===== helpers ========================================================
+
+fn streq(a as *u8, b as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (a[i] != 0 && b[i] != 0) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    if (a[i] != b[i]) { return 0; }
+    return 1;
+}
+
+fn slen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+// Read the name at `off` and hand back the result length. A negative return is
+// the error, which is what most of the checks below are actually asserting.
+fn nread(buf as *u8, len as i64, off as i64, out as *u8) as i64 {
+    return dns.dns_name_read(buf, len, off, out, 256, cast(*i64, 0));
+}
+
+fn main() as i32 {
+    let is [256]u8 as nm;
+    let is [512]u8 as enc;
+
+    // dns.cst declares its scratch buffers as the literal 256 rather than
+    // [MAX_TEXT]u8 — see the note there. The compiler bug that forced it is
+    // fixed upstream but not in a release, and CI builds against the release,
+    // so the literal stays until one ships. This pins it to the constant so
+    // the two cannot drift apart while they are spelled separately.
+    if (sizeof([256]u8) != dns.MAX_TEXT) { return 200; }
+    if (sizeof([256]u8) != 256) { return 201; }
+
+    // ===== the encoder ================================================
+    // Byte for byte against a query built by an independent implementation.
+    let is i64 as qn = dns.dns_encode_query("example.com", dns.T_A, 0x1234,
+                                            cast(*u8, &enc), 512);
+    if (qn != Q_EXAMPLE_N) { return 1; }
+    let is i64 as i with mut = 0;
+    while (i < qn) {
+        if (enc[i] != Q_EXAMPLE[i]) { return 2; }
+        i = i + 1;
+    }
+
+    // The name encoder on its own.
+    if (dns.dns_encode_name("a.com", cast(*u8, &enc), 512) != 7) { return 3; }
+    if (enc[0] != cast(u8, 1)) { return 4; }
+    if (enc[1] != cast(u8, 97)) { return 5; }
+    if (enc[2] != cast(u8, 3)) { return 6; }
+    if (enc[6] != cast(u8, 0)) { return 7; }
+    // A trailing dot is the fully-qualified form and encodes identically.
+    if (dns.dns_encode_name("a.com.", cast(*u8, &enc), 512) != 7) { return 8; }
+    // The root.
+    if (dns.dns_encode_name(".", cast(*u8, &enc), 512) != 1) { return 9; }
+
+    // An empty label would encode a zero byte, which is the end-of-name
+    // marker: "a..b" would go out as a query for "a".
+    if (dns.dns_encode_name("a..b", cast(*u8, &enc), 512) != dns.DNS_ERR_NAME) { return 10; }
+    if (dns.dns_encode_name("", cast(*u8, &enc), 512) != dns.DNS_ERR_NAME) { return 11; }
+    if (dns.dns_encode_name(".a", cast(*u8, &enc), 512) != dns.DNS_ERR_NAME) { return 12; }
+    // A label of 64 is one past the limit.
+    if (dns.dns_encode_name("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.com",
+                            cast(*u8, &enc), 512) != dns.DNS_ERR_NAME) { return 13; }
+    // ...and 63 is not.
+    if (dns.dns_encode_name("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.com",
+                            cast(*u8, &enc), 512) != 69) { return 14; }
+    // The caller's buffer is respected.
+    if (dns.dns_encode_name("a.com", cast(*u8, &enc), 4) != dns.DNS_ERR_SPACE) { return 15; }
+    if (dns.dns_encode_query("a.com", dns.T_A, 1, cast(*u8, &enc), 10) != dns.DNS_ERR_SPACE) { return 16; }
+
+    // ===== the live example.com capture ===============================
+    let is dns.DnsMsg as m;
+    if (dns.dns_parse(R_EXAMPLE, R_EXAMPLE_N, &m) != 0) { return 17; }
+    if (m.id != 0x1234) { return 18; }
+    if (m.qd != 1) { return 19; }
+    if (m.an != 2) { return 20; }
+    if (m.rcode != dns.RC_NOERROR) { return 21; }
+    if (m.tc != 0) { return 22; }
+    if (m.ra != 1) { return 23; }
+    if (m.an_off != 29) { return 24; }
+
+    if (nread(R_EXAMPLE, R_EXAMPLE_N, m.q_off, cast(*u8, &nm)) != 11) { return 25; }
+    if (streq(cast(*u8, &nm), "example.com") == 0) { return 26; }
+    if (dns.dns_check_question(&m, "example.com", dns.T_A) != 1) { return 27; }
+    // Case-insensitive, as DNS names are.
+    if (dns.dns_check_question(&m, "EXAMPLE.COM", dns.T_A) != 1) { return 28; }
+    // ...but not a different name or type.
+    if (dns.dns_check_question(&m, "example.org", dns.T_A) != 0) { return 29; }
+    if (dns.dns_check_question(&m, "example.com", dns.T_AAAA) != 0) { return 30; }
+
+    // Walk the answer section.
+    let is dns.DnsRR as rr;
+    let is i64 as cur with mut = 0;
+    if (dns.dns_answer_next(&m, &cur, &rr) != 1) { return 31; }
+    if (rr.rtype != dns.T_A) { return 32; }
+    if (rr.rclass != dns.C_IN) { return 33; }
+    if (rr.ttl != 68) { return 34; }
+    if (rr.rd_len != 4) { return 35; }
+    // The RR's name is a compression pointer back to the question.
+    if (dns.dns_name_eq(R_EXAMPLE, R_EXAMPLE_N, rr.name_off, "example.com") != 1) { return 36; }
+    if (dns.dns_answer_next(&m, &cur, &rr) != 1) { return 37; }
+    if (rr.rtype != dns.T_A) { return 38; }
+    // Exactly two, then done — the count comes from the header and must not
+    // run the walk off the end of the datagram.
+    if (dns.dns_answer_next(&m, &cur, &rr) != 0) { return 39; }
+
+    let is [16]u8 as addr;
+    let is i64 as ttl with mut = 0;
+    if (dns.dns_addr_of(&m, "example.com", cast(*u8, &addr), 0, &ttl) != 4) { return 40; }
+    if (addr[0] != cast(u8, 172)) { return 41; }
+    if (addr[1] != cast(u8, 66)) { return 42; }
+    if (addr[2] != cast(u8, 147)) { return 43; }
+    if (addr[3] != cast(u8, 243)) { return 44; }
+    if (ttl != 68) { return 45; }
+    // No AAAA in this reply.
+    if (dns.dns_addr_of(&m, "example.com", cast(*u8, &addr), 1, &ttl) != dns.DNS_ERR_NODATA) { return 46; }
+    // A name that is not in the reply at all.
+    if (dns.dns_addr_of(&m, "elsewhere.com", cast(*u8, &addr), 0, &ttl) != dns.DNS_ERR_NODATA) { return 47; }
+
+    // ===== the CNAME chain ============================================
+    if (dns.dns_parse(R_CNAME, R_CNAME_N, &m) != 0) { return 48; }
+    if (m.id != 0x5678) { return 49; }
+    if (m.an != 2) { return 50; }
+
+    cur = 0;
+    if (dns.dns_answer_next(&m, &cur, &rr) != 1) { return 51; }
+    if (rr.rtype != dns.T_CNAME) { return 52; }
+    if (rr.ttl != 3521) { return 53; }
+    // The CNAME's RDATA is itself a pointer — decoding it means running the
+    // name reader from inside a record rather than from the question.
+    if (nread(R_CNAME, R_CNAME_N, rr.rd_off, cast(*u8, &nm)) != 10) { return 54; }
+    if (streq(cast(*u8, &nm), "github.com") == 0) { return 55; }
+
+    if (dns.dns_answer_next(&m, &cur, &rr) != 1) { return 56; }
+    if (rr.rtype != dns.T_A) { return 57; }
+    if (rr.ttl != 45) { return 58; }
+
+    // Follow the chain end to end.
+    ttl = 0;
+    if (dns.dns_addr_of(&m, "www.github.com", cast(*u8, &addr), 0, &ttl) != 4) { return 59; }
+    if (addr[0] != cast(u8, 4)) { return 60; }
+    if (addr[1] != cast(u8, 228)) { return 61; }
+    if (addr[2] != cast(u8, 31)) { return 62; }
+    if (addr[3] != cast(u8, 150)) { return 63; }
+    // The smallest TTL along the chain is what the cache has to honour: the
+    // CNAME's 3521 does not license keeping the address for an hour.
+    if (ttl != 45) { return 64; }
+
+    // ===== compression pointer attacks ================================
+    // Every one of these must return, and return an error. A test that hangs
+    // here has found the bug.
+    if (nread(P_SELF, P_SELF_N, 12, cast(*u8, &nm)) != dns.DNS_ERR_LOOP) { return 65; }
+    if (nread(P_MUTUAL, P_MUTUAL_N, 12, cast(*u8, &nm)) != dns.DNS_ERR_LOOP) { return 66; }
+    if (nread(P_FWD, P_FWD_N, 12, cast(*u8, &nm)) != dns.DNS_ERR_LOOP) { return 67; }
+
+    // The one that defeats "target < my own offset".
+    if (nread(P_CYCLE, P_CYCLE_N, P_CYCLE_AT, cast(*u8, &nm)) != dns.DNS_ERR_LOOP) { return 68; }
+
+    // Reserved length-byte prefixes.
+    if (nread(P_RESERVED, P_RESERVED_N, 12, cast(*u8, &nm)) != dns.DNS_ERR_FORMAT) { return 69; }
+    // A label running past the datagram.
+    if (nread(P_OVERRUN, P_OVERRUN_N, 12, cast(*u8, &nm)) != dns.DNS_ERR_FORMAT) { return 70; }
+    // Past the 255-byte name limit.
+    if (nread(P_LONGINLINE, P_LONGINLINE_N, 12, cast(*u8, &nm)) != dns.DNS_ERR_NAME) { return 71; }
+
+    // Deep but legal compression still decodes: 12 labels of 20 plus 11 dots.
+    if (nread(P_LONGPTR, P_LONGPTR_N, P_LONGPTR_AT, cast(*u8, &nm)) != 251) { return 72; }
+    if (nm[0] != cast(u8, 108)) { return 73; }      // 'l', the tail block
+    if (nm[250] != cast(u8, 97)) { return 74; }     // 'a', the head block
+
+    // A caller buffer smaller than the name is refused, not overrun.
+    if (dns.dns_name_read(P_LONGPTR, P_LONGPTR_N, P_LONGPTR_AT,
+                          cast(*u8, &nm), 64, cast(*i64, 0)) != dns.DNS_ERR_SPACE) { return 75; }
+
+    // An offset outside the datagram.
+    if (nread(P_SELF, P_SELF_N, 900, cast(*u8, &nm)) != dns.DNS_ERR_FORMAT) { return 76; }
+    if (nread(P_SELF, P_SELF_N, 0 - 1, cast(*u8, &nm)) != dns.DNS_ERR_FORMAT) { return 77; }
+
+    // ===== malformed messages =========================================
+    if (dns.dns_parse(P_SHORT, P_SHORT_N, &m) != dns.DNS_ERR_FORMAT) { return 78; }
+    if (dns.dns_parse(P_TWOQ, P_TWOQ_N, &m) != dns.DNS_ERR_FORMAT) { return 79; }
+
+    // RDLENGTH past the end. dns_parse only walks the question, so this
+    // surfaces when the answer is read — which is the moment it would have
+    // been a read of someone else's memory.
+    if (dns.dns_parse(P_RDOVER, P_RDOVER_N, &m) != 0) { return 80; }
+    cur = 0;
+    if (dns.dns_answer_next(&m, &cur, &rr) != dns.DNS_ERR_FORMAT) { return 81; }
+
+    // An A record with five bytes of address.
+    if (dns.dns_parse(P_BADA, P_BADA_N, &m) != 0) { return 82; }
+    if (dns.dns_addr_of(&m, "a.com", cast(*u8, &addr), 0, &ttl) != dns.DNS_ERR_FORMAT) { return 83; }
+
+    // ===== flags and rcodes ===========================================
+    if (dns.dns_parse(P_TRUNC, P_TRUNC_N, &m) != 0) { return 84; }
+    if (m.tc != 1) { return 85; }        // the resolver's cue to retry over TCP
+
+    if (dns.dns_parse(P_NXDOMAIN, P_NXDOMAIN_N, &m) != 0) { return 86; }
+    if (m.rcode != dns.RC_NXDOMAIN) { return 87; }
+    if (dns.dns_addr_of(&m, "nope.example", cast(*u8, &addr), 0, &ttl) != dns.DNS_ERR_NXDOMAIN) { return 88; }
+
+    if (dns.dns_parse(P_SERVFAIL, P_SERVFAIL_N, &m) != 0) { return 89; }
+    if (m.rcode != dns.RC_SERVFAIL) { return 90; }
+    // SERVFAIL and NXDOMAIN must NOT collapse into one error: the first is
+    // "ask someone else", the second is "the name does not exist" and is
+    // cacheable. A resolver that confuses them either hammers every server on
+    // every typo or caches a transient failure.
+    if (dns.dns_addr_of(&m, "a.com", cast(*u8, &addr), 0, &ttl) != dns.DNS_ERR_RCODE) { return 91; }
+
+    // ===== a CNAME loop ===============================================
+    // Bounded, like the pointer walk, one level up.
+    if (dns.dns_parse(P_CNAMELOOP, P_CNAMELOOP_N, &m) != 0) { return 92; }
+    if (dns.dns_addr_of(&m, "a.com", cast(*u8, &addr), 0, &ttl) != dns.DNS_ERR_LOOP) { return 93; }
+
+    // ===== name comparison ============================================
+    if (dns.dns_parse(R_EXAMPLE, R_EXAMPLE_N, &m) != 0) { return 94; }
+    if (dns.dns_name_eq(R_EXAMPLE, R_EXAMPLE_N, m.q_off, "example.com") != 1) { return 95; }
+    if (dns.dns_name_eq(R_EXAMPLE, R_EXAMPLE_N, m.q_off, "example.com.") != 1) { return 96; }
+    if (dns.dns_name_eq(R_EXAMPLE, R_EXAMPLE_N, m.q_off, "Example.Com") != 1) { return 97; }
+    if (dns.dns_name_eq(R_EXAMPLE, R_EXAMPLE_N, m.q_off, "example.co") != 0) { return 98; }
+    if (dns.dns_name_eq(R_EXAMPLE, R_EXAMPLE_N, m.q_off, "example.commm") != 0) { return 99; }
+    // A prefix must not match — otherwise "evil.com" answers for "evil.com.x".
+    if (dns.dns_name_eq(R_EXAMPLE, R_EXAMPLE_N, m.q_off, "example") != 0) { return 100; }
+
+    return 0;
+}

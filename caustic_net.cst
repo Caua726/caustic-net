@@ -7,13 +7,24 @@
 //
 // Compile-check the whole library with:  caustic -c caustic_net.cst
 // Modules land phase by phase (see ROADMAP / plan); this list grows.
+//
+// Every path here is explicitly "./"-relative. A bare `use "core/conn.cst"`
+// resolves to this directory today only because source-relative is tried
+// before the --path list — and caustic-compact ships a `core/` of its own, as
+// does any library of size. Leaning on resolution order for that is one
+// declaration away from importing someone else's `core/bytes.cst` in silence.
+// tests/run.cst enforces the rule for the whole library.
 // =======================================================
 
-use "core/conn.cst" as conn;
-use "core/errno.cst" as errno;
-use "core/bytes.cst" as bytes;
-use "core/bufread.cst" as bufread;
-use "transport/tcp_conn.cst" as tcp;
-use "transport/transport.cst" as transport;
-use "proto/url.cst" as url;
-use "proto/http1.cst" as http1;
+use "./core/conn.cst" as conn;
+use "./core/errno.cst" as errno;
+use "./core/entropy.cst" as entropy;
+use "./core/chrono.cst" as chrono;
+use "./core/bytes.cst" as bytes;
+use "./core/bufread.cst" as bufread;
+use "./transport/tcp_conn.cst" as tcp;
+use "./transport/resolver.cst" as resolver;
+use "./transport/transport.cst" as transport;
+use "./proto/dns.cst" as dns;
+use "./proto/url.cst" as url;
+use "./proto/http1.cst" as http1;

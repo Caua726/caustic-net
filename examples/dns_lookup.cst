@@ -1,0 +1,114 @@
+// =======================================================
+// examples/dns_lookup.cst — the resolver against a real nameserver.
+//
+// BUILD-ONLY in tests/run.cst. It needs whatever DNS the machine is
+// configured with and an outbound socket, and neither of those can be what
+// decides whether the suite is green. Run it by hand:
+//
+//     caustic-mk build dns_lookup && ./build/dns_lookup [name ...]
+//
+// With no arguments it resolves a short default list. Exit 0 means every name
+// asked for came back.
+// =======================================================
+
+use "std/io.cst" as io;
+use "std/env.cst" as env;
+use "../core/conn.cst" as conn;
+use "../transport/resolver.cst" as res;
+use "../transport/transport.cst" as tp;
+use "../proto/dns.cst" as dns;
+
+fn show(r as *res.Resolver, name as *u8) as i64 {
+    let is [16]u8 as addr;
+    let is [64]u8 as txt;
+
+    io.write_str(1, "  ");
+    io.write_str(1, name);
+    let is i64 as pad with mut = 28;
+    let is i64 as k with mut = 0;
+    while (name[k] != 0) { k = k + 1; pad = pad - 1; }
+    while (pad > 0) { io.write_str(1, " "); pad = pad - 1; }
+
+    let is i64 as n = res.resolve(r, name, cast(*u8, &addr), 0);
+    if (n < 0) {
+        io.write_str(1, "FAIL  ");
+        io.write_str(1, res.res_err_name(n));
+        io.write_str(1, "\n");
+        return 1;
+    }
+    if (res.addr_str(cast(*u8, &addr), n, cast(*u8, &txt), 64) < 0) {
+        io.write_str(1, "FAIL  endereco nao formatavel\n");
+        return 1;
+    }
+    io.write_str(1, cast(*u8, &txt));
+
+    // Second time must come from the cache. Nothing here can observe that
+    // directly, so it is only reported — the assertion that the cache works
+    // lives in tests/test_res.cst, where it does not need a network.
+    let is i64 as n2 = res.resolve(r, name, cast(*u8, &addr), 0);
+    if (n2 != n) { io.write_str(1, "  (segunda consulta divergiu!)"); io.write_str(1, "\n"); return 1; }
+    io.write_str(1, "\n");
+    return 0;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    tp.init();
+
+    let is res.Resolver as r;
+    let is i64 as ns = res.resolver_init(&r);
+    io.write_str(1, "nameservers: ");
+    io.write_int(1, ns);
+    io.write_str(1, "   timeout ");
+    io.write_int(1, r.timeout_ms);
+    io.write_str(1, "ms   tries ");
+    io.write_int(1, r.tries);
+    io.write_str(1, "\n");
+
+    let is i64 as bad with mut = 0;
+
+    if (env.argc() > 1) {
+        let is i64 as i with mut = 1;
+        while (i < env.argc()) {
+            bad = bad + show(&r, env.argv(i));
+            i = i + 1;
+        }
+    } else {
+        bad = bad + show(&r, "localhost");          // /etc/hosts, no query
+        bad = bad + show(&r, "1.1.1.1");            // a literal, no query
+        bad = bad + show(&r, "example.com");
+        bad = bad + show(&r, "www.github.com");     // a CNAME chain
+
+        // A name that does not exist: the answer is NXDOMAIN, which is a
+        // success for the resolver even though it is a failure for the caller.
+        let is [16]u8 as junk;
+        let is i64 as nx = res.resolve(&r, "this-name-does-not-exist.invalid",
+                                       cast(*u8, &junk), 0);
+        io.write_str(1, "  nome inexistente          ");
+        if (nx == dns.DNS_ERR_NXDOMAIN || nx == dns.DNS_ERR_NODATA) {
+            io.write_str(1, "NXDOMAIN (correto)\n");
+        } else {
+            io.write_str(1, "esperava NXDOMAIN, veio ");
+            io.write_str(1, res.res_err_name(nx));
+            io.write_str(1, "\n");
+            bad = bad + 1;
+        }
+    }
+
+    // And the thing the whole module exists for: a socket to a NAME.
+    io.write_str(1, "\ndial_host(\"example.com\", 80): ");
+    let is *conn.Conn as c = tp.dial_host("example.com", 80);
+    if (cast(i64, c) == 0) {
+        io.write_str(1, "falhou — ");
+        io.write_str(1, res.res_err_name(tp.dial_host_err()));
+        io.write_str(1, "\n");
+        bad = bad + 1;
+    } else {
+        io.write_str(1, "conectado\n");
+        conn.conn_free(c);
+    }
+
+    if (bad == 0) { io.write_str(1, "\ndns_lookup ok\n"); return 0; }
+    io.write_str(1, "\ndns_lookup: "); io.write_int(1, bad); io.write_str(1, " falha(s)\n");
+    return 1;
+}

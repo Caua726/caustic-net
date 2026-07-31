@@ -7,6 +7,10 @@ name: test
 # passed only the per-dependency `--path` and not the deps root, so a module
 # could not be imported under the name it was declared with. v0.1.6 ships the
 # fix, and the suite is green on the release alone, so the extra step is gone.
+#
+# `caustic-mk build run` clones the `depend` entries into .caustic/deps before
+# compiling, so the crypto dependency needs no step of its own here — but it
+# does mean this job needs network and git, and a checkout is always cold.
 
 on:
   push:

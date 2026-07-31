@@ -1,0 +1,710 @@
+// =======================================================
+// caustic-net/transport/resolver.cst
+// Turning a hostname into an address. The stub resolver.
+//
+// There is no libc here, so there is no getaddrinfo, and the standard library
+// has no name resolution of any kind — `net.dial` takes a dotted quad and
+// nothing else. Everything a browser does starts with a name, so this is the
+// piece between `url_host()` and a socket.
+//
+// The order is the one every stub resolver uses, and each step exists because
+// skipping it is wrong rather than merely slower:
+//
+//   1. A literal address parses as itself. "127.0.0.1" is not a name and
+//      asking a server about it is both pointless and a privacy leak.
+//   2. /etc/hosts, before the network. It is how a machine names itself and
+//      how a developer redirects a domain; a resolver that goes to the wire
+//      first quietly ignores both.
+//   3. The cache, honouring the TTL the zone published — including for
+//      failures, since without negative caching one typo hammers every
+//      nameserver on every retry.
+//   4. UDP to each configured server in turn, falling back to TCP when the
+//      answer comes back truncated.
+//
+// proto/dns.cst does the wire format and owns every bound on it; this module
+// does policy and I/O. The split is what lets the parser be tested against
+// hostile packets without a socket.
+//
+// NOT REENTRANT. The config reader, the query buffers and the cache are all
+// module-level, so two threads resolving at once would tread on each other.
+// That is deliberate for now — a resolver that allocates is a resolver that
+// can fail to resolve because it is out of memory — but it is a real
+// constraint the moment `client/parallel` starts fetching subresources on
+// threads, and it will need a lock or per-caller buffers then.
+// =======================================================
+
+use "std/net.cst" as net;
+use "std/io.cst" as io;
+use "std/time.cst" as time;
+use "std/mem.cst" only bins, core as mem;
+use "../core/conn.cst" as conn;
+use "../core/errno.cst" as errno;
+use "../core/entropy.cst" as entropy;
+use "../proto/dns.cst" as dns;
+use "./tcp_conn.cst" as tcpc;
+
+// --- Errors. Shares the -1400 block with proto/dns; dns owns 1400..1409. ---
+let is i64 as RES_ERR_CONFIG  with imut = 0 - 1420;   // no usable nameserver
+let is i64 as RES_ERR_TIMEOUT with imut = 0 - 1421;   // every server, every try
+let is i64 as RES_ERR_SOCKET  with imut = 0 - 1422;   // could not send at all
+let is i64 as RES_ERR_SPACE   with imut = 0 - 1423;   // caller's buffer too small
+
+let is i64 as MAX_SERVERS with imut = 3;
+let is i64 as DNS_PORT    with imut = 53;
+
+// A UDP answer is capped at 512 bytes without EDNS0, which is not advertised
+// here — anything larger comes back with TC set and is refetched over TCP.
+let is i64 as UDP_MAX with imut = 512;
+let is i64 as TCP_MAX with imut = 8192;
+
+let is i64 as DEFAULT_TIMEOUT_MS with imut = 2000;
+let is i64 as DEFAULT_TRIES      with imut = 2;
+
+// TTL bounds. A zone that publishes 0 wants no caching at all and gets it; one
+// that publishes a week gets a day, because this cache has no invalidation and
+// a stale address outlives the reason anyone would look at it.
+let is i64 as TTL_MIN with imut = 0;
+let is i64 as TTL_MAX with imut = 86400;
+let is i64 as TTL_NEG with imut = 60;      // for NXDOMAIN, when no SOA says otherwise
+
+struct Resolver {
+    srv        as [3]i64;    // nameserver IPv4s, host byte order
+    nsrv       as i64;
+    timeout_ms as i64;
+    tries      as i64;
+    ready      as i64;
+}
+
+// --- Small helpers -----------------------------------------------------
+
+fn _slen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+fn _lower(c as u8) as u8 {
+    if (c >= 65 && c <= 90) { return cast(u8, cast(i64, c) + 32); }
+    return c;
+}
+
+fn _is_digit(c as u8) as i64 {
+    if (c >= 48 && c <= 57) { return 1; }
+    return 0;
+}
+
+fn _is_space(c as u8) as i64 {
+    if (c == 32 || c == 9 || c == 13) { return 1; }
+    return 0;
+}
+
+// Case-insensitive compare of two NUL-terminated names, ignoring one trailing
+// dot on either side — "a.com" and "A.com." are the same name.
+fn _name_eq(a as *u8, b as *u8) as i64 {
+    let is i64 as la with mut = _slen(a);
+    let is i64 as lb with mut = _slen(b);
+    if (la > 1 && a[la - 1] == cast(u8, 46)) { la = la - 1; }
+    if (lb > 1 && b[lb - 1] == cast(u8, 46)) { lb = lb - 1; }
+    if (la != lb) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < la) {
+        if (_lower(a[i]) != _lower(b[i])) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Strict dotted quad. Returns 1 and writes the host-order address, or 0.
+//
+// Written here rather than using net.ip4_parse because that one reports
+// failure as 0, which is also the value of "0.0.0.0" — and a resolver has to
+// tell "this is already an address" from "this is a name" with no ambiguity at
+// all, or it sends a DNS query for a literal.
+fn parse_ipv4(s as *u8, out as *i64) as i64 {
+    let is i64 as n = _slen(s);
+    if (n < 7 || n > 15) { return 0; }
+    let is i64 as v with mut = 0;
+    let is i64 as octets with mut = 0;
+    let is i64 as i with mut = 0;
+    while (octets < 4) {
+        let is i64 as digits with mut = 0;
+        let is i64 as acc with mut = 0;
+        while (i < n && _is_digit(s[i]) == 1) {
+            acc = acc * 10 + (cast(i64, s[i]) - 48);
+            digits = digits + 1;
+            if (digits > 3) { return 0; }
+            i = i + 1;
+        }
+        if (digits == 0) { return 0; }
+        if (acc > 255) { return 0; }
+        // A leading zero is how an octal quad sneaks past a naive parser and
+        // resolves somewhere else than it reads.
+        if (digits > 1 && s[i - digits] == cast(u8, 48)) { return 0; }
+        v = (v << 8) + acc;
+        octets = octets + 1;
+        if (octets < 4) {
+            if (i >= n || s[i] != cast(u8, 46)) { return 0; }
+            i = i + 1;
+        }
+    }
+    if (i != n) { return 0; }
+    *out = v;
+    return 1;
+}
+
+// --- File reading ------------------------------------------------------
+//
+// Module-level so a 64 KiB read is not a 64 KiB stack frame, and read through
+// the raw fd rather than io.read_file: that one allocates through `bins`,
+// which refuses anything past 65536 bytes and returns NULL in silence, and
+// then writes the terminator through the NULL.
+let is [65536]u8 as _fbuf with mut;
+let is i64 as _flen with mut = 0;
+
+fn _read_conf(path as *u8) as i64 {
+    _flen = 0;
+    if (io.exists(path) == 0) { return 0 - 1; }
+    let is i64 as sz = io.file_size(path);
+    if (sz <= 0) { return 0 - 1; }
+    // A truncated read here would silently drop the entries past the cut, so a
+    // file this large is refused rather than half-honoured.
+    if (sz >= 65536) { return 0 - 1; }
+    let is i64 as fd = io._open_read(path);
+    if (fd < 0) { return 0 - 1; }
+    let is i64 as got = io.read_exact(fd, cast(*u8, &_fbuf), sz);
+    io._close_fd(fd);
+    if (got != sz) { return 0 - 1; }
+    _flen = sz;
+    return 0;
+}
+
+// --- /etc/hosts --------------------------------------------------------
+
+// Look `name` up in /etc/hosts. Returns 4 with the address written to `out`,
+// or 0 when the name is not there, or <0 on a read failure.
+//
+// Only IPv4 for now: an IPv6 literal in hosts needs the same parser AAAA
+// answers will need, and both land together.
+fn hosts_lookup(name as *u8, out as *u8) as i64 {
+    if (_read_conf("/etc/hosts") != 0) { return 0; }
+
+    let is [256]u8 as tok;
+    let is i64 as pos with mut = 0;
+    while (pos < _flen) {
+        // one line
+        let is i64 as ls = pos;
+        while (pos < _flen && _fbuf[pos] != 10) { pos = pos + 1; }
+        let is i64 as le = pos;
+        if (pos < _flen) { pos = pos + 1; }
+
+        // strip a comment
+        let is i64 as i with mut = ls;
+        while (i < le && _fbuf[i] != 35) { i = i + 1; }     // '#'
+        let is i64 as end = i;
+
+        // first field: the address
+        i = ls;
+        while (i < end && _is_space(_fbuf[i]) == 1) { i = i + 1; }
+        let is i64 as as_ = i;
+        while (i < end && _is_space(_fbuf[i]) == 0) { i = i + 1; }
+        let is i64 as alen = i - as_;
+        if (alen == 0 || alen > 255) { continue; }
+
+        let is i64 as k with mut = 0;
+        while (k < alen) { tok[k] = _fbuf[as_ + k]; k = k + 1; }
+        tok[alen] = cast(u8, 0);
+        let is i64 as ip with mut = 0;
+        if (parse_ipv4(cast(*u8, &tok), &ip) == 0) { continue; }
+
+        // every remaining field is a name for it
+        while (i < end) {
+            while (i < end && _is_space(_fbuf[i]) == 1) { i = i + 1; }
+            let is i64 as ns = i;
+            while (i < end && _is_space(_fbuf[i]) == 0) { i = i + 1; }
+            let is i64 as nlen = i - ns;
+            if (nlen == 0 || nlen > 255) { continue; }
+            let is i64 as j with mut = 0;
+            while (j < nlen) { tok[j] = _fbuf[ns + j]; j = j + 1; }
+            tok[nlen] = cast(u8, 0);
+            if (_name_eq(cast(*u8, &tok), name) == 1) {
+                out[0] = cast(u8, (ip >> 24) & 255);
+                out[1] = cast(u8, (ip >> 16) & 255);
+                out[2] = cast(u8, (ip >> 8) & 255);
+                out[3] = cast(u8, ip & 255);
+                return 4;
+            }
+        }
+    }
+    return 0;
+}
+
+// --- /etc/resolv.conf --------------------------------------------------
+
+fn resolver_defaults(r as *Resolver) as void {
+    r.nsrv = 0;
+    r.timeout_ms = DEFAULT_TIMEOUT_MS;
+    r.tries = DEFAULT_TRIES;
+    r.ready = 1;
+}
+
+// Parse the `nameserver` lines of /etc/resolv.conf. Returns the count found.
+//
+// IPv6 nameservers are skipped rather than mis-parsed. `options timeout:` and
+// `attempts:` are honoured because a machine that sets them usually has a
+// reason (a slow link, a flaky server) and ignoring them makes this resolver
+// behave differently from every other program on the box.
+fn resolver_init(r as *Resolver) as i64 {
+    resolver_defaults(r);
+
+    if (_read_conf("/etc/resolv.conf") != 0) {
+        // No file, or unreadable. Windows has no resolv.conf at all, so this
+        // is the normal path there until the registry lookup lands — see the
+        // module note. A public resolver is a deliberate, visible default: the
+        // alternative is failing to resolve anything, and a silent fallback to
+        // one would be worse than a stated one.
+        r.srv[0] = net.ip4(1, 1, 1, 1);
+        r.srv[1] = net.ip4(8, 8, 8, 8);
+        r.nsrv = 2;
+        return r.nsrv;
+    }
+
+    let is [256]u8 as tok;
+    let is i64 as pos with mut = 0;
+    while (pos < _flen) {
+        let is i64 as ls = pos;
+        while (pos < _flen && _fbuf[pos] != 10) { pos = pos + 1; }
+        let is i64 as le = pos;
+        if (pos < _flen) { pos = pos + 1; }
+
+        let is i64 as i with mut = ls;
+        while (i < le && _fbuf[i] != 35 && _fbuf[i] != 59) { i = i + 1; }   // '#' ';'
+        let is i64 as end = i;
+
+        i = ls;
+        while (i < end && _is_space(_fbuf[i]) == 1) { i = i + 1; }
+        let is i64 as ks = i;
+        while (i < end && _is_space(_fbuf[i]) == 0) { i = i + 1; }
+        let is i64 as klen = i - ks;
+        if (klen == 0) { continue; }
+
+        let is i64 as c with mut = 0;
+        if (klen < 256) {
+            while (c < klen) { tok[c] = _fbuf[ks + c]; c = c + 1; }
+            tok[klen] = cast(u8, 0);
+        } else { continue; }
+
+        if (_name_eq(cast(*u8, &tok), "nameserver") == 1) {
+            if (r.nsrv >= MAX_SERVERS) { continue; }
+            while (i < end && _is_space(_fbuf[i]) == 1) { i = i + 1; }
+            let is i64 as vs = i;
+            while (i < end && _is_space(_fbuf[i]) == 0) { i = i + 1; }
+            let is i64 as vlen = i - vs;
+            if (vlen == 0 || vlen > 255) { continue; }
+            let is i64 as j with mut = 0;
+            while (j < vlen) { tok[j] = _fbuf[vs + j]; j = j + 1; }
+            tok[vlen] = cast(u8, 0);
+            let is i64 as ip with mut = 0;
+            if (parse_ipv4(cast(*u8, &tok), &ip) == 1) {
+                r.srv[r.nsrv] = ip;
+                r.nsrv = r.nsrv + 1;
+            }
+            continue;
+        }
+
+        if (_name_eq(cast(*u8, &tok), "options") == 1) {
+            while (i < end) {
+                while (i < end && _is_space(_fbuf[i]) == 1) { i = i + 1; }
+                let is i64 as os_ = i;
+                while (i < end && _is_space(_fbuf[i]) == 0) { i = i + 1; }
+                let is i64 as olen = i - os_;
+                if (olen == 0 || olen > 255) { continue; }
+                let is i64 as m with mut = 0;
+                while (m < olen) { tok[m] = _fbuf[os_ + m]; m = m + 1; }
+                tok[olen] = cast(u8, 0);
+
+                if (_starts(cast(*u8, &tok), "timeout:") == 1) {
+                    let is i64 as v = _num_after(cast(*u8, &tok), 8);
+                    if (v > 0 && v <= 30) { r.timeout_ms = v * 1000; }
+                }
+                if (_starts(cast(*u8, &tok), "attempts:") == 1) {
+                    let is i64 as v = _num_after(cast(*u8, &tok), 9);
+                    if (v > 0 && v <= 5) { r.tries = v; }
+                }
+            }
+        }
+    }
+
+    if (r.nsrv == 0) {
+        r.srv[0] = net.ip4(1, 1, 1, 1);
+        r.srv[1] = net.ip4(8, 8, 8, 8);
+        r.nsrv = 2;
+    }
+    return r.nsrv;
+}
+
+fn _starts(s as *u8, p as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (p[i] != 0) {
+        if (s[i] == 0) { return 0; }
+        if (s[i] != p[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn _num_after(s as *u8, off as i64) as i64 {
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = off;
+    let is i64 as d with mut = 0;
+    while (s[i] != 0 && _is_digit(s[i]) == 1) {
+        v = v * 10 + (cast(i64, s[i]) - 48);
+        d = d + 1;
+        if (d > 6) { return 0 - 1; }
+        i = i + 1;
+    }
+    if (d == 0) { return 0 - 1; }
+    return v;
+}
+
+// --- Cache -------------------------------------------------------------
+//
+// A fixed table, replaced by whichever slot expired first when it is full. No
+// heap, no eviction policy worth the name — a browser looks up tens of names,
+// not millions, and a resolver that allocates is a resolver that can fail to
+// resolve because it is out of memory.
+
+struct CacheEntry {
+    name    as [256]u8;
+    addr    as [16]u8;
+    alen    as i64;      // 4, 16, or 0 for a remembered failure
+    want6   as i64;
+    expires as i64;      // epoch seconds; 0 = free
+}
+
+let is [64]CacheEntry as _cache with mut;
+let is i64 as _cache_ready with mut = 0;
+
+fn cache_clear() as void {
+    let is i64 as i with mut = 0;
+    while (i < 64) {
+        _cache[i].expires = 0;
+        i = i + 1;
+    }
+    _cache_ready = 1;
+}
+
+fn _cache_find(name as *u8, want6 as i64, out as *u8) as i64 {
+    if (_cache_ready == 0) { cache_clear(); }
+    let is i64 as now = time.unix_time();
+    let is i64 as i with mut = 0;
+    while (i < 64) {
+        if (_cache[i].expires > now && _cache[i].want6 == want6) {
+            if (_name_eq(cast(*u8, &_cache[i].name), name) == 1) {
+                if (_cache[i].alen == 0) { return dns.DNS_ERR_NXDOMAIN; }
+                let is i64 as k with mut = 0;
+                while (k < _cache[i].alen) { out[k] = _cache[i].addr[k]; k = k + 1; }
+                return _cache[i].alen;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn _cache_put(name as *u8, want6 as i64, addr as *u8, alen as i64, ttl as i64) as void {
+    if (_cache_ready == 0) { cache_clear(); }
+    let is i64 as n = _slen(name);
+    if (n >= 256) { return; }
+
+    let is i64 as t with mut = ttl;
+    if (t < TTL_MIN) { t = TTL_MIN; }
+    if (t > TTL_MAX) { t = TTL_MAX; }
+    if (t == 0) { return; }                    // the zone asked for no caching
+
+    let is i64 as now = time.unix_time();
+
+    // An entry for this same question is REPLACED, not duplicated. Without
+    // this, re-resolving a live name leaves two entries for it, and
+    // _cache_find returns whichever it reaches first — which is the older one
+    // as often as not, so a refreshed answer would be ignored until the stale
+    // copy aged out.
+    let is i64 as pick with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < 64) {
+        if (_cache[i].expires > 0 && _cache[i].want6 == want6) {
+            if (_name_eq(cast(*u8, &_cache[i].name), name) == 1) { pick = i; i = 64; }
+            else { i = i + 1; }
+        } else { i = i + 1; }
+    }
+
+    // Otherwise a free slot, else the one that expires soonest — the one whose
+    // loss costs least.
+    let is i64 as oldest with mut = 0;
+    if (pick < 0) {
+        i = 0;
+        while (i < 64) {
+            if (_cache[i].expires <= now) { pick = i; i = 64; }
+            else {
+                if (oldest == 0 || _cache[i].expires < oldest) { oldest = _cache[i].expires; }
+                i = i + 1;
+            }
+        }
+    }
+    if (pick < 0) {
+        i = 0;
+        while (i < 64) {
+            if (_cache[i].expires == oldest) { pick = i; i = 64; }
+            else { i = i + 1; }
+        }
+    }
+    if (pick < 0) { pick = 0; }
+
+    let is i64 as k with mut = 0;
+    while (k < n) { _cache[pick].name[k] = name[k]; k = k + 1; }
+    _cache[pick].name[n] = cast(u8, 0);
+    _cache[pick].alen = alen;
+    _cache[pick].want6 = want6;
+    k = 0;
+    while (k < alen) { _cache[pick].addr[k] = addr[k]; k = k + 1; }
+    _cache[pick].expires = now + t;
+}
+
+// --- The query -------------------------------------------------------
+
+let is [8192]u8 as _rxbuf with mut;
+let is [768]u8 as _txbuf with mut;
+
+// Is this datagram an answer to the question we asked? Three things have to
+// agree — source address, query ID, and the echoed question — and all three
+// are checked in the RECEIVE LOOP rather than by the caller.
+//
+// That placement is the point. A datagram that fails any of these is not this
+// server failing; it is a stray, a late duplicate of an earlier query, or a
+// forgery. Handing it up as "this server did not answer" would abandon the
+// real reply still in flight and move on to the next server, which is a single
+// junk packet turning into a failed lookup.
+fn _reply_matches(m as *dns.DnsMsg, from as *u8, ip as i64,
+                  id as i64, name as *u8, qtype as i64) as i64 {
+    // The Addr is built by POINTING at the sockaddr udp_recv filled in — not
+    // by addr_init, which memsets the buffer first and would erase the sender
+    // before it could be read.
+    let is net.Addr as fa;
+    fa.data = from;
+    if (net.addr_ip(fa) != ip) { return 0; }
+    if (m.id != id) { return 0; }
+    if (dns.dns_check_question(m, name, qtype) != 1) { return 0; }
+    return 1;
+}
+
+// Ask one server over UDP. Returns the reply length in _rxbuf, or <0.
+// On return the reply is known to answer this exact question.
+fn _query_udp(ip as i64, q as *u8, qlen as i64, timeout_ms as i64,
+              id as i64, name as *u8, qtype as i64) as i64 {
+    let is i64 as fd = net.udp_socket();
+    if (fd < 0) { return RES_ERR_SOCKET; }
+
+    let is [16]u8 as abuf;
+    let is net.Addr as a = net.addr_init(cast(*u8, &abuf), ip, DNS_PORT);
+    if (net.udp_send(fd, q, qlen, a) < 0) { net.close(fd); return RES_ERR_SOCKET; }
+
+    // A deadline, not a single wait: a datagram from somewhere else resets the
+    // wait but must not extend the total, or an attacker holds the resolver
+    // open by dribbling packets at it.
+    let is i64 as deadline = conn.deadline_in(timeout_ms);
+    while (1 == 1) {
+        let is i64 as left = conn.deadline_remaining(deadline);
+        if (left <= 0) { net.close(fd); return RES_ERR_TIMEOUT; }
+        let is i64 as ready = net.wait_readable(fd, left);
+        if (ready <= 0) { net.close(fd); return RES_ERR_TIMEOUT; }
+
+        let is [16]u8 as from;
+        let is i64 as n = net.udp_recv(fd, cast(*u8, &_rxbuf), UDP_MAX, cast(*u8, &from));
+        if (n <= 0) { continue; }
+
+        let is dns.DnsMsg as m;
+        if (dns.dns_parse(cast(*u8, &_rxbuf), n, &m) != 0) { continue; }
+        if (_reply_matches(&m, cast(*u8, &from), ip, id, name, qtype) == 0) { continue; }
+
+        net.close(fd);
+        return n;
+    }
+    net.close(fd);
+    return RES_ERR_TIMEOUT;
+}
+
+// The same question over TCP, for when UDP came back truncated. DNS over TCP
+// prefixes the message with a 2-byte big-endian length, in both directions.
+// Validated the same way UDP is, even though a TCP reply arrives on a socket
+// only this server can write to: the checks are cheap, and "it came over TCP"
+// is not a reason to trust a message with the wrong ID in it.
+fn _query_tcp(ip as i64, q as *u8, qlen as i64, timeout_ms as i64,
+              id as i64, name as *u8, qtype as i64) as i64 {
+    let is [16]u8 as abuf;
+    let is net.Addr as a = net.addr_init(cast(*u8, &abuf), ip, DNS_PORT);
+    let is i64 as fd = net.tcp_connect(a);
+    if (fd < 0) { return RES_ERR_SOCKET; }
+    let is *conn.Conn as c = tcpc.conn_from_fd(fd);
+    if (cast(i64, c) == 0) { net.close(fd); return RES_ERR_SOCKET; }
+
+    let is i64 as deadline = conn.deadline_in(timeout_ms);
+
+    let is [2]u8 as pfx;
+    pfx[0] = cast(u8, (qlen >> 8) & 255);
+    pfx[1] = cast(u8, qlen & 255);
+    if (conn.conn_write_all_by(c, cast(*u8, &pfx), 2, deadline) != 2) {
+        conn.conn_free(c); return RES_ERR_SOCKET;
+    }
+    if (conn.conn_write_all_by(c, q, qlen, deadline) != qlen) {
+        conn.conn_free(c); return RES_ERR_SOCKET;
+    }
+
+    if (conn.conn_read_exact_by(c, cast(*u8, &pfx), 2, deadline) != 2) {
+        conn.conn_free(c); return RES_ERR_TIMEOUT;
+    }
+    let is i64 as rlen = (cast(i64, pfx[0]) << 8) + cast(i64, pfx[1]);
+    if (rlen <= 0 || rlen > TCP_MAX) { conn.conn_free(c); return dns.DNS_ERR_FORMAT; }
+    if (conn.conn_read_exact_by(c, cast(*u8, &_rxbuf), rlen, deadline) != rlen) {
+        conn.conn_free(c); return RES_ERR_TIMEOUT;
+    }
+    conn.conn_free(c);
+
+    let is dns.DnsMsg as m;
+    if (dns.dns_parse(cast(*u8, &_rxbuf), rlen, &m) != 0) { return dns.DNS_ERR_FORMAT; }
+    if (m.id != id) { return dns.DNS_ERR_MISMATCH; }
+    if (dns.dns_check_question(&m, name, qtype) != 1) { return dns.DNS_ERR_MISMATCH; }
+    return rlen;
+}
+
+// One question, asked of every server in turn, retried `tries` times.
+// Returns the address length written to `out`, or <0.
+fn _ask(r as *Resolver, name as *u8, want6 as i64, out as *u8, ttl_out as *i64) as i64 {
+    let is i64 as qtype with mut = dns.T_A;
+    if (want6 == 1) { qtype = dns.T_AAAA; }
+
+    let is i64 as last with mut = RES_ERR_TIMEOUT;
+    let is i64 as attempt with mut = 0;
+    while (attempt < r.tries) {
+        let is i64 as si with mut = 0;
+        while (si < r.nsrv) {
+            // A fresh ID per attempt. Reusing one across retries hands an
+            // off-path attacker a second guess at the same target.
+            let is i64 as id with mut = 0;
+            if (dns.dns_new_id(&id) < 0) { return RES_ERR_SOCKET; }
+
+            let is i64 as qlen = dns.dns_encode_query(name, qtype, id, cast(*u8, &_txbuf), 768);
+            if (qlen < 0) { return qlen; }
+
+            // Both transports return a reply already known to answer THIS
+            // question — _query_udp checks it in its receive loop, _query_tcp
+            // on the single message it reads — so there is one parse here and
+            // no re-validation.
+            let is i64 as n with mut = _query_udp(r.srv[si], cast(*u8, &_txbuf), qlen,
+                                                  r.timeout_ms, id, name, qtype);
+            if (n > 0) {
+                let is dns.DnsMsg as m;
+                if (dns.dns_parse(cast(*u8, &_rxbuf), n, &m) != 0) { n = dns.DNS_ERR_FORMAT; }
+                else {
+                    // Truncated: the same question again over TCP, where there
+                    // is no 512-byte ceiling.
+                    if (m.tc == 1) {
+                        n = _query_tcp(r.srv[si], cast(*u8, &_txbuf), qlen, r.timeout_ms,
+                                       id, name, qtype);
+                        if (n > 0) {
+                            if (dns.dns_parse(cast(*u8, &_rxbuf), n, &m) != 0) { n = dns.DNS_ERR_FORMAT; }
+                        }
+                    }
+                }
+
+                if (n > 0) {
+                    let is i64 as ttl with mut = 0;
+                    let is i64 as got = dns.dns_addr_of(&m, name, out, want6, &ttl);
+                    if (got > 0) { *ttl_out = ttl; return got; }
+                    // NXDOMAIN and NODATA are ANSWERS, not failures to reach a
+                    // server: every other server will say the same thing, so
+                    // stop here rather than asking them all.
+                    if (got == dns.DNS_ERR_NXDOMAIN) { *ttl_out = TTL_NEG; return got; }
+                    if (got == dns.DNS_ERR_NODATA)   { *ttl_out = TTL_NEG; return got; }
+                    n = got;
+                }
+            }
+            // Anything left is this server failing to answer usefully; record
+            // it and try the next one. Unconditional, so a malformed reply
+            // cannot leave `last` reporting some earlier server's problem.
+            last = n;
+            si = si + 1;
+        }
+        attempt = attempt + 1;
+    }
+    return last;
+}
+
+// --- The API -----------------------------------------------------------
+
+// Resolve `name`, writing 4 bytes (A) or 16 (AAAA) to `out` and returning that
+// count, or <0. `out` must have room for 16.
+//
+// Consults, in order: a literal address, /etc/hosts, the cache, the network.
+fn resolve(r as *Resolver, name as *u8, out as *u8, want6 as i64) as i64 {
+    if (r.ready == 0) { resolver_init(r); }
+    if (r.nsrv == 0) { return RES_ERR_CONFIG; }
+
+    let is i64 as n = _slen(name);
+    if (n == 0 || n > 255) { return dns.DNS_ERR_NAME; }
+
+    // A literal is already an answer.
+    let is i64 as lit with mut = 0;
+    if (parse_ipv4(name, &lit) == 1) {
+        if (want6 == 1) { return dns.DNS_ERR_NODATA; }
+        out[0] = cast(u8, (lit >> 24) & 255);
+        out[1] = cast(u8, (lit >> 16) & 255);
+        out[2] = cast(u8, (lit >> 8) & 255);
+        out[3] = cast(u8, lit & 255);
+        return 4;
+    }
+
+    if (want6 == 0) {
+        let is i64 as h = hosts_lookup(name, out);
+        if (h == 4) { return 4; }
+    }
+
+    let is i64 as c = _cache_find(name, want6, out);
+    if (c > 0) { return c; }
+    if (c == dns.DNS_ERR_NXDOMAIN) { return c; }
+
+    let is i64 as ttl with mut = 0;
+    let is i64 as got = _ask(r, name, want6, out, &ttl);
+    if (got > 0) {
+        _cache_put(name, want6, out, got, ttl);
+        return got;
+    }
+    // Remember a definitive "no" so a typo does not re-ask every server on
+    // every retry. A timeout is NOT definitive and is not cached.
+    if (got == dns.DNS_ERR_NXDOMAIN || got == dns.DNS_ERR_NODATA) {
+        _cache_put(name, want6, out, 0, TTL_NEG);
+    }
+    return got;
+}
+
+// Format a resolved address as text. `out` needs 16 bytes for IPv4, 46 for
+// IPv6. Returns the length written, or <0.
+fn addr_str(addr as *u8, alen as i64, out as *u8, max as i64) as i64 {
+    if (alen == 4) {
+        if (max < 16) { return RES_ERR_SPACE; }
+        let is i64 as ip = (cast(i64, addr[0]) << 24) + (cast(i64, addr[1]) << 16)
+                         + (cast(i64, addr[2]) << 8) + cast(i64, addr[3]);
+        return net.ip4_format(ip, out);
+    }
+    if (alen == 16) {
+        if (max < 46) { return RES_ERR_SPACE; }
+        return net.ip6_format(addr, out);
+    }
+    return RES_ERR_SPACE;
+}
+
+fn res_err_name(e as i64) as *u8 {
+    if (e == RES_ERR_CONFIG)  { return "RES_ERR_CONFIG"; }
+    if (e == RES_ERR_TIMEOUT) { return "RES_ERR_TIMEOUT"; }
+    if (e == RES_ERR_SOCKET)  { return "RES_ERR_SOCKET"; }
+    if (e == RES_ERR_SPACE)   { return "RES_ERR_SPACE"; }
+    return dns.dns_err_name(e);
+}

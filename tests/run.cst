@@ -72,6 +72,38 @@ fn silence_stderr() as void {
     io._open_write(nul);
 }
 
+// The dependency clones, and nothing below them.
+//
+// caustic-mk gives a direct dependency two --paths: the deps root, under which
+// only the qualified name `caustic-crypto/hash/sha2.cst` resolves, and the
+// clone's own contents, under which the short `hash/sha2.cst` also resolves.
+// The second one is what a consumer building caustic-net transitively does NOT
+// get. Passing only the root here makes every compile in this suite run under
+// the consumer's constraint rather than ours, so a short-form import fails at
+// the compile that introduces it instead of in someone else's repository.
+let is *u8 as DEPS_ROOT with imut = ".caustic/deps";
+
+// Compile `src` to `out`. 0 on success. Shared by run_case and build_case so
+// there is one place that knows the compiler's argument order.
+fn compile_to(cc as *u8, src as *u8, out as *u8) as i32 {
+    io.unlink(out);
+
+    let is [8]i64 as cav;
+    let is i64 as n with mut = 0;
+    cav[n] = cast(i64, "caustic"); n = n + 1;
+    if (cast(i64, OPT) != 0) { cav[n] = cast(i64, OPT); n = n + 1; }
+    cav[n] = cast(i64, "--path"); n = n + 1;
+    cav[n] = cast(i64, DEPS_ROOT); n = n + 1;
+    cav[n] = cast(i64, src); n = n + 1;
+    cav[n] = cast(i64, "-o"); n = n + 1;
+    cav[n] = cast(i64, out); n = n + 1;
+    cav[n] = 0;
+    let is str.String as _log = proc.capture(cc, cast(*u8, &cav));
+
+    if (io.exists(out) == 0) { return 1; }
+    return 0;
+}
+
 fn run_case(cc as *u8, name as *u8, src as *u8) as i32 {
     let is [512]u8 as out;
     let is i64 as p with mut = app(cast(*u8, &out), 0, "build/");
@@ -79,19 +111,7 @@ fn run_case(cc as *u8, name as *u8, src as *u8) as i32 {
     out[p] = cast(u8, 0);
 
     label(name);
-    io.unlink(cast(*u8, &out));
-
-    let is [6]i64 as cav;
-    let is i64 as n with mut = 0;
-    cav[n] = cast(i64, "caustic"); n = n + 1;
-    if (cast(i64, OPT) != 0) { cav[n] = cast(i64, OPT); n = n + 1; }
-    cav[n] = cast(i64, src); n = n + 1;
-    cav[n] = cast(i64, "-o"); n = n + 1;
-    cav[n] = cast(i64, cast(*u8, &out)); n = n + 1;
-    cav[n] = 0;
-    let is str.String as _log = proc.capture(cc, cast(*u8, &cav));
-
-    if (io.exists(cast(*u8, &out)) == 0) { io.write_str(1, "COMPILE FAIL\n"); return 1; }
+    if (compile_to(cc, src, cast(*u8, &out)) != 0) { io.write_str(1, "COMPILE FAIL\n"); return 1; }
 
     let is [2]i64 as rav;
     rav[0] = cast(i64, cast(*u8, &out)); rav[1] = 0;
@@ -99,6 +119,155 @@ fn run_case(cc as *u8, name as *u8, src as *u8) as i32 {
     let is i32 as rc = proc.wait_pid(rpid);
     if (rc == 0) { io.write_str(1, "PASS\n"); return 0; }
     io.write_str(1, "FAIL (exit "); io.write_int(1, cast(i64, rc)); io.write_str(1, ")\n");
+    return 1;
+}
+
+// Compile only. For a case whose success criterion is a real network — an https
+// fetch, a DNS lookup — which cannot be the thing that decides CI. The binary
+// is left in build/ to be run by hand.
+fn build_case(cc as *u8, name as *u8, src as *u8) as i32 {
+    let is [512]u8 as out;
+    let is i64 as p with mut = app(cast(*u8, &out), 0, "build/");
+    p = app(cast(*u8, &out), p, name);
+    out[p] = cast(u8, 0);
+
+    label(name);
+    if (compile_to(cc, src, cast(*u8, &out)) != 0) { io.write_str(1, "COMPILE FAIL\n"); return 1; }
+    io.write_str(1, "built (run by hand)\n");
+    return 0;
+}
+
+// =======================================================
+// The import-form invariant.
+//
+// Every `use` in this library starts with "./", "../", "std/", or the name of
+// a sibling library. Nothing else.
+//
+// The one it exists to catch is the short form of a sibling import:
+//
+//     use "hash/sha2.cst" as sha2;          // WRONG
+//     use "caustic-crypto/hash/sha2.cst";   // right
+//
+// The short form compiles here. caustic-crypto is a DIRECT dependency of
+// caustic-net, and caustic-mk emits a --path for each direct dependency's
+// contents, so `hash/sha2.cst` resolves. For a consumer — caustic-browser —
+// caustic-crypto arrives TRANSITIVELY, and only the deps-root --path applies,
+// under which the sole resolvable name is the qualified one. So the mistake is
+// green through this entire suite and breaks the moment anyone depends on us.
+//
+// The bare form is wrong for a second reason even where it works: caustic-net
+// has a core/, and so do caustic-compact and most libraries of any size. Two
+// of them on the search path resolve to whichever was declared first, silently.
+//
+// Checked as source rather than by building a consumer fixture: the fixture
+// would have to copy this tree into a .caustic/deps/ and clone from the
+// network to be faithful, and the property is static anyway.
+// =======================================================
+
+// Module-level so a 64 KiB read isn't a 64 KiB stack frame.
+let is [65536]u8 as _src with mut;
+let is i64 as _srclen with mut = 0;
+
+// Does _src[off..] begin with s, without running past lim?
+fn src_has(off as i64, lim as i64, s as *u8) as i32 {
+    let is i64 as k with mut = 0;
+    while (s[k] != 0) {
+        if (off + k >= lim) { return 0; }
+        if (_src[off + k] != s[k]) { return 0; }
+        k = k + 1;
+    }
+    return 1;
+}
+
+fn ok_prefix(off as i64, lim as i64) as i32 {
+    if (src_has(off, lim, "./") == 1) { return 1; }
+    if (src_has(off, lim, "../") == 1) { return 1; }
+    if (src_has(off, lim, "std/") == 1) { return 1; }
+    if (src_has(off, lim, "caustic-crypto/") == 1) { return 1; }
+    if (src_has(off, lim, "caustic-compact/") == 1) { return 1; }
+    if (src_has(off, lim, "caustic-unicode/") == 1) { return 1; }
+    return 0;
+}
+
+fn load_src(path as *u8) as i32 {
+    _srclen = 0;
+    let is i64 as sz = io.file_size(path);
+    if (sz <= 0) { return 1; }
+    // Not a silent truncation: a module past the buffer is a hard failure, so
+    // the check can never quietly stop covering the file that outgrew it.
+    if (sz >= 65536) { return 2; }
+    let is i64 as fd = io._open_read(path);
+    if (fd < 0) { return 1; }
+    let is i64 as got = io.read_exact(fd, cast(*u8, &_src), sz);
+    io._close_fd(fd);
+    if (got != sz) { return 1; }
+    _srclen = sz;
+    return 0;
+}
+
+// A `use` at column 0, since a mention of one inside a comment is not one.
+fn check_imports(path as *u8) as i32 {
+    let is i32 as rc = load_src(path);
+    if (rc == 2) {
+        io.write_str(1, "\n  "); io.write_str(1, path);
+        io.write_str(1, ": too large for the import check, raise the buffer\n");
+        return 1;
+    }
+    if (rc != 0) {
+        io.write_str(1, "\n  "); io.write_str(1, path); io.write_str(1, ": unreadable\n");
+        return 1;
+    }
+
+    let is i64 as bad with mut = 0;
+    let is i64 as pos with mut = 0;
+    while (pos < _srclen) {
+        let is i64 as ls = pos;
+        while (pos < _srclen && _src[pos] != 10) { pos = pos + 1; }
+        let is i64 as le = pos;
+        if (pos < _srclen) { pos = pos + 1; }
+
+        if (src_has(ls, le, "use ") == 0) { continue; }
+
+        // the opening quote of the path
+        let is i64 as q with mut = ls + 4;
+        while (q < le && _src[q] != 34) { q = q + 1; }
+        if (q >= le) { continue; }
+        q = q + 1;
+
+        if (ok_prefix(q, le) == 1) { continue; }
+
+        bad = bad + 1;
+        io.write_str(1, "\n  "); io.write_str(1, path); io.write_str(1, ": use \"");
+        let is i64 as e with mut = q;
+        while (e < le && _src[e] != 34) {
+            io._write_fd(1, cast(*u8, &_src[e]), 1);
+            e = e + 1;
+        }
+        io.write_str(1, "\" — needs ./ ../ std/ or a library name");
+    }
+
+    if (bad > 0) { io.write_str(1, "\n"); }
+    return cast(i32, bad);
+}
+
+fn check_all_imports() as i32 {
+    label("imports");
+    let is i64 as bad with mut = 0;
+    bad = bad + cast(i64, check_imports("caustic_net.cst"));
+    bad = bad + cast(i64, check_imports("core/conn.cst"));
+    bad = bad + cast(i64, check_imports("core/errno.cst"));
+    bad = bad + cast(i64, check_imports("core/entropy.cst"));
+    bad = bad + cast(i64, check_imports("core/chrono.cst"));
+    bad = bad + cast(i64, check_imports("core/bytes.cst"));
+    bad = bad + cast(i64, check_imports("core/bufread.cst"));
+    bad = bad + cast(i64, check_imports("transport/tcp_conn.cst"));
+    bad = bad + cast(i64, check_imports("transport/resolver.cst"));
+    bad = bad + cast(i64, check_imports("transport/transport.cst"));
+    bad = bad + cast(i64, check_imports("proto/dns.cst"));
+    bad = bad + cast(i64, check_imports("proto/url.cst"));
+    bad = bad + cast(i64, check_imports("proto/http1.cst"));
+    if (bad == 0) { io.write_str(1, "ok\n"); return 0; }
+    io.write_str(1, "  "); io.write_int(1, bad); io.write_str(1, " bad import(s)\n");
     return 1;
 }
 
@@ -114,9 +283,10 @@ fn compile_lib(cc as *u8, src as *u8) as i32 {
     label("library");
     io.unlink(cast(*u8, &art));
 
-    let is [5]i64 as cav;
+    let is [7]i64 as cav;
     cav[0] = cast(i64, "caustic"); cav[1] = cast(i64, "-q");
-    cav[2] = cast(i64, "-c"); cav[3] = cast(i64, src); cav[4] = 0;
+    cav[2] = cast(i64, "--path"); cav[3] = cast(i64, DEPS_ROOT);
+    cav[4] = cast(i64, "-c"); cav[5] = cast(i64, src); cav[6] = 0;
     let is str.String as _log = proc.capture(cc, cast(*u8, &cav));
 
     if (io.exists(cast(*u8, &art)) == 0) { io.write_str(1, "COMPILE FAIL\n"); return 1; }
@@ -147,7 +317,13 @@ fn main(argc as i64, argv as *u8) as i32 {
     silence_stderr();
 
     let is i64 as fail with mut = 0;
+    fail = fail + cast(i64, check_all_imports());
     fail = fail + cast(i64, compile_lib(ccp, "caustic_net.cst"));
+    fail = fail + cast(i64, run_case(ccp, "test_dep",     "tests/test_dep.cst"));
+    fail = fail + cast(i64, run_case(ccp, "test_ent",     "tests/test_ent.cst"));
+    fail = fail + cast(i64, run_case(ccp, "test_chrono",  "tests/test_chrono.cst"));
+    fail = fail + cast(i64, run_case(ccp, "test_dns",     "tests/test_dns.cst"));
+    fail = fail + cast(i64, run_case(ccp, "test_res",     "tests/test_res.cst"));
     fail = fail + cast(i64, run_case(ccp, "test_conn",    "tests/test_conn.cst"));
     fail = fail + cast(i64, run_case(ccp, "test_bytes",   "tests/test_bytes.cst"));
     fail = fail + cast(i64, run_case(ccp, "test_bufread", "tests/test_bufread.cst"));
@@ -155,6 +331,7 @@ fn main(argc as i64, argv as *u8) as i32 {
     fail = fail + cast(i64, run_case(ccp, "test_http1",   "tests/test_http1.cst"));
     fail = fail + cast(i64, run_case(ccp, "tcp_echo",     "examples/tcp_echo.cst"));
     fail = fail + cast(i64, run_case(ccp, "http_get",     "examples/http_get.cst"));
+    fail = fail + cast(i64, build_case(ccp, "dns_lookup",   "examples/dns_lookup.cst"));
 
     if (fail == 0) { io.write_str(1, "all green\n"); return 0; }
     io.write_str(1, "FAILURES: "); io.write_int(1, fail); io.write_str(1, "\n");

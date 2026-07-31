@@ -5,7 +5,7 @@ socket up to `fetch()`, with no libc and no OpenSSL.**
 
 ![version](https://img.shields.io/badge/version-0.1.0-blue)
 ![status](https://img.shields.io/badge/status-early%20%C2%B7%20TCP%20%C2%B7%20URL%20%C2%B7%20HTTP%2F1.1-yellow)
-![dependencies](https://img.shields.io/badge/dependencies-none%20yet-brightgreen)
+![dependencies](https://img.shields.io/badge/dependencies-caustic--crypto-blue)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
 The scope is everything an application needs to talk to a network: sockets, name
@@ -66,8 +66,9 @@ Written against it:
 
 ```
 core/        conn (the vtable) · errno · bytes (Bytes/Slice) · bufread (lines)
-transport/   tcp_conn (TCP→Conn) · transport (dial/listen/accept/tuning) · epoll*
-proto/       url · http1 · dns* · cookie* · http2* · websocket* · sse* · mime*
+             entropy (checked CSPRNG) · chrono (epoch ↔ civil, ASN.1 + HTTP dates)
+transport/   tcp_conn (TCP→Conn) · transport (dial/dial_host/listen/accept) · resolver · epoll*
+proto/       url · http1 · dns · cookie* · http2* · websocket* · sse* · mime*
 tls/         records* · handshake* · keyschedule* · client* (implements Conn)
 server/      router* · threaded* · reactor* · static* · middleware*
 client/      fetch* (url→dns→connect→tls→http→redirect→decompress)
@@ -80,8 +81,10 @@ client/      fetch* (url→dns→connect→tls→http→redirect→decompress)
   allocating constructors return a pointer and signal failure with null.
   Parsed values use an `ok`/flag field. (Generic `Result`/`Option` are avoided —
   their construction syntax isn't supported by the compiler.)
-  New error sentinels sit outside the errno range — `-1000` transport, `-1100` bufread,
-  `-1200` url, `-1300` http1 — so a sentinel can never be mistaken for an `-errno`.
+  New error sentinels sit outside the errno range so one can never be mistaken for an
+  `-errno`: `-1000` `WANT_READ`/`WANT_WRITE` (in `errno`, reserved for the non-blocking
+  and TLS layers), `-1100` bufread, `-1200` url, `-1300` http1, and reserved ahead —
+  `-1400` dns, `-1500` tls, `-1600` x509, `-1700` cookie, `-1800` client.
 - **Memory:** manual, via the stdlib `bins` allocator per module; `Conn` boxes +
   backend contexts share one heap (`core/conn.cst` `cn_alloc`/`cn_free`), freed by
   `conn_free`. Hot path (`conn_read`/`conn_write`) is zero-alloc raw `*u8+len`.
@@ -91,6 +94,12 @@ client/      fetch* (url→dns→connect→tls→http→redirect→decompress)
   which of the two owns the pointer.
 - **Imports:** `use "std/mem.cst" only bins, core as mem;` — this exact form. A narrower
   `only` list narrows the module *globally* and breaks `std/string`, which needs `bins`.
+  Every path is `./`, `../`, `std/`, or a **library name** — never the short
+  `use "hash/sha2.cst"` for a sibling. The short form resolves here, where caustic-crypto
+  is a *direct* dependency and gets a `--path` of its own, and stops resolving for a
+  consumer, where it arrives transitively under the deps-root `--path` alone. Green here,
+  broken for them. `tests/run.cst` enforces it twice: as source, and by compiling every
+  case with only the deps root on the search path — the consumer's constraint, not ours.
 - **Naming:** `snake_case` fns, `PascalCase` structs, `_prefix` private, vtable
   backends named `_<proto>_<op>`, `SCREAMING` constants `with imut`.
 - **Parsers are tested split.** Anything that reads a delimited stream gets a test that
@@ -106,13 +115,20 @@ client/      fetch* (url→dns→connect→tls→http→redirect→decompress)
 | core | `bytes` — growable buffer, bins ≤16 KiB / pages above | ✅ green (`tests/test_bytes`, growth to 1 MiB) |
 | core | `errno` — errno names + sentinels | ✅ |
 | core | `bufread` — lines and exact counts over `Conn` | ✅ green (`tests/test_bufread`, incl. one byte per read) |
+| core | `entropy` — CSPRNG with the return value checked | ✅ green (`tests/test_ent`) |
+| core | `chrono` — epoch ↔ civil, ASN.1 time, HTTP-date | ✅ green (`tests/test_chrono`, exhaustive 1888–2106) |
 | transport | `tcp_conn` · `transport` · `Listener` · peer address | ✅ green (`examples/tcp_echo`) |
-| transport | epoll/kqueue/IOCP reactor | ⛔ no epoll anywhere in the stdlib — needs raw `syscall()` |
-| transport | IPv6 · Happy Eyeballs (RFC 8305) | ⛔ `net.Addr` is a 16-byte `sockaddr_in` only |
-| proto | `url` — RFC 3986, zero-copy | ✅ green (`tests/test_url`) · relative resolution missing |
+| transport | epoll/kqueue/IOCP reactor | ⏳ unblocked — stdlib v0.1.6 ships `net.Poller` (epoll on Linux, `poll` elsewhere) |
+| transport | IPv6 · Happy Eyeballs (RFC 8305) | ⏳ unblocked — stdlib v0.1.6 ships `Addr6`, `tcp_connect6`, `udp_bind6` |
+| proto | `url` — RFC 3986 incl. relative resolution (§5.2) | ✅ green (`tests/test_url`) |
 | proto | `http1` client — build, head parse, body framing | ✅ green (`tests/test_http1`, `examples/http_get`) |
-| proto | `dns` | ⛔ `_sock_sendto` drops the destination on the Windows target |
+| proto | `dns` — wire codec, no I/O | ✅ green (`tests/test_dns`, 2 live captures + 15 hostile packets) |
+| transport | `resolver` — `hosts` · `resolv.conf` · UDP + TCP fallback · TTL cache · `dial_host` | ✅ green (`tests/test_res`, `examples/dns_lookup`) |
+| deps | `caustic-crypto` v0.1.0 wired in | ✅ green (`tests/test_dep`) |
 | everything else | see the roadmap | ⏳ |
+
+The three ⛔ rows above were all "the toolchain can't yet"; stdlib v0.1.6 closed each one, so
+what is left there is work rather than a blocker.
 
 8 modules, 1 797 lines, 248 checks, green on both compiler backends.
 

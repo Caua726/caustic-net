@@ -1,0 +1,93 @@
+// =======================================================
+// caustic-net/core/entropy.cst
+// Cryptographic randomness, with the return value checked.
+//
+// The stdlib already reaches the right source — std/random's _entropy_fill is
+// getrandom(2) on Linux, BCryptGenRandom on Windows, and the host import on
+// wasm — so the per-OS dispatch is not reimplemented here. What is missing is
+// the check:
+//
+//     fn fill_bytes(buf as *u8, count as i64) as void {     // std/random.cst
+//         let is i64 as done with mut = 0;
+//         while (done < count) {
+//             let is i64 as n = _entropy_fill(...);
+//             if (n <= 0) { return; }                       // <-- silent
+//             done = done + n;
+//         }
+//     }
+//
+// It returns void, so a caller cannot tell a full buffer from an empty one,
+// and on failure the buffer keeps whatever was on the stack. For a nonce or a
+// session key that is not a degraded result, it is a broken one that looks
+// fine: an X25519 private key of leftover stack bytes still produces a working
+// handshake. caustic-crypto's drbg_init calls fill_bytes and does not check
+// either, which is why TLS key material comes through here instead.
+//
+// Returns the count on success, or a negative -errno. Never partial.
+// =======================================================
+
+use "std/random.cst" as random;
+use "./errno.cst" as errno;
+
+// getrandom(2) guarantees a short read cannot happen below 257 bytes once the
+// pool is initialized, and makes no promise above it — so the loop is real,
+// not defensive decoration. A signal mid-call surfaces as -EINTR with nothing
+// written, which is a retry and not a failure.
+fn entropy_fill(buf as *u8, n as i64) as i64 {
+    if (n < 0) { return 0 - errno.EINVAL; }
+    if (n == 0) { return 0; }
+    if (cast(i64, buf) == 0) { return 0 - errno.EFAULT; }
+
+    let is i64 as done with mut = 0;
+    let is i64 as stalls with mut = 0;
+    while (done < n) {
+        let is i64 as got = random._entropy_fill(cast(*u8, cast(i64, buf) + done), n - done);
+        if (got == 0 - errno.EINTR) { continue; }
+        if (got < 0) { return got; }
+        if (got == 0) {
+            // No error and no progress. Nothing in the contract produces this,
+            // so treat a run of them as a broken source rather than spinning:
+            // an infinite loop here would hang a browser mid-handshake with no
+            // diagnostic at all.
+            stalls = stalls + 1;
+            if (stalls > 16) { return 0 - errno.EIO; }
+            continue;
+        }
+        stalls = 0;
+        done = done + got;
+    }
+    return done;
+}
+
+// A non-negative random integer, for a DNS query ID or any other unpredictable
+// tag. Seven bytes, not eight: 56 bits is far past what any caller here needs,
+// and stopping short of the sign bit means the result is never negative — which
+// matters because a negative return means "error" everywhere else in this
+// library, and a 1-in-2 chance of an ID that reads as one is a trap.
+//
+// Returns 0 on success, <0 on failure. A caller that ignores the failure and
+// uses the value anyway is left with whatever `out` held, which for a query ID
+// is a predictable value — and a predictable query ID is precisely what DNS
+// cache poisoning needs.
+fn entropy_u56(out as *i64) as i64 {
+    let is [7]u8 as b;
+    let is i64 as rc = entropy_fill(cast(*u8, &b), 7);
+    if (rc < 0) { return rc; }
+    let is i64 as v with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < 7) {
+        v = (v << 8) + cast(i64, b[i]);
+        i = i + 1;
+    }
+    *out = v;
+    return 0;
+}
+
+// A random value in [0, 65536), which is the shape a DNS query ID wants.
+fn entropy_u16(out as *i64) as i64 {
+    let is [2]u8 as b;
+    let is i64 as rc = entropy_fill(cast(*u8, &b), 2);
+    if (rc < 0) { return rc; }
+    *out = (cast(i64, b[0]) << 8) + cast(i64, b[1]);
+    return 0;
+}

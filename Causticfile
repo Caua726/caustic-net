@@ -9,17 +9,40 @@ author "Cauã Alvarenga Neves"
 //   caustic-mk build tcp_echo  the example, to run by hand
 //   caustic-mk run clean       build artifacts
 //
-// There are no dependencies yet. The floor is the standard library's
-// std/net.cst (TCP/UDP/poll) and everything above it is written here. When the
-// TLS track lands it will `depend` on caustic-crypto rather than carry its own
-// copy of the primitives — a second, unaudited implementation of X25519 inside
-// the same author's own ecosystem would be the worst of both worlds.
+// The floor is the standard library's std/net.cst (TCP/UDP/poll); everything
+// above it is written here.
+//
+// TLS takes its primitives from caustic-crypto rather than carrying a copy — a
+// second, unaudited implementation of X25519 inside the same author's own
+// ecosystem would be the worst of both worlds.
 
 env_default "OPT" "-O1"
+
+// ── Dependencies ─────────────────────────────────────────────────────
+//
+// Project level, not per-target: every module that imports crypto would
+// otherwise have to name it in each target that reaches it.
+//
+// Imports of a sibling library are ALWAYS written in the qualified form,
+//     use "caustic-crypto/hash/sha2.cst" as sha2;
+// never the short `use "hash/sha2.cst"`. caustic-mk emits a per-dependency
+// --path only for DIRECT dependencies, and the deps root --path for the whole
+// graph. So the short form resolves when caustic-net is built on its own and
+// stops resolving the moment a consumer pulls caustic-crypto in transitively:
+// green here, broken for them. tests/run.cst catches it two ways: it reads the
+// library's own `use` lines, and it compiles every case with only the deps
+// root on the search path — the consumer's constraint, not ours.
+
+depend "caustic-crypto" in "https://github.com/Caua726/caustic-crypto" tag "v0.1.0"
 
 // ── Targets ──────────────────────────────────────────────────────────
 
 target "run"        { src "tests/run.cst"          out "build/run" }
+target "test_dep"   { src "tests/test_dep.cst"     out "build/test_dep" }
+target "test_ent"   { src "tests/test_ent.cst"     out "build/test_ent" }
+target "test_chrono" { src "tests/test_chrono.cst"  out "build/test_chrono" }
+target "test_dns"   { src "tests/test_dns.cst"     out "build/test_dns" }
+target "test_res"   { src "tests/test_res.cst"     out "build/test_res" }
 target "test_conn"  { src "tests/test_conn.cst"    out "build/test_conn" }
 target "test_bytes" { src "tests/test_bytes.cst"   out "build/test_bytes" }
 target "test_bufread" { src "tests/test_bufread.cst" out "build/test_bufread" }
@@ -27,6 +50,7 @@ target "test_url"   { src "tests/test_url.cst"     out "build/test_url" }
 target "test_http1" { src "tests/test_http1.cst"   out "build/test_http1" }
 target "tcp_echo"   { src "examples/tcp_echo.cst"  out "build/tcp_echo" }
 target "http_get"   { src "examples/http_get.cst"  out "build/http_get" }
+target "dns_lookup" { src "examples/dns_lookup.cst" out "build/dns_lookup" }
 
 // ── Scripts ──────────────────────────────────────────────────────────
 

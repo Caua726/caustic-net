@@ -1,0 +1,531 @@
+// =======================================================
+// caustic-net/proto/dns.cst
+// DNS wire format — encode a query, decode a response. No I/O.
+//
+// Split from the resolver on purpose. Everything here is a pure function over
+// a byte buffer, so it can be tested against captured packets and against
+// deliberately malicious ones without a socket in sight — and the malicious
+// ones are the point. A resolver parses attacker-controlled bytes off a
+// connectionless socket, which is about as exposed as parsing gets.
+//
+// The three that actually bite:
+//
+//   * Compression pointer loops. A name can be a pointer to an earlier name,
+//     and a packet can point a name at itself. Naively that is an infinite
+//     loop in a parser reading a 30-byte datagram. See _name_read below for
+//     what stops it.
+//   * A name that expands past 255 bytes, or a label past 63, overrunning
+//     whatever the caller sized its buffer for.
+//   * RDLENGTH that reaches past the end of the datagram.
+//
+// Nothing here trusts a length, an offset, or a count from the wire.
+// =======================================================
+
+use "../core/entropy.cst" as entropy;
+
+// --- Errors (the -1400 range) -----------------------------------------
+let is i64 as DNS_ERR_FORMAT   with imut = 0 - 1400;   // malformed on the wire
+let is i64 as DNS_ERR_TRUNC    with imut = 0 - 1401;   // TC bit — retry over TCP
+let is i64 as DNS_ERR_NAME     with imut = 0 - 1402;   // label/name too long, or bad
+let is i64 as DNS_ERR_LOOP     with imut = 0 - 1403;   // compression pointer cycle
+let is i64 as DNS_ERR_RCODE    with imut = 0 - 1404;   // server said no (SERVFAIL, REFUSED)
+let is i64 as DNS_ERR_NXDOMAIN with imut = 0 - 1405;   // the name does not exist
+let is i64 as DNS_ERR_SPACE    with imut = 0 - 1406;   // caller's buffer too small
+let is i64 as DNS_ERR_NODATA   with imut = 0 - 1407;   // name exists, no record of this type
+let is i64 as DNS_ERR_MISMATCH with imut = 0 - 1408;   // reply does not answer our question
+
+// --- Record types and classes -----------------------------------------
+let is i64 as T_A     with imut = 1;
+let is i64 as T_NS    with imut = 2;
+let is i64 as T_CNAME with imut = 5;
+let is i64 as T_SOA   with imut = 6;
+let is i64 as T_PTR   with imut = 12;
+let is i64 as T_MX    with imut = 15;
+let is i64 as T_TXT   with imut = 16;
+let is i64 as T_AAAA  with imut = 28;
+let is i64 as T_SRV   with imut = 33;
+
+let is i64 as C_IN with imut = 1;
+
+// --- Limits, all from RFC 1035 §2.3.4 unless noted ---------------------
+let is i64 as MAX_NAME  with imut = 255;   // wire form, including length bytes
+let is i64 as MAX_LABEL with imut = 63;
+// Presentation form plus the NUL. Every scratch buffer below is declared as
+// the LITERAL 256 rather than [MAX_TEXT]u8.
+//
+// `[MAX_TEXT]u8` used to compile into an array of length ZERO — the parser
+// read the token's int_val without checking it was a number, and an
+// identifier's is 0 — so sizeof reported 0 and the writes ran off the frame.
+// Fixed in the compiler (Caustic d8ff1ef; a named `with imut` constant is now
+// folded, and anything unfoldable is an error).
+//
+// The literal stays because CI builds against the PUBLISHED release, which
+// does not carry that fix yet: switching to the named form here would be green
+// locally and silently corrupt in CI. Revisit once a release ships it.
+// tests/test_dns.cst pins the literal to the constant so they cannot drift.
+let is i64 as MAX_TEXT  with imut = 256;
+let is i64 as HDR_LEN   with imut = 12;
+let is i64 as MAX_JUMPS with imut = 128;   // belt-and-braces; see _name_read
+let is i64 as MAX_CNAME with imut = 16;    // chain length before giving up
+
+// RCODEs
+let is i64 as RC_NOERROR  with imut = 0;
+let is i64 as RC_FORMERR  with imut = 1;
+let is i64 as RC_SERVFAIL with imut = 2;
+let is i64 as RC_NXDOMAIN with imut = 3;
+let is i64 as RC_NOTIMP   with imut = 4;
+let is i64 as RC_REFUSED  with imut = 5;
+
+struct DnsMsg {
+    buf as *u8;
+    len as i64;
+
+    id    as i64;
+    flags as i64;
+    qd    as i64;
+    an    as i64;
+    ns    as i64;
+    ar    as i64;
+
+    q_off  as i64;    // start of the question section (always HDR_LEN)
+    an_off as i64;    // start of the first answer RR
+
+    rcode as i64;
+    tc    as i64;     // 1 when truncated: the answer needs TCP
+    ra    as i64;     // recursion available
+}
+
+struct DnsRR {
+    name_off as i64;   // where this RR's NAME begins (may be compressed)
+    rtype    as i64;
+    rclass   as i64;
+    ttl      as i64;
+    rd_off   as i64;
+    rd_len   as i64;
+    next     as i64;   // offset just past this record
+}
+
+// --- Byte helpers ------------------------------------------------------
+
+fn _u16(p as *u8, off as i64) as i64 {
+    return (cast(i64, p[off]) << 8) + cast(i64, p[off + 1]);
+}
+
+fn _u32(p as *u8, off as i64) as i64 {
+    return (cast(i64, p[off]) << 24) + (cast(i64, p[off + 1]) << 16)
+         + (cast(i64, p[off + 2]) << 8) + cast(i64, p[off + 3]);
+}
+
+fn _put16(p as *u8, off as i64, v as i64) as void {
+    p[off] = cast(u8, (v >> 8) & 255);
+    p[off + 1] = cast(u8, v & 255);
+}
+
+fn _lower(c as u8) as u8 {
+    if (c >= 65 && c <= 90) { return cast(u8, cast(i64, c) + 32); }
+    return c;
+}
+
+fn _slen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+// --- Encoding ----------------------------------------------------------
+
+// "www.example.com" -> \x03www\x07example\x03com\x00
+//
+// A trailing dot is accepted (it is the fully-qualified form) but an empty
+// label anywhere else is not: "a..b" would encode a zero length byte, which is
+// the end-of-name marker, and the query would silently ask for "a".
+fn dns_encode_name(name as *u8, out as *u8, max as i64) as i64 {
+    let is i64 as n = _slen(name);
+    if (n == 0) { return DNS_ERR_NAME; }
+
+    // The root, ".", is a single zero byte.
+    if (n == 1 && name[0] == cast(u8, 46)) {
+        if (max < 1) { return DNS_ERR_SPACE; }
+        out[0] = cast(u8, 0);
+        return 1;
+    }
+
+    let is i64 as end with mut = n;
+    if (name[end - 1] == cast(u8, 46)) { end = end - 1; }
+    if (end == 0) { return DNS_ERR_NAME; }
+
+    let is i64 as w with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < end) {
+        let is i64 as start = i;
+        while (i < end && name[i] != cast(u8, 46)) { i = i + 1; }
+        let is i64 as ll = i - start;
+        if (ll == 0) { return DNS_ERR_NAME; }
+        if (ll > MAX_LABEL) { return DNS_ERR_NAME; }
+        if (w + 1 + ll + 1 > max) { return DNS_ERR_SPACE; }
+        if (w + 1 + ll + 1 > MAX_NAME) { return DNS_ERR_NAME; }
+
+        out[w] = cast(u8, ll);
+        w = w + 1;
+        let is i64 as k with mut = 0;
+        while (k < ll) { out[w + k] = name[start + k]; k = k + 1; }
+        w = w + ll;
+
+        if (i < end) { i = i + 1; }         // skip the dot
+    }
+
+    out[w] = cast(u8, 0);
+    return w + 1;
+}
+
+// A standard recursive query. Returns the datagram length, or an error.
+//
+// `id` must come from core/entropy — it is half of what makes an off-path
+// forgery hard, the other half being the source port the resolver binds. A
+// counter here is a cache-poisoning invitation, which is why this takes the ID
+// rather than generating one: the caller has to have gotten it from somewhere.
+fn dns_encode_query(name as *u8, qtype as i64, id as i64, out as *u8, max as i64) as i64 {
+    if (max < HDR_LEN + 5) { return DNS_ERR_SPACE; }
+
+    _put16(out, 0, id & 65535);
+    _put16(out, 2, 0x0100);            // QR=0, Opcode=0, RD=1
+    _put16(out, 4, 1);                 // QDCOUNT
+    _put16(out, 6, 0);
+    _put16(out, 8, 0);
+    _put16(out, 10, 0);
+
+    let is i64 as nl = dns_encode_name(name, cast(*u8, cast(i64, out) + HDR_LEN), max - HDR_LEN - 4);
+    if (nl < 0) { return nl; }
+
+    _put16(out, HDR_LEN + nl, qtype);
+    _put16(out, HDR_LEN + nl + 2, C_IN);
+    return HDR_LEN + nl + 4;
+}
+
+// Convenience: an ID straight from the CSPRNG. <0 if entropy is unavailable,
+// because a query with a guessable ID is worse than no query.
+fn dns_new_id(out as *i64) as i64 {
+    return entropy.entropy_u16(out);
+}
+
+// --- Name decoding -----------------------------------------------------
+//
+// THE LOOP GUARD.
+//
+// A label whose length byte has the top two bits set is a pointer: the low 14
+// bits are an offset into the message, and the name continues there. A packet
+// is free to point a name at itself, or to build a cycle of any length, and a
+// parser that just follows pointers spins forever on a 30-byte datagram.
+//
+// Three limits. They are NOT redundant — each catches a shape the others let
+// through, which is worth spelling out because the obvious reading is that any
+// one of them would do:
+//
+//   1. Every pointer target must be STRICTLY LESS than the PREVIOUS TARGET
+//      (and the first, strictly less than where the name started). A strictly
+//      decreasing sequence of non-negative integers cannot cycle, so this is a
+//      complete proof of termination on its own.
+//
+//      The usual formulation is weaker: target < the pointer's OWN offset.
+//      That is enough for a chain of pointers with nothing between them, since
+//      the position then falls on every jump. It is not enough once labels sit
+//      in between. Follow a pointer at 50 back to 30, read forward from 30 to
+//      a pointer at 35 aimed at 20, read forward from 20 to a pointer at 40
+//      aimed back at 30: every target is below its own pointer, the targets go
+//      30, 20, 30, 20, and the walk never ends. tests/test_dns.cst carries
+//      that packet as P_CYCLE, and with this rule replaced by the usual one
+//      and the other two limits removed, it runs until it faults.
+//
+//   2. A hard cap on jumps. Catches a pure pointer chain that (1) would also
+//      catch — kept because it bounds a bug in (1) rather than trusting it.
+//
+//   3. A cap on the emitted name at 255 bytes. This one is doing more work
+//      than it looks: a cycle that emits a label per revolution is bounded by
+//      the OUTPUT, not by the jumps, so under the usual rule this is the limit
+//      that actually stops P_CYCLE — after ten revolutions of writing rather
+//      than at the first repeat. It is also the only one of the three that
+//      protects the caller's buffer.
+//
+// `wire_end`, when non-null, receives the offset just past the name AS IT
+// APPEARS IN THE MESSAGE — that is, past the first pointer if there is one,
+// not past the data it points at. That is what a caller walking records needs;
+// conflating the two walks off into the middle of an earlier record.
+//
+// Returns the length written to `out`, not counting the NUL.
+fn dns_name_read(buf as *u8, len as i64, off as i64,
+                 out as *u8, max as i64, wire_end as *i64) as i64 {
+    if (off < 0 || off >= len) { return DNS_ERR_FORMAT; }
+
+    let is i64 as w with mut = 0;          // bytes written to out
+    let is i64 as wire with mut = 0;       // bytes of NAME consumed in place
+    let is i64 as p with mut = off;
+    let is i64 as jumps with mut = 0;
+    let is i64 as jumped with mut = 0;
+    let is i64 as last_target with mut = off;   // limit 1: strictly decreasing
+
+    while (1 == 1) {
+        if (p < 0 || p >= len) { return DNS_ERR_FORMAT; }
+        let is i64 as b = cast(i64, buf[p]);
+
+        if ((b & 192) == 192) {                       // 0b11xxxxxx: a pointer
+            if (p + 1 >= len) { return DNS_ERR_FORMAT; }
+            let is i64 as target = ((b & 63) << 8) + cast(i64, buf[p + 1]);
+
+            if (jumped == 0) { wire = wire + 2; }     // the pointer is 2 bytes
+            jumped = 1;
+
+            if (target >= last_target) { return DNS_ERR_LOOP; }
+            if (target >= len) { return DNS_ERR_FORMAT; }
+            jumps = jumps + 1;
+            if (jumps > MAX_JUMPS) { return DNS_ERR_LOOP; }
+
+            last_target = target;
+            p = target;
+            continue;
+        }
+
+        if ((b & 192) != 0) { return DNS_ERR_FORMAT; }   // 0b01/0b10 are reserved
+
+        if (b == 0) {                                  // end of name
+            if (jumped == 0) { wire = wire + 1; }
+            if (w == 0) {
+                // The root name. Presentation form is a single dot.
+                if (max < 2) { return DNS_ERR_SPACE; }
+                out[0] = cast(u8, 46);
+                out[1] = cast(u8, 0);
+                if (cast(i64, wire_end) != 0) { *wire_end = off + wire; }
+                return 1;
+            }
+            if (w >= max) { return DNS_ERR_SPACE; }
+            out[w] = cast(u8, 0);
+            if (cast(i64, wire_end) != 0) { *wire_end = off + wire; }
+            return w;
+        }
+
+        if (b > MAX_LABEL) { return DNS_ERR_NAME; }
+        if (p + 1 + b > len) { return DNS_ERR_FORMAT; }
+        if (jumped == 0) { wire = wire + 1 + b; }
+
+        // limit 3: the decompressed name, plus the dot we are about to add
+        if (w + b + 1 > MAX_NAME) { return DNS_ERR_NAME; }
+        if (w + b + 1 >= max) { return DNS_ERR_SPACE; }
+
+        if (w > 0) { out[w] = cast(u8, 46); w = w + 1; }   // '.'
+        let is i64 as k with mut = 0;
+        while (k < b) { out[w + k] = buf[p + 1 + k]; k = k + 1; }
+        w = w + b;
+        p = p + 1 + b;
+    }
+    return DNS_ERR_FORMAT;
+}
+
+// How many bytes the NAME at `off` occupies IN THE MESSAGE — 2 for a bare
+// pointer, however long the labels run for an uncompressed one. This is a
+// LENGTH, not an offset: every caller adds it to `off` to step past the name,
+// and returning the absolute end here instead reads the next field from a
+// position deeper into the packet than the record actually sits.
+//
+// Shares every guard in dns_name_read, including the loop guard — a record
+// whose name is a pointer cycle cannot be walked past either.
+fn dns_name_wire_len(buf as *u8, len as i64, off as i64) as i64 {
+    let is [256]u8 as scratch;
+    let is i64 as we with mut = 0;
+    let is i64 as rc = dns_name_read(buf, len, off, cast(*u8, &scratch), MAX_TEXT, &we);
+    if (rc < 0) { return rc; }
+    return we - off;
+}
+
+// Compare a (possibly compressed) name in the message against a plain one.
+// Case-insensitive, because DNS names are — a reply that answers "WWW.A.COM"
+// for a query of "www.a.com" is answering the same question, and a
+// case-sensitive compare here rejects real traffic.
+fn dns_name_eq(buf as *u8, len as i64, off as i64, name as *u8) as i64 {
+    let is [256]u8 as got;
+    let is i64 as n = dns_name_read(buf, len, off, cast(*u8, &got), MAX_TEXT, cast(*i64, 0));
+    if (n < 0) { return 0; }
+
+    let is i64 as m with mut = _slen(name);
+    if (m > 0 && name[m - 1] == cast(u8, 46) && m > 1) { m = m - 1; }   // trailing dot
+    if (n != m) { return 0; }
+
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (_lower(got[i]) != _lower(name[i])) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// --- Message parsing ---------------------------------------------------
+
+// Validate the header and walk the question section to find where the answers
+// begin. Returns 0, or an error. A TC reply and an RCODE are reported through
+// the DnsMsg rather than as errors here, so the caller can see the ID and
+// decide (retry over TCP, cache the negative answer, try another server).
+fn dns_parse(buf as *u8, len as i64, m as *DnsMsg) as i64 {
+    if (len < HDR_LEN) { return DNS_ERR_FORMAT; }
+
+    m.buf = buf;
+    m.len = len;
+    m.id = _u16(buf, 0);
+    m.flags = _u16(buf, 2);
+    m.qd = _u16(buf, 4);
+    m.an = _u16(buf, 6);
+    m.ns = _u16(buf, 8);
+    m.ar = _u16(buf, 10);
+
+    m.rcode = m.flags & 15;
+    m.tc = (m.flags >> 9) & 1;
+    m.ra = (m.flags >> 7) & 1;
+    m.q_off = HDR_LEN;
+    m.an_off = 0;
+
+    // A response to a query we sent has exactly one question echoed back.
+    // Zero is legal in the protocol at large and is not an answer to us.
+    if (m.qd > 1) { return DNS_ERR_FORMAT; }
+
+    let is i64 as p with mut = HDR_LEN;
+    let is i64 as i with mut = 0;
+    while (i < m.qd) {
+        let is i64 as nl = dns_name_wire_len(buf, len, p);
+        if (nl < 0) { return nl; }
+        p = p + nl;
+        if (p + 4 > len) { return DNS_ERR_FORMAT; }
+        p = p + 4;                                  // QTYPE + QCLASS
+        i = i + 1;
+    }
+
+    m.an_off = p;
+    return 0;
+}
+
+// Read the RR that starts at `off`.
+fn dns_rr_at(m as *DnsMsg, off as i64, rr as *DnsRR) as i64 {
+    if (off < 0 || off >= m.len) { return DNS_ERR_FORMAT; }
+
+    let is i64 as nl = dns_name_wire_len(m.buf, m.len, off);
+    if (nl < 0) { return nl; }
+
+    let is i64 as p = off + nl;
+    if (p + 10 > m.len) { return DNS_ERR_FORMAT; }
+
+    rr.name_off = off;
+    rr.rtype = _u16(m.buf, p);
+    rr.rclass = _u16(m.buf, p + 2);
+    rr.ttl = _u32(m.buf, p + 4);
+    rr.rd_len = _u16(m.buf, p + 8);
+    rr.rd_off = p + 10;
+
+    // The one that reads someone else's memory if it is taken on trust.
+    if (rr.rd_off + rr.rd_len > m.len) { return DNS_ERR_FORMAT; }
+
+    rr.next = rr.rd_off + rr.rd_len;
+    return 0;
+}
+
+// Iterate the answer section. `cur` starts at 0 and is opaque afterwards.
+// Returns 1 with `rr` filled, 0 when the section is done, or <0.
+fn dns_answer_next(m as *DnsMsg, cur as *i64, rr as *DnsRR) as i64 {
+    if (*cur >= m.an) { return 0; }
+    let is i64 as off with mut = m.an_off;
+    if (*cur > 0) { off = rr.next; }
+
+    let is i64 as rc = dns_rr_at(m, off, rr);
+    if (rc < 0) { return rc; }
+    *cur = *cur + 1;
+    return 1;
+}
+
+// Does this reply answer the question we asked? An off-path attacker who
+// guesses the ID still has to match the question, and a resolver that skips
+// this check accepts an answer for a name it never asked about.
+fn dns_check_question(m as *DnsMsg, name as *u8, qtype as i64) as i64 {
+    if (m.qd != 1) { return 0; }
+    if (dns_name_eq(m.buf, m.len, m.q_off, name) == 0) { return 0; }
+    let is i64 as nl = dns_name_wire_len(m.buf, m.len, m.q_off);
+    if (nl < 0) { return 0; }
+    let is i64 as p = m.q_off + nl;
+    if (p + 4 > m.len) { return 0; }
+    if (_u16(m.buf, p) != qtype) { return 0; }
+    if (_u16(m.buf, p + 2) != C_IN) { return 0; }
+    return 1;
+}
+
+// --- The answer a resolver actually wants ------------------------------
+
+// Find the address for `qname`, following CNAMEs. Writes 4 bytes for A or 16
+// for AAAA and returns that count; `ttl_out`, when non-null, receives the
+// smallest TTL along the chain, which is what the cache must honour.
+//
+// The CNAME walk is bounded: a zone can point a.example -> b.example ->
+// a.example, and following that without a cap is the same infinite loop as a
+// compression cycle, one level up.
+fn dns_addr_of(m as *DnsMsg, qname as *u8, out as *u8, want6 as i64, ttl_out as *i64) as i64 {
+    if (m.rcode == RC_NXDOMAIN) { return DNS_ERR_NXDOMAIN; }
+    if (m.rcode != RC_NOERROR) { return DNS_ERR_RCODE; }
+
+    let is i64 as want with mut = T_A;
+    let is i64 as size with mut = 4;
+    if (want6 == 1) { want = T_AAAA; size = 16; }
+
+    let is [256]u8 as target;
+    let is i64 as t with mut = 0;
+    while (qname[t] != 0 && t < MAX_TEXT - 1) { target[t] = qname[t]; t = t + 1; }
+    // Normalize away a trailing dot so the compare below is uniform.
+    if (t > 1 && target[t - 1] == cast(u8, 46)) { t = t - 1; }
+    target[t] = cast(u8, 0);
+
+    let is i64 as best_ttl with mut = 0x7FFFFFFF;
+    let is i64 as hops with mut = 0;
+
+    while (hops < MAX_CNAME) {
+        let is DnsRR as rr;
+        let is i64 as cur with mut = 0;
+        let is i64 as found_cname with mut = 0;
+        let is [256]u8 as cname;
+
+        while (dns_answer_next(m, &cur, &rr) == 1) {
+            if (rr.rclass != C_IN) { continue; }
+            if (dns_name_eq(m.buf, m.len, rr.name_off, cast(*u8, &target)) == 0) { continue; }
+
+            if (rr.rtype == want) {
+                if (rr.rd_len != size) { return DNS_ERR_FORMAT; }
+                let is i64 as k with mut = 0;
+                while (k < size) { out[k] = m.buf[rr.rd_off + k]; k = k + 1; }
+                if (rr.ttl < best_ttl) { best_ttl = rr.ttl; }
+                if (cast(i64, ttl_out) != 0) { *ttl_out = best_ttl; }
+                return size;
+            }
+
+            if (rr.rtype == T_CNAME && found_cname == 0) {
+                let is i64 as n = dns_name_read(m.buf, m.len, rr.rd_off,
+                                                cast(*u8, &cname), MAX_TEXT, cast(*i64, 0));
+                if (n < 0) { return n; }
+                if (rr.ttl < best_ttl) { best_ttl = rr.ttl; }
+                found_cname = 1;
+            }
+        }
+
+        if (found_cname == 0) { return DNS_ERR_NODATA; }
+
+        let is i64 as k with mut = 0;
+        while (cname[k] != 0 && k < MAX_TEXT - 1) { target[k] = cname[k]; k = k + 1; }
+        target[k] = cast(u8, 0);
+        hops = hops + 1;
+    }
+
+    return DNS_ERR_LOOP;
+}
+
+fn dns_err_name(e as i64) as *u8 {
+    if (e == DNS_ERR_FORMAT)   { return "DNS_ERR_FORMAT"; }
+    if (e == DNS_ERR_TRUNC)    { return "DNS_ERR_TRUNC"; }
+    if (e == DNS_ERR_NAME)     { return "DNS_ERR_NAME"; }
+    if (e == DNS_ERR_LOOP)     { return "DNS_ERR_LOOP"; }
+    if (e == DNS_ERR_RCODE)    { return "DNS_ERR_RCODE"; }
+    if (e == DNS_ERR_NXDOMAIN) { return "DNS_ERR_NXDOMAIN"; }
+    if (e == DNS_ERR_SPACE)    { return "DNS_ERR_SPACE"; }
+    if (e == DNS_ERR_NODATA)   { return "DNS_ERR_NODATA"; }
+    if (e == DNS_ERR_MISMATCH) { return "DNS_ERR_MISMATCH"; }
+    return "DNS_ERR_UNKNOWN";
+}

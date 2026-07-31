@@ -1,0 +1,270 @@
+// =======================================================
+// tests/test_res.cst — transport/resolver.cst
+//
+// Everything here runs without a network. The resolver's job is mostly
+// deciding what NOT to send: a literal address, a name in /etc/hosts, and a
+// cached answer all have to be served locally, and each of those is a place
+// where getting it wrong means a query goes out that should not have.
+//
+// The wire path is covered by tests/test_dns.cst against captured and hostile
+// packets, and end to end by examples/dns_lookup, which is build-only because
+// a real nameserver cannot be what decides CI.
+//
+// Exit 0 = all pass. Non-zero = the numbered check that failed.
+// =======================================================
+
+use "../transport/resolver.cst" as res;
+use "../proto/dns.cst" as dns;
+use "std/time.cst" as time;
+
+fn eq4(a as *u8, b0 as i64, b1 as i64, b2 as i64, b3 as i64) as i64 {
+    if (cast(i64, a[0]) != b0) { return 0; }
+    if (cast(i64, a[1]) != b1) { return 0; }
+    if (cast(i64, a[2]) != b2) { return 0; }
+    if (cast(i64, a[3]) != b3) { return 0; }
+    return 1;
+}
+
+fn streq(a as *u8, b as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (a[i] != 0 && b[i] != 0) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    if (a[i] != b[i]) { return 0; }
+    return 1;
+}
+
+fn main() as i32 {
+    let is [16]u8 as addr;
+    let is i64 as ip with mut = 0;
+    let is i64 as i with mut = 0;
+
+    // ===== parse_ipv4 =================================================
+    // The point of this function is telling "already an address" from "a name
+    // to look up" with no ambiguity, so both answers have to be exact.
+    if (res.parse_ipv4("1.2.3.4", &ip) != 1) { return 1; }
+    if (ip != (1 << 24) + (2 << 16) + (3 << 8) + 4) { return 2; }
+    if (res.parse_ipv4("0.0.0.0", &ip) != 1) { return 3; }
+    if (ip != 0) { return 4; }
+    // 0.0.0.0 parsing to 0 is exactly why this does not use net.ip4_parse,
+    // which reports failure as 0 too.
+    if (res.parse_ipv4("255.255.255.255", &ip) != 1) { return 5; }
+    if (ip != 4294967295) { return 6; }
+    if (res.parse_ipv4("127.0.0.1", &ip) != 1) { return 7; }
+    if (ip != (127 << 24) + 1) { return 8; }
+
+    // Rejected — every one of these resolves somewhere under a loose parser.
+    if (res.parse_ipv4("1.2.3", &ip) != 0) { return 9; }
+    if (res.parse_ipv4("1.2.3.4.5", &ip) != 0) { return 10; }
+    if (res.parse_ipv4("1.2.3.256", &ip) != 0) { return 11; }
+    if (res.parse_ipv4("1.2.3.-1", &ip) != 0) { return 12; }
+    if (res.parse_ipv4("1.2.3.", &ip) != 0) { return 13; }
+    if (res.parse_ipv4(".1.2.3", &ip) != 0) { return 14; }
+    if (res.parse_ipv4("1..2.3", &ip) != 0) { return 15; }
+    if (res.parse_ipv4("a.b.c.d", &ip) != 0) { return 16; }
+    if (res.parse_ipv4("", &ip) != 0) { return 17; }
+    if (res.parse_ipv4("1.2.3.4 ", &ip) != 0) { return 18; }
+    if (res.parse_ipv4(" 1.2.3.4", &ip) != 0) { return 19; }
+    if (res.parse_ipv4("1.2.3.4444", &ip) != 0) { return 20; }
+    // A leading zero is the octal trick: 010.0.0.1 reads as ten and resolves
+    // as eight to anything that accepts it.
+    if (res.parse_ipv4("010.0.0.1", &ip) != 0) { return 21; }
+    if (res.parse_ipv4("1.2.3.04", &ip) != 0) { return 22; }
+    // ...but a bare zero octet is not a leading zero.
+    if (res.parse_ipv4("10.0.0.1", &ip) != 1) { return 23; }
+    if (res.parse_ipv4("192.168.0.10", &ip) != 1) { return 24; }
+    // Not a hostname, either way round.
+    if (res.parse_ipv4("example.com", &ip) != 0) { return 25; }
+    if (res.parse_ipv4("1.2.3.4.example.com", &ip) != 0) { return 26; }
+
+    // ===== configuration ==============================================
+    let is res.Resolver as r;
+    if (res.resolver_init(&r) < 1) { return 27; }     // always at least one server
+    if (r.nsrv < 1) { return 28; }
+    if (r.nsrv > 3) { return 29; }
+    if (r.timeout_ms <= 0) { return 30; }
+    if (r.tries <= 0) { return 31; }
+    if (r.ready != 1) { return 32; }
+    // A nameserver of 0.0.0.0 would be a parse that silently produced nothing.
+    let is i64 as si with mut = 0;
+    while (si < r.nsrv) {
+        if (r.srv[si] == 0) { return 33; }
+        si = si + 1;
+    }
+
+    // ===== a literal is answered without a query ======================
+    // No server is reachable from a test, so anything that returns here proves
+    // it never went to the wire.
+    if (res.resolve(&r, "127.0.0.1", cast(*u8, &addr), 0) != 4) { return 34; }
+    if (eq4(cast(*u8, &addr), 127, 0, 0, 1) == 0) { return 35; }
+    if (res.resolve(&r, "8.8.4.4", cast(*u8, &addr), 0) != 4) { return 36; }
+    if (eq4(cast(*u8, &addr), 8, 8, 4, 4) == 0) { return 37; }
+    // Asking for AAAA and being handed a v4 literal is not an answer.
+    if (res.resolve(&r, "127.0.0.1", cast(*u8, &addr), 1) != dns.DNS_ERR_NODATA) { return 38; }
+
+    // A name too long for the wire is refused before any of that.
+    let is [300]u8 as longname;
+    i = 0;
+    while (i < 280) { longname[i] = cast(u8, 97); i = i + 1; }
+    longname[280] = cast(u8, 0);
+    if (res.resolve(&r, cast(*u8, &longname), cast(*u8, &addr), 0) != dns.DNS_ERR_NAME) { return 39; }
+    if (res.resolve(&r, "", cast(*u8, &addr), 0) != dns.DNS_ERR_NAME) { return 40; }
+
+    // ===== /etc/hosts, before the network =============================
+    // Every Linux has localhost here, and a resolver that goes to the wire for
+    // it is one that ignores the file entirely.
+    if (res.hosts_lookup("localhost", cast(*u8, &addr)) != 4) { return 41; }
+    if (eq4(cast(*u8, &addr), 127, 0, 0, 1) == 0) { return 42; }
+    // Case-insensitive, like every name.
+    if (res.hosts_lookup("LOCALHOST", cast(*u8, &addr)) != 4) { return 43; }
+    if (eq4(cast(*u8, &addr), 127, 0, 0, 1) == 0) { return 44; }
+    // A trailing dot is the fully-qualified spelling of the same name.
+    if (res.hosts_lookup("localhost.", cast(*u8, &addr)) != 4) { return 45; }
+    // A name that is not there must not match a prefix of one that is.
+    if (res.hosts_lookup("localhos", cast(*u8, &addr)) != 0) { return 46; }
+    if (res.hosts_lookup("localhostx", cast(*u8, &addr)) != 0) { return 47; }
+    if (res.hosts_lookup("definitely-not-in-hosts.invalid", cast(*u8, &addr)) != 0) { return 48; }
+
+    // And through the front door.
+    if (res.resolve(&r, "localhost", cast(*u8, &addr), 0) != 4) { return 49; }
+    if (eq4(cast(*u8, &addr), 127, 0, 0, 1) == 0) { return 50; }
+
+    // ===== the cache ==================================================
+    res.cache_clear();
+
+    let is [16]u8 as put;
+    put[0] = cast(u8, 203); put[1] = cast(u8, 0); put[2] = cast(u8, 113); put[3] = cast(u8, 7);
+    res._cache_put("cached.example", 0, cast(*u8, &put), 4, 300);
+    if (res._cache_find("cached.example", 0, cast(*u8, &addr)) != 4) { return 51; }
+    if (eq4(cast(*u8, &addr), 203, 0, 113, 7) == 0) { return 52; }
+    // Case-insensitive on the way out too.
+    if (res._cache_find("CACHED.example", 0, cast(*u8, &addr)) != 4) { return 53; }
+    // A different question is a different entry: an A answer must not satisfy
+    // an AAAA lookup for the same name.
+    if (res._cache_find("cached.example", 1, cast(*u8, &addr)) != 0) { return 54; }
+    if (res._cache_find("other.example", 0, cast(*u8, &addr)) != 0) { return 55; }
+
+    // Putting the same question twice REPLACES the entry. If it appended
+    // instead, two live entries would exist for one name and _cache_find would
+    // return whichever it reached first — as often the stale one as not, so a
+    // refreshed answer would be ignored until the old copy aged out.
+    put[0] = cast(u8, 198); put[1] = cast(u8, 51); put[2] = cast(u8, 100); put[3] = cast(u8, 9);
+    res._cache_put("cached.example", 0, cast(*u8, &put), 4, 300);
+    if (res._cache_find("cached.example", 0, cast(*u8, &addr)) != 4) { return 73; }
+    if (eq4(cast(*u8, &addr), 198, 51, 100, 9) == 0) { return 74; }
+    // ...and exactly one slot is in use for it.
+    let is i64 as live with mut = 0;
+    i = 0;
+    while (i < 64) {
+        if (res._cache[i].expires > 0) { live = live + 1; }
+        i = i + 1;
+    }
+    if (live != 1) { return 75; }
+    // Replacement is per question, not per name: the AAAA entry is its own.
+    res._cache_put("cached.example", 1, cast(*u8, &put), 16, 300);
+    live = 0;
+    i = 0;
+    while (i < 64) {
+        if (res._cache[i].expires > 0) { live = live + 1; }
+        i = i + 1;
+    }
+    if (live != 2) { return 76; }
+
+    put[0] = cast(u8, 203); put[1] = cast(u8, 0); put[2] = cast(u8, 113); put[3] = cast(u8, 7);
+
+    // A TTL of 0 means "do not cache this", not "cache it for no time". Both
+    // spellings LOOK the same from _cache_find — an entry expiring at `now` is
+    // never returned either — so the check that separates them is whether a
+    // slot was spent at all.
+    res.cache_clear();
+    res._cache_put("zero.example", 0, cast(*u8, &put), 4, 0);
+    if (res._cache_find("zero.example", 0, cast(*u8, &addr)) != 0) { return 56; }
+    i = 0;
+    while (i < 64) {
+        if (res._cache[i].expires != 0) { return 71; }
+        i = i + 1;
+    }
+
+    // Negative caching: a remembered NXDOMAIN answers without a query. Without
+    // it, one typo re-asks every nameserver on every retry.
+    res.cache_clear();
+    res._cache_put("nope.example", 0, cast(*u8, &put), 0, 60);
+    if (res._cache_find("nope.example", 0, cast(*u8, &addr)) != dns.DNS_ERR_NXDOMAIN) { return 57; }
+
+    // Expiry. Reaching into the table beats sleeping for a second.
+    res.cache_clear();
+    res._cache_put("expiring.example", 0, cast(*u8, &put), 4, 300);
+    if (res._cache_find("expiring.example", 0, cast(*u8, &addr)) != 4) { return 58; }
+    let is i64 as slot with mut = 0 - 1;
+    i = 0;
+    while (i < 64) {
+        if (res._cache[i].expires > 0) { slot = i; i = 64; }
+        else { i = i + 1; }
+    }
+    if (slot < 0) { return 59; }
+    res._cache[slot].expires = 1;                  // 1970, i.e. long gone
+    if (res._cache_find("expiring.example", 0, cast(*u8, &addr)) != 0) { return 60; }
+
+    // The TTL ceiling: a zone publishing a year does not get a year.
+    res.cache_clear();
+    res._cache_put("forever.example", 0, cast(*u8, &put), 4, 999999999);
+    slot = 0 - 1;
+    i = 0;
+    while (i < 64) {
+        if (res._cache[i].expires > 0) { slot = i; i = 64; }
+        else { i = i + 1; }
+    }
+    if (slot < 0) { return 61; }
+    // now + TTL_MAX exactly, and not a second past it. Measured against the
+    // clock rather than some distant absolute date: 999999999 seconds from now
+    // is still only the year 2062, so a loose upper bound here would let an
+    // uncapped TTL through while looking like it had checked something.
+    let is i64 as now = time.unix_time();
+    if (res._cache[slot].expires > now + 86400) { return 62; }
+    if (res._cache[slot].expires < now + 86400 - 5) { return 72; }
+
+    // The table holds 64 entries and must survive being overfilled, keeping
+    // the most recent rather than corrupting or refusing.
+    res.cache_clear();
+    let is [32]u8 as nm;
+    i = 0;
+    while (i < 200) {
+        let is i64 as w with mut = 0;
+        w = 0;
+        nm[w] = cast(u8, 110); w = w + 1;          // 'n'
+        let is i64 as v with mut = i;
+        if (v == 0) { nm[w] = cast(u8, 48); w = w + 1; }
+        let is i64 as ds = w;
+        while (v > 0) { nm[w] = cast(u8, 48 + v % 10); v = v / 10; w = w + 1; }
+        let is i64 as a with mut = ds;
+        let is i64 as b with mut = w - 1;
+        while (a < b) {
+            let is u8 as t = nm[a]; nm[a] = nm[b]; nm[b] = t;
+            a = a + 1; b = b - 1;
+        }
+        nm[w] = cast(u8, 0);
+        res._cache_put(cast(*u8, &nm), 0, cast(*u8, &put), 4, 300);
+        i = i + 1;
+    }
+    // The last one written is certainly still there.
+    if (res._cache_find("n199", 0, cast(*u8, &addr)) != 4) { return 63; }
+    if (eq4(cast(*u8, &addr), 203, 0, 113, 7) == 0) { return 64; }
+
+    // ===== addr_str ===================================================
+    let is [64]u8 as txt;
+    put[0] = cast(u8, 192); put[1] = cast(u8, 168); put[2] = cast(u8, 1); put[3] = cast(u8, 250);
+    if (res.addr_str(cast(*u8, &put), 4, cast(*u8, &txt), 64) <= 0) { return 65; }
+    if (streq(cast(*u8, &txt), "192.168.1.250") == 0) { return 66; }
+    if (res.addr_str(cast(*u8, &put), 4, cast(*u8, &txt), 4) != res.RES_ERR_SPACE) { return 67; }
+    if (res.addr_str(cast(*u8, &put), 7, cast(*u8, &txt), 64) != res.RES_ERR_SPACE) { return 68; }
+
+    // ===== error names ================================================
+    // res_err_name falls through to dns_err_name, so one accessor covers the
+    // whole range a caller can be handed.
+    if (streq(res.res_err_name(res.RES_ERR_TIMEOUT), "RES_ERR_TIMEOUT") == 0) { return 69; }
+    if (streq(res.res_err_name(dns.DNS_ERR_NXDOMAIN), "DNS_ERR_NXDOMAIN") == 0) { return 70; }
+
+    res.cache_clear();
+    return 0;
+}

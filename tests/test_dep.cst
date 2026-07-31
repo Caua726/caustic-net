@@ -1,0 +1,90 @@
+// =======================================================
+// tests/test_dep.cst — the dependency chain, end to end.
+//
+// Not a test of caustic-crypto: that library validates its own primitives
+// against CAVP and Wycheproof. This checks the three things that are ours —
+// that `depend "caustic-crypto"` resolves, that the QUALIFIED import form is
+// the one that works, and that what comes back is the real function and not a
+// stub that links and returns zeros.
+//
+// The qualified form is the point. `use "hash/sha2.cst"` also compiles here,
+// because caustic-crypto is a DIRECT dependency of caustic-net and caustic-mk
+// gives every direct dependency its own --path. It stops compiling for a
+// consumer, where caustic-crypto arrives transitively and only the deps-root
+// --path applies. Green here, broken for them.
+//
+// Exit 0 = all pass. Non-zero = the numbered check that failed.
+// =======================================================
+
+use "caustic-crypto/hash/sha2.cst" as sha2;
+
+fn eq(a as i64, b as i64) as i64 {
+    if (a == b) { return 1; }
+    return 0;
+}
+
+fn main() as i32 {
+    // FIPS 180-4, SHA-256("abc")
+    //   ba7816bf 8f01cfea 414140de 5dae2223 b00361a3 96177a9c b410ff61 f20015ad
+    let is [32]u8 as d;
+    sha2.sha256("abc", 3, cast(*u8, &d));
+    if (eq(cast(i64, d[0]), 186) == 0) { return 1; }
+    if (eq(cast(i64, d[1]), 120) == 0) { return 2; }
+    if (eq(cast(i64, d[2]), 22) == 0)  { return 3; }
+    if (eq(cast(i64, d[3]), 191) == 0) { return 4; }
+    if (eq(cast(i64, d[31]), 173) == 0) { return 5; }
+
+    // The empty digest, which a stub returning zeros would get wrong:
+    //   e3b0c442 98fc1c14 9afbf4c8 996fb924 27ae41e4 649b934c a495991b 7852b855
+    let is [32]u8 as e;
+    sha2.sha256(cast(*u8, 0), 0, cast(*u8, &e));
+    if (eq(cast(i64, e[0]), 227) == 0) { return 6; }
+    if (eq(cast(i64, e[1]), 176) == 0) { return 7; }
+    if (eq(cast(i64, e[31]), 85) == 0) { return 8; }
+
+    // Incremental must agree with one-shot — this is the API the TLS transcript
+    // hash is built on, and the property it depends on (see tls/transcript.cst).
+    let is sha2.Sha256 as st;
+    sha2.sha256_init(&st);
+    sha2.sha256_update(&st, "a", 1);
+    sha2.sha256_update(&st, "b", 1);
+    sha2.sha256_update(&st, "c", 1);
+    let is [32]u8 as inc;
+    sha2.sha256_final(&st, cast(*u8, &inc));
+    let is i64 as i with mut = 0;
+    while (i < 32) {
+        if (eq(cast(i64, inc[i]), cast(i64, d[i])) == 0) { return 9; }
+        i = i + 1;
+    }
+
+    // The state is a pointer-free POD, so a plain struct copy is a valid clone.
+    // TLS 1.3 needs exactly this: an interim transcript digest without ending
+    // the transcript, because sha256_final is destructive.
+    let is sha2.Sha256 as live;
+    sha2.sha256_init(&live);
+    sha2.sha256_update(&live, "a", 1);
+    let is sha2.Sha256 as snap = live;      // clone
+    let is [32]u8 as snapd;
+    sha2.sha256_final(&snap, cast(*u8, &snapd));   // consumes the clone only
+
+    let is [32]u8 as one;
+    sha2.sha256("a", 1, cast(*u8, &one));
+    i = 0;
+    while (i < 32) {
+        if (eq(cast(i64, snapd[i]), cast(i64, one[i])) == 0) { return 10; }
+        i = i + 1;
+    }
+
+    // ...and the original is still live and still correct after the clone died.
+    sha2.sha256_update(&live, "b", 1);
+    sha2.sha256_update(&live, "c", 1);
+    let is [32]u8 as after;
+    sha2.sha256_final(&live, cast(*u8, &after));
+    i = 0;
+    while (i < 32) {
+        if (eq(cast(i64, after[i]), cast(i64, d[i])) == 0) { return 11; }
+        i = i + 1;
+    }
+
+    return 0;
+}
