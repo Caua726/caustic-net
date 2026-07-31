@@ -119,11 +119,11 @@ client/      fetch* (url→dns→connect→tls→http→redirect→decompress)
 | core | `chrono` — epoch ↔ civil, ASN.1 time, HTTP-date | ✅ green (`tests/test_chrono`, exhaustive 1888–2106) |
 | transport | `tcp_conn` · `transport` · `Listener` · peer address | ✅ green (`examples/tcp_echo`) |
 | transport | epoll/kqueue/IOCP reactor | ⏳ unblocked — stdlib v0.1.6 ships `net.Poller` (epoll on Linux, `poll` elsewhere) |
-| transport | IPv6 · Happy Eyeballs (RFC 8305) | ⏳ unblocked — stdlib v0.1.6 ships `Addr6`, `tcp_connect6`, `udp_bind6` |
+| transport | Happy Eyeballs (RFC 8305) | ⏳ IPv6 resolves and dials; the two families are tried in series, not raced |
 | proto | `url` — RFC 3986 incl. relative resolution (§5.2) | ✅ green (`tests/test_url`) |
 | proto | `http1` client — build, head parse, body framing | ✅ green (`tests/test_http1`, `examples/http_get`) |
 | proto | `dns` — wire codec, no I/O | ✅ green (`tests/test_dns`, 2 live captures + 15 hostile packets) |
-| transport | `resolver` — `hosts` · `resolv.conf` · UDP + TCP fallback · TTL cache · `dial_host` | ✅ green (`tests/test_res`, `examples/dns_lookup`) |
+| transport | `resolver` — `hosts` · `resolv.conf` incl. `search`/`ndots` · IPv4+IPv6 · UDP + TCP fallback · TTL cache (SOA-derived on a negative) · `dial_host` | ✅ green (`tests/test_res`, `examples/dns_lookup`) |
 | deps | `caustic-crypto` v0.1.0 wired in | ✅ green (`tests/test_dep`) |
 | everything else | see the roadmap | ⏳ |
 

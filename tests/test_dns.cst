@@ -29,6 +29,13 @@ let is i64 as R_EXAMPLE_N with imut = 61;
 let is *u8 as R_CNAME with imut = "\x56\x78\x81\x80\x00\x01\x00\x02\x00\x00\x00\x00\x03\x77\x77\x77\x06\x67\x69\x74\x68\x75\x62\x03\x63\x6f\x6d\x00\x00\x01\x00\x01\xc0\x0c\x00\x05\x00\x01\x00\x00\x0d\xc1\x00\x02\xc0\x10\xc0\x10\x00\x01\x00\x01\x00\x00\x00\x2d\x00\x04\x04\xe4\x1f\x96";
 let is i64 as R_CNAME_N with imut = 62;
 
+// A real negative answer from 1.1.1.1: no answers, one authority record, and
+// that record is the SOA whose MINIMUM says how long the absence may be
+// cached. RFC 2308 §5. Decoded by hand from the capture: SOA at offset 51,
+// TTL 1800, MINIMUM 1800.
+let is *u8 as R_NXSOA with imut = "\x43\x21\x81\x80\x00\x01\x00\x00\x00\x01\x00\x00\x15\x6e\x61\x6f\x2d\x65\x78\x69\x73\x74\x65\x2d\x6d\x65\x73\x6d\x6f\x2d\x31\x32\x33\x34\x07\x65\x78\x61\x6d\x70\x6c\x65\x03\x63\x6f\x6d\x00\x00\x01\x00\x01\xc0\x22\x00\x06\x00\x01\x00\x00\x07\x08\x00\x32\x07\x65\x6c\x6c\x69\x6f\x74\x74\x02\x6e\x73\x0a\x63\x6c\x6f\x75\x64\x66\x6c\x61\x72\x65\xc0\x2a\x03\x64\x6e\x73\xc0\x4a\x8f\xb2\xa4\x2b\x00\x00\x27\x10\x00\x00\x09\x60\x00\x09\x3a\x80\x00\x00\x07\x08";
+let is i64 as R_NXSOA_N with imut = 113;
+
 // What dns_encode_query must produce for example.com A with ID 0x1234.
 let is *u8 as Q_EXAMPLE with imut = "\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07\x65\x78\x61\x6d\x70\x6c\x65\x03\x63\x6f\x6d\x00\x00\x01\x00\x01";
 let is i64 as Q_EXAMPLE_N with imut = 29;
@@ -334,6 +341,36 @@ fn main() as i32 {
     // Bounded, like the pointer walk, one level up.
     if (dns.dns_parse(P_CNAMELOOP, P_CNAMELOOP_N, &m) != 0) { return 92; }
     if (dns.dns_addr_of(&m, "a.com", cast(*u8, &addr), 0, &ttl) != dns.DNS_ERR_LOOP) { return 93; }
+
+    // ===== the SOA behind a negative answer ===========================
+    // How long "this name has no address" may be remembered. A constant here
+    // instead would either re-ask a dead name constantly or keep believing in
+    // its absence after it starts existing.
+    if (dns.dns_parse(R_NXSOA, R_NXSOA_N, &m) != 0) { return 110; }
+    if (m.an != 0) { return 111; }
+    if (m.ns != 1) { return 112; }
+    // The authority section starts right after the (empty) answer section.
+    if (dns.dns_ns_off(&m) != 51) { return 113; }
+
+    cur = 0;
+    if (dns.dns_authority_next(&m, &cur, &rr) != 1) { return 114; }
+    if (rr.rtype != dns.T_SOA) { return 115; }
+    if (rr.ttl != 1800) { return 116; }
+    if (dns.dns_authority_next(&m, &cur, &rr) != 0) { return 117; }
+
+    // min(record TTL, RDATA MINIMUM) = min(1800, 1800).
+    if (dns.dns_neg_ttl(&m) != 1800) { return 118; }
+
+    // A reply with no authority section has no SOA to read, and says so
+    // rather than inventing a number.
+    if (dns.dns_parse(R_EXAMPLE, R_EXAMPLE_N, &m) != 0) { return 119; }
+    if (dns.dns_neg_ttl(&m) != 0 - 1) { return 120; }
+
+    // Walking the authority section means walking every answer first, so it
+    // inherits the same bounds — a record that does not fit is an error, not a
+    // read past the datagram.
+    if (dns.dns_parse(P_RDOVER, P_RDOVER_N, &m) != 0) { return 121; }
+    if (dns.dns_ns_off(&m) >= 0) { return 122; }
 
     // ===== name comparison ============================================
     if (dns.dns_parse(R_EXAMPLE, R_EXAMPLE_N, &m) != 0) { return 94; }

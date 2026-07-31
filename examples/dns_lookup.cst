@@ -63,6 +63,15 @@ fn main(argc as i64, argv as *u8) as i32 {
     io.write_int(1, r.timeout_ms);
     io.write_str(1, "ms   tries ");
     io.write_int(1, r.tries);
+    io.write_str(1, "   ndots ");
+    io.write_int(1, r.ndots);
+    io.write_str(1, "   search ");
+    io.write_int(1, r.nsearch);
+    let is i64 as sj with mut = 0;
+    while (sj < r.nsearch) {
+        io.write_str(1, " "); io.write_str(1, cast(*u8, &r.search[sj]));
+        sj = sj + 1;
+    }
     io.write_str(1, "\n");
 
     let is i64 as bad with mut = 0;
@@ -78,6 +87,21 @@ fn main(argc as i64, argv as *u8) as i32 {
         bad = bad + show(&r, "1.1.1.1");            // a literal, no query
         bad = bad + show(&r, "example.com");
         bad = bad + show(&r, "www.github.com");     // a CNAME chain
+
+        // AAAA. Reported rather than required: a machine on a v4-only network
+        // legitimately has no route to ask, and the assertion that the v6 path
+        // works lives in tests/test_res.cst where it needs no network at all.
+        let is [16]u8 as a6;
+        let is [64]u8 as t6;
+        io.write_str(1, "  example.com AAAA          ");
+        let is i64 as n6 = res.resolve(&r, "example.com", cast(*u8, &a6), 1);
+        if (n6 == 16) {
+            res.addr_str(cast(*u8, &a6), 16, cast(*u8, &t6), 64);
+            io.write_str(1, cast(*u8, &t6)); io.write_str(1, "\n");
+        } else {
+            io.write_str(1, "sem AAAA ("); io.write_str(1, res.res_err_name(n6));
+            io.write_str(1, ")\n");
+        }
 
         // A name that does not exist: the answer is NXDOMAIN, which is a
         // success for the resolver even though it is a failure for the caller.

@@ -423,6 +423,78 @@ fn dns_rr_at(m as *DnsMsg, off as i64, rr as *DnsRR) as i64 {
     return 0;
 }
 
+// Where the AUTHORITY section starts: past every answer.
+//
+// Computed on demand rather than in dns_parse, because it costs a walk of the
+// whole answer section and almost every caller only wants an address. Each
+// step goes through dns_rr_at, so the same bounds apply — a count of 65535 in
+// the header cannot walk off the datagram, it fails at the first record that
+// does not fit.
+fn dns_ns_off(m as *DnsMsg) as i64 {
+    let is i64 as off with mut = m.an_off;
+    let is DnsRR as rr;
+    let is i64 as i with mut = 0;
+    while (i < m.an) {
+        if (dns_rr_at(m, off, &rr) != 0) { return DNS_ERR_FORMAT; }
+        off = rr.next;
+        i = i + 1;
+    }
+    return off;
+}
+
+// Iterate the authority section, the same way dns_answer_next does the answers.
+fn dns_authority_next(m as *DnsMsg, cur as *i64, rr as *DnsRR) as i64 {
+    if (*cur >= m.ns) { return 0; }
+    let is i64 as off with mut = 0;
+    if (*cur == 0) {
+        off = dns_ns_off(m);
+        if (off < 0) { return off; }
+    } else { off = rr.next; }
+
+    let is i64 as rc = dns_rr_at(m, off, rr);
+    if (rc < 0) { return rc; }
+    *cur = *cur + 1;
+    return 1;
+}
+
+// How long a NEGATIVE answer may be cached, per RFC 2308 §5: the smaller of
+// the SOA record's own TTL and the MINIMUM field in its RDATA, taken from the
+// SOA the server puts in the authority section of an NXDOMAIN or NODATA reply.
+//
+// Returns -1 when there is no usable SOA, which is a real case — a server is
+// not obliged to send one — and leaves the caller to pick a default. Guessing
+// a long TTL here would cache a name's absence past the point where it exists.
+//
+// SOA RDATA is MNAME, RNAME, then five 32-bit fields; MINIMUM is the last.
+// The two names can be compressed, so they are walked rather than assumed to
+// be any particular length.
+fn dns_neg_ttl(m as *DnsMsg) as i64 {
+    let is DnsRR as rr;
+    let is i64 as cur with mut = 0;
+    while (dns_authority_next(m, &cur, &rr) == 1) {
+        if (rr.rtype != T_SOA) { continue; }
+        if (rr.rclass != C_IN) { continue; }
+
+        let is i64 as p with mut = rr.rd_off;
+        let is i64 as n1 = dns_name_wire_len(m.buf, m.len, p);
+        if (n1 < 0) { continue; }
+        p = p + n1;
+        let is i64 as n2 = dns_name_wire_len(m.buf, m.len, p);
+        if (n2 < 0) { continue; }
+        p = p + n2;
+
+        // SERIAL REFRESH RETRY EXPIRE MINIMUM — twenty bytes, and they have to
+        // be inside this record rather than merely inside the message.
+        if (p + 20 > rr.rd_off + rr.rd_len) { continue; }
+        let is i64 as minimum = _u32(m.buf, p + 16);
+
+        let is i64 as t with mut = minimum;
+        if (rr.ttl < t) { t = rr.ttl; }
+        return t;
+    }
+    return 0 - 1;
+}
+
 // Iterate the answer section. `cur` starts at 0 and is opaque afterwards.
 // Returns 1 with `rr` filled, 0 when the section is done, or <0.
 fn dns_answer_next(m as *DnsMsg, cur as *i64, rr as *DnsRR) as i64 {

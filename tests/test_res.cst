@@ -40,6 +40,15 @@ fn main() as i32 {
     let is i64 as ip with mut = 0;
     let is i64 as i with mut = 0;
 
+    // The Resolver's arrays are declared with LITERAL dimensions rather than
+    // [MAX_SERVERS] / [MAX_SEARCH]. The compiler grew support for a named one
+    // in a struct field (Caustic 5753566), but CI builds against the published
+    // release, which has not, and there a named dimension sizes to nothing and
+    // writes off the end. These pin the literals to the constants so the two
+    // spellings cannot drift while they are separate.
+    if (sizeof([3][16]u8) != res.MAX_SERVERS * 16) { return 200; }
+    if (sizeof([6][256]u8) != res.MAX_SEARCH * 256) { return 201; }
+
     // ===== parse_ipv4 =================================================
     // The point of this function is telling "already an address" from "a name
     // to look up" with no ambiguity, so both answers have to be exact.
@@ -135,23 +144,23 @@ fn main() as i32 {
 
     let is [16]u8 as put;
     put[0] = cast(u8, 203); put[1] = cast(u8, 0); put[2] = cast(u8, 113); put[3] = cast(u8, 7);
-    res._cache_put("cached.example", 0, cast(*u8, &put), 4, 300);
-    if (res._cache_find("cached.example", 0, cast(*u8, &addr)) != 4) { return 51; }
+    res._cache_put("cached.example", 4, cast(*u8, &put), 4, 300);
+    if (res._cache_find("cached.example", 4, cast(*u8, &addr)) != 4) { return 51; }
     if (eq4(cast(*u8, &addr), 203, 0, 113, 7) == 0) { return 52; }
     // Case-insensitive on the way out too.
-    if (res._cache_find("CACHED.example", 0, cast(*u8, &addr)) != 4) { return 53; }
+    if (res._cache_find("CACHED.example", 4, cast(*u8, &addr)) != 4) { return 53; }
     // A different question is a different entry: an A answer must not satisfy
     // an AAAA lookup for the same name.
-    if (res._cache_find("cached.example", 1, cast(*u8, &addr)) != 0) { return 54; }
-    if (res._cache_find("other.example", 0, cast(*u8, &addr)) != 0) { return 55; }
+    if (res._cache_find("cached.example", 16, cast(*u8, &addr)) != 0) { return 54; }
+    if (res._cache_find("other.example", 4, cast(*u8, &addr)) != 0) { return 55; }
 
     // Putting the same question twice REPLACES the entry. If it appended
     // instead, two live entries would exist for one name and _cache_find would
     // return whichever it reached first — as often the stale one as not, so a
     // refreshed answer would be ignored until the old copy aged out.
     put[0] = cast(u8, 198); put[1] = cast(u8, 51); put[2] = cast(u8, 100); put[3] = cast(u8, 9);
-    res._cache_put("cached.example", 0, cast(*u8, &put), 4, 300);
-    if (res._cache_find("cached.example", 0, cast(*u8, &addr)) != 4) { return 73; }
+    res._cache_put("cached.example", 4, cast(*u8, &put), 4, 300);
+    if (res._cache_find("cached.example", 4, cast(*u8, &addr)) != 4) { return 73; }
     if (eq4(cast(*u8, &addr), 198, 51, 100, 9) == 0) { return 74; }
     // ...and exactly one slot is in use for it.
     let is i64 as live with mut = 0;
@@ -162,7 +171,7 @@ fn main() as i32 {
     }
     if (live != 1) { return 75; }
     // Replacement is per question, not per name: the AAAA entry is its own.
-    res._cache_put("cached.example", 1, cast(*u8, &put), 16, 300);
+    res._cache_put("cached.example", 16, cast(*u8, &put), 16, 300);
     live = 0;
     i = 0;
     while (i < 64) {
@@ -178,8 +187,8 @@ fn main() as i32 {
     // never returned either — so the check that separates them is whether a
     // slot was spent at all.
     res.cache_clear();
-    res._cache_put("zero.example", 0, cast(*u8, &put), 4, 0);
-    if (res._cache_find("zero.example", 0, cast(*u8, &addr)) != 0) { return 56; }
+    res._cache_put("zero.example", 4, cast(*u8, &put), 4, 0);
+    if (res._cache_find("zero.example", 4, cast(*u8, &addr)) != 0) { return 56; }
     i = 0;
     while (i < 64) {
         if (res._cache[i].expires != 0) { return 71; }
@@ -189,13 +198,13 @@ fn main() as i32 {
     // Negative caching: a remembered NXDOMAIN answers without a query. Without
     // it, one typo re-asks every nameserver on every retry.
     res.cache_clear();
-    res._cache_put("nope.example", 0, cast(*u8, &put), 0, 60);
-    if (res._cache_find("nope.example", 0, cast(*u8, &addr)) != dns.DNS_ERR_NXDOMAIN) { return 57; }
+    res._cache_put("nope.example", 4, cast(*u8, &put), 0, 60);
+    if (res._cache_find("nope.example", 4, cast(*u8, &addr)) != dns.DNS_ERR_NXDOMAIN) { return 57; }
 
     // Expiry. Reaching into the table beats sleeping for a second.
     res.cache_clear();
-    res._cache_put("expiring.example", 0, cast(*u8, &put), 4, 300);
-    if (res._cache_find("expiring.example", 0, cast(*u8, &addr)) != 4) { return 58; }
+    res._cache_put("expiring.example", 4, cast(*u8, &put), 4, 300);
+    if (res._cache_find("expiring.example", 4, cast(*u8, &addr)) != 4) { return 58; }
     let is i64 as slot with mut = 0 - 1;
     i = 0;
     while (i < 64) {
@@ -204,11 +213,11 @@ fn main() as i32 {
     }
     if (slot < 0) { return 59; }
     res._cache[slot].expires = 1;                  // 1970, i.e. long gone
-    if (res._cache_find("expiring.example", 0, cast(*u8, &addr)) != 0) { return 60; }
+    if (res._cache_find("expiring.example", 4, cast(*u8, &addr)) != 0) { return 60; }
 
     // The TTL ceiling: a zone publishing a year does not get a year.
     res.cache_clear();
-    res._cache_put("forever.example", 0, cast(*u8, &put), 4, 999999999);
+    res._cache_put("forever.example", 4, cast(*u8, &put), 4, 999999999);
     slot = 0 - 1;
     i = 0;
     while (i < 64) {
@@ -244,12 +253,138 @@ fn main() as i32 {
             a = a + 1; b = b - 1;
         }
         nm[w] = cast(u8, 0);
-        res._cache_put(cast(*u8, &nm), 0, cast(*u8, &put), 4, 300);
+        res._cache_put(cast(*u8, &nm), 4, cast(*u8, &put), 4, 300);
         i = i + 1;
     }
     // The last one written is certainly still there.
-    if (res._cache_find("n199", 0, cast(*u8, &addr)) != 4) { return 63; }
+    if (res._cache_find("n199", 4, cast(*u8, &addr)) != 4) { return 63; }
     if (eq4(cast(*u8, &addr), 203, 0, 113, 7) == 0) { return 64; }
+
+    // ===== parse_ipv6 =================================================
+    let is [16]u8 as v6;
+    if (res.parse_ipv6("2001:db8::1", cast(*u8, &v6)) != 1) { return 77; }
+    if (cast(i64, v6[0]) != 32 || cast(i64, v6[1]) != 1) { return 78; }
+    if (cast(i64, v6[15]) != 1) { return 79; }
+    if (res.parse_ipv6("::1", cast(*u8, &v6)) != 1) { return 80; }
+    if (cast(i64, v6[15]) != 1) { return 81; }
+    if (cast(i64, v6[0]) != 0) { return 82; }
+    // An IPv4 literal is not an IPv6 one, and vice versa: the two parsers have
+    // to disagree, or a v4 address would be dialled as v6 or the reverse.
+    if (res.parse_ipv6("1.2.3.4", cast(*u8, &v6)) != 0) { return 83; }
+    if (res.parse_ipv6("nao-e-endereco", cast(*u8, &v6)) != 0) { return 84; }
+    if (res.parse_ipv6("", cast(*u8, &v6)) != 0) { return 85; }
+    if (res.parse_ipv4_bytes("::1", cast(*u8, &v6)) != 0) { return 86; }
+
+    // An IPv6 literal answers itself, the same as a v4 one does.
+    if (res.resolve(&r, "::1", cast(*u8, &addr), 1) != 16) { return 87; }
+    if (cast(i64, addr[15]) != 1) { return 88; }
+    // ...and asking for A when handed a v6 literal is not an answer.
+    if (res.resolve(&r, "::1", cast(*u8, &addr), 0) != dns.DNS_ERR_NODATA) { return 89; }
+
+    // ===== the search list ============================================
+    // Exercised offline by priming the cache with the name the search list
+    // ought to produce: if the suffix is never appended, nothing is found and
+    // the lookup would have to go to a network no test has.
+    res.cache_clear();
+    let is res.Resolver as sr;
+    res.resolver_defaults(&sr);
+    sr.srv[0][0] = cast(u8, 127); sr.srv[0][1] = cast(u8, 0);
+    sr.srv[0][2] = cast(u8, 0);   sr.srv[0][3] = cast(u8, 1);
+    sr.srv6[0] = 0;
+    sr.nsrv = 1;
+    sr.tries = 1;
+    sr.timeout_ms = 1;
+    // search corp.example
+    let is *u8 as suffix = "corp.example";
+    i = 0;
+    while (suffix[i] != 0) { sr.search[0][i] = suffix[i]; i = i + 1; }
+    sr.search[0][i] = cast(u8, 0);
+    sr.nsearch = 1;
+    sr.ndots = 1;
+
+    put[0] = cast(u8, 10); put[1] = cast(u8, 1); put[2] = cast(u8, 2); put[3] = cast(u8, 3);
+    res._cache_put("intranet.corp.example", 4, cast(*u8, &put), 4, 300);
+
+    // "intranet" has 0 dots, below ndots 1, so the suffix is tried FIRST and
+    // the cached FQDN answers. Without a search list this is the lookup that
+    // fails on a corporate network while every other program succeeds.
+    if (res.resolve(&sr, "intranet", cast(*u8, &addr), 0) != 4) { return 90; }
+    if (eq4(cast(*u8, &addr), 10, 1, 2, 3) == 0) { return 91; }
+
+    // A trailing dot means absolute: no suffix, ever.
+    //
+    // Checking only that the lookup fails would not prove it — appending a
+    // suffix to "intranet." yields "intranet..corp.example", which fails too,
+    // so both behaviours look identical from outside. What separates them is
+    // whether that joined name is ever ASKED FOR, so it gets cached and the
+    // answer must still not come back. ndots is raised so the search list
+    // would be tried first if the short-circuit were gone.
+    sr.ndots = 4;
+    put[0] = cast(u8, 9); put[1] = cast(u8, 9); put[2] = cast(u8, 9); put[3] = cast(u8, 9);
+    res._cache_put("intranet..corp.example", 4, cast(*u8, &put), 4, 300);
+    if (res.resolve(&sr, "intranet.", cast(*u8, &addr), 0) == 4) { return 92; }
+    sr.ndots = 1;
+
+    // ===== ndots decides the ORDER, and the order decides the answer ===
+    // Both names cached, with different addresses. Which one comes back is
+    // purely a question of which candidate is tried first.
+    res.cache_clear();
+    put[0] = cast(u8, 1); put[1] = cast(u8, 1); put[2] = cast(u8, 1); put[3] = cast(u8, 1);
+    res._cache_put("host.dev", 4, cast(*u8, &put), 4, 300);          // as typed
+    put[0] = cast(u8, 2); put[1] = cast(u8, 2); put[2] = cast(u8, 2); put[3] = cast(u8, 2);
+    res._cache_put("host.dev.corp.example", 4, cast(*u8, &put), 4, 300);   // suffixed
+
+    // "host.dev" has one dot. With ndots 1 that meets the threshold, so it is
+    // tried as typed first and the internet-facing name wins.
+    sr.ndots = 1;
+    if (res.resolve(&sr, "host.dev", cast(*u8, &addr), 0) != 4) { return 93; }
+    if (eq4(cast(*u8, &addr), 1, 1, 1, 1) == 0) { return 94; }
+
+    // With ndots 2 it falls below, so the search list goes first and the
+    // corporate host wins. Same input, same cache, opposite answer — which is
+    // exactly why the directive cannot be ignored.
+    sr.ndots = 2;
+    if (res.resolve(&sr, "host.dev", cast(*u8, &addr), 0) != 4) { return 95; }
+    if (eq4(cast(*u8, &addr), 2, 2, 2, 2) == 0) { return 96; }
+
+    // ===== a search entry of "." is no entry ==========================
+    // systemd-resolved writes `search .` on a machine with no search domain.
+    // Appending it would build "name.." — a name with an empty label in the
+    // middle, which no zone answers — and, worse, the failure of that query
+    // would then stand in for the real answer the name itself gave.
+    let is res.Resolver as dr;
+    res.resolver_defaults(&dr);
+    res._add_search(&dr, ".", 1);
+    if (dr.nsearch != 0) { return 97; }
+    res._add_search(&dr, "", 0);
+    if (dr.nsearch != 0) { return 98; }
+    res._add_search(&dr, "corp.example", 12);
+    if (dr.nsearch != 1) { return 99; }
+
+    // ===== a definitive answer is not downgraded by a suffix ==========
+    // The name as typed says NXDOMAIN; a suffix then fails to reach anyone.
+    // The caller asked about the name, so NXDOMAIN is the answer — a suffix
+    // being unreachable says nothing about it. Getting this backwards turns
+    // "no such host" into "network is down", which is a different error page.
+    res.cache_clear();
+    let is res.Resolver as nr;
+    res.resolver_defaults(&nr);
+    nr.srv[0][0] = cast(u8, 127); nr.srv[0][1] = cast(u8, 0);
+    nr.srv[0][2] = cast(u8, 0);   nr.srv[0][3] = cast(u8, 1);
+    nr.srv6[0] = 0;
+    nr.nsrv = 1;
+    nr.tries = 1;
+    nr.timeout_ms = 1;                       // the suffix query will not answer
+    i = 0;
+    while (suffix[i] != 0) { nr.search[0][i] = suffix[i]; i = i + 1; }
+    nr.search[0][i] = cast(u8, 0);
+    nr.nsearch = 1;
+    nr.ndots = 1;
+    // "gone.example" has one dot, so it is tried as typed first; the cached
+    // negative answers immediately. The suffixed name is then tried against a
+    // server that is not there.
+    res._cache_put("gone.example", 4, cast(*u8, &put), 0, 300);
+    if (res.resolve(&nr, "gone.example", cast(*u8, &addr), 0) != dns.DNS_ERR_NXDOMAIN) { return 100; }
 
     // ===== addr_str ===================================================
     let is [64]u8 as txt;

@@ -11,6 +11,7 @@ use "./tcp_conn.cst" as tcpc;
 use "./resolver.cst" as res;
 use "../core/conn.cst" as conn;
 use "../core/errno.cst" as errno;
+use "../proto/dns.cst" as dns;
 
 // One-time WSAStartup on Windows; no-op on Linux. Safe to call repeatedly.
 fn init() as i32 {
@@ -48,29 +49,60 @@ let is i64 as _dial_err with mut = 0;
 
 fn dial_host_err() as i64 { return _dial_err; }
 
+fn _connect_addr(addr as *u8, alen as i64, port as i64) as *conn.Conn {
+    if (alen == 4) {
+        let is i64 as ip = (cast(i64, addr[0]) << 24) + (cast(i64, addr[1]) << 16)
+                         + (cast(i64, addr[2]) << 8) + cast(i64, addr[3]);
+        return connect_ip4(ip, port);
+    }
+    if (alen == 16) {
+        let is [28]u8 as buf6;
+        let is net.Addr6 as a6 = net.addr6_init(cast(*u8, &buf6), addr, port);
+        let is i64 as fd = net.tcp_connect6(a6);
+        if (fd < 0) { return cast(*conn.Conn, 0); }
+        return tcpc.conn_from_fd(fd);
+    }
+    return cast(*conn.Conn, 0);
+}
+
 fn dial_host(host as *u8, port as i64) as *conn.Conn {
     _dial_err = 0;
     let is [16]u8 as addr;
-    let is i64 as n = res.resolve(resolver(), host, cast(*u8, &addr), 0);
-    if (n < 0) { _dial_err = n; return cast(*conn.Conn, 0); }
+    let is *res.Resolver as r = resolver();
 
-    if (n == 4) {
-        let is i64 as ip = (cast(i64, addr[0]) << 24) + (cast(i64, addr[1]) << 16)
-                         + (cast(i64, addr[2]) << 8) + cast(i64, addr[3]);
-        let is *conn.Conn as k = connect_ip4(ip, port);
-        if (cast(i64, k) == 0) { _dial_err = 0 - errno.ECONNREFUSED; }
-        return k;
+    // A first, then AAAA. Not the RFC 6724 preference, and deliberately not:
+    // without Happy Eyeballs (RFC 8305) there is no concurrent attempt to fall
+    // back FROM, so trying IPv6 first on a v4-only network costs a full
+    // connect timeout on every request. A serial resolver should lead with the
+    // family that works everywhere. When client/parallel lands, the two become
+    // simultaneous and this ordering stops mattering.
+    let is i64 as n with mut = res.resolve(r, host, cast(*u8, &addr), 0);
+    if (n > 0) {
+        let is *conn.Conn as k = _connect_addr(cast(*u8, &addr), n, port);
+        if (cast(i64, k) != 0) { return k; }
+        // The name resolves and the host will not take the connection. Trying
+        // AAAA next is still worth it: a dual-stack host can be reachable on
+        // one family and not the other.
+        _dial_err = 0 - errno.ECONNREFUSED;
+    } else {
+        _dial_err = n;
     }
 
-    if (n == 16) {
-        let is [28]u8 as buf6;
-        let is net.Addr6 as a6 = net.addr6_init(cast(*u8, &buf6), cast(*u8, &addr), port);
-        let is i64 as fd = net.tcp_connect6(a6);
-        if (fd < 0) { _dial_err = fd; return cast(*conn.Conn, 0); }
-        return tcpc.conn_from_fd(fd);
+    let is i64 as n6 = res.resolve(r, host, cast(*u8, &addr), 1);
+    if (n6 > 0) {
+        let is *conn.Conn as k6 = _connect_addr(cast(*u8, &addr), n6, port);
+        if (cast(i64, k6) != 0) { _dial_err = 0; return k6; }
+        _dial_err = 0 - errno.ECONNREFUSED;
+        return cast(*conn.Conn, 0);
     }
 
-    _dial_err = 0 - errno.EINVAL;
+    // Neither family. Report whichever failure says more: "no such name" beats
+    // "this name has no address of that kind", since the second is expected
+    // for a v4-only host and tells the caller nothing.
+    if (n < 0 && n6 == dns.DNS_ERR_NODATA) { _dial_err = n; }
+    else {
+        if (n6 < 0 && n == dns.DNS_ERR_NODATA) { _dial_err = n6; }
+    }
     return cast(*conn.Conn, 0);
 }
 
