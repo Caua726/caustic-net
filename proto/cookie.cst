@@ -1,0 +1,641 @@
+// =======================================================
+// caustic-net/proto/cookie.cst
+// Set-Cookie in, Cookie out — RFC 6265.
+//
+// The parsing is the easy half. The half that matters is deciding which
+// cookies a request is allowed to carry, because every rule here exists
+// because it was once absent:
+//
+//   * A cookie's Domain may only widen to a suffix of the host that set it.
+//     Without that, example.com sets a cookie for .com and reads it back from
+//     every site on the internet.
+//   * ...and not to a PUBLIC SUFFIX. `.co.uk` is a suffix of `bbc.co.uk`, and
+//     a cookie set for it would be shared by every British company. There is
+//     no way to tell `.co.uk` from `.bbc.co.uk` by looking; it takes a list.
+//   * Secure cookies never go out over http. A cookie that identifies a
+//     session and travels in the clear is a session anyone on the path owns.
+//   * Path matching is prefix-with-a-boundary, not prefix. `/foo` must not
+//     match `/foobar`, or a cookie for one application leaks to another on
+//     the same host.
+//
+// THE PUBLIC SUFFIX LIST IS A HEURISTIC HERE, and this is the module's real
+// limitation. psl_is_public_suffix refuses a single label (`com`, `localhost`)
+// and a short built-in table of two-part suffixes. It does NOT know that
+// `pvt.k12.ma.us` is one or that `github.io` is. The real list is nine
+// thousand rules and belongs in a generated table; the interface is a single
+// function so that swapping it is one file and one `use`. Until then, a
+// cookie set for an unlisted public suffix is accepted, and that is a real
+// gap rather than a theoretical one.
+// =======================================================
+
+use "std/mem.cst" as mem;
+use "../core/chrono.cst" as chrono;
+use "../proto/http1.cst" as http;
+use "../proto/url.cst" as url;
+
+// --- Errors (the -1700 block) ------------------------------------------
+let is i64 as COOKIE_ERR_PARSE  with imut = 0 - 1700;   // no name=value
+let is i64 as COOKIE_ERR_DOMAIN with imut = 0 - 1701;   // Domain not allowed for this host
+let is i64 as COOKIE_ERR_SPACE  with imut = 0 - 1702;
+let is i64 as COOKIE_ERR_ALLOC  with imut = 0 - 1703;
+
+let is i64 as SAME_SITE_NONE   with imut = 0;
+let is i64 as SAME_SITE_LAX    with imut = 1;
+let is i64 as SAME_SITE_STRICT with imut = 2;
+
+// Literal dimensions, per the note in proto/dns.cst.
+let is i64 as MAX_NAME   with imut = 128;
+let is i64 as MAX_VALUE  with imut = 4096;
+let is i64 as MAX_DOMAIN with imut = 256;
+let is i64 as MAX_PATH   with imut = 512;
+
+struct Cookie {
+    name   as [128]u8;
+    value  as [4096]u8;
+    domain as [256]u8;      // never carries a leading dot
+    path   as [512]u8;
+    expires   as i64;       // epoch, or 0 for a session cookie
+    created   as i64;       // for the ordering RFC 6265 §5.4 requires
+    secure    as i64;
+    http_only as i64;
+    same_site as i64;
+    host_only as i64;       // 1 when no Domain attribute was sent
+    used      as i64;
+}
+
+struct Jar {
+    c   as *Cookie;
+    cap as i64;
+    n   as i64;
+}
+
+fn _slen(s as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+fn _lower(c as u8) as u8 {
+    if (c >= 65 && c <= 90) { return cast(u8, cast(i64, c) + 32); }
+    return c;
+}
+
+fn _ieq(a as *u8, b as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (a[i] != 0 && b[i] != 0) {
+        if (_lower(a[i]) != _lower(b[i])) { return 0; }
+        i = i + 1;
+    }
+    if (a[i] != b[i]) { return 0; }
+    return 1;
+}
+
+fn _eq(a as *u8, b as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (a[i] != 0 && b[i] != 0) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    if (a[i] != b[i]) { return 0; }
+    return 1;
+}
+
+fn _copy(dst as *u8, max as i64, src as *u8, n as i64) as i64 {
+    let is i64 as k with mut = n;
+    if (k > max - 1) { k = max - 1; }
+    let is i64 as i with mut = 0;
+    while (i < k) { dst[i] = src[i]; i = i + 1; }
+    dst[k] = cast(u8, 0);
+    return k;
+}
+
+fn _map_ok(p as *u8) as i64 {
+    let is i64 as v = cast(i64, p);
+    if (v == 0) { return 0; }
+    if (v == 0 - 1) { return 0; }
+    return 1;
+}
+
+// --- The public suffix question ----------------------------------------
+
+// Two-part suffixes common enough to be worth naming before the real list
+// exists. Every one of them is a registry under which anyone can register,
+// so a cookie scoped to one would be shared across unrelated sites.
+let is *u8 as _PSL2 with imut =
+    "co.uk ac.uk gov.uk org.uk net.uk sch.uk com.au net.au org.au edu.au gov.au co.nz net.nz org.nz com.br net.br org.br gov.br co.jp ne.jp or.jp com.cn net.cn org.cn co.in net.in org.in co.za com.mx com.ar com.tr co.kr com.sg com.hk com.tw github.io gitlab.io herokuapp.com pages.dev workers.dev vercel.app netlify.app ";
+
+fn _label_count(d as *u8) as i64 {
+    let is i64 as n with mut = 1;
+    let is i64 as i with mut = 0;
+    while (d[i] != 0) {
+        if (d[i] == 46) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
+// Is `d` a suffix nobody may set a cookie for?
+//
+// The honest version of this function is a generated table of the Mozilla
+// Public Suffix List. This one refuses a single label and a short table, and
+// says yes to nothing else — which means an unlisted public suffix is
+// ACCEPTED. Everything about that is stated at the top of the file, and the
+// signature is what a real implementation would have, so replacing it is one
+// file and one `use`.
+fn psl_is_public_suffix(d as *u8) as i64 {
+    if (d[0] == 0) { return 1; }
+    // A single label — "com", "localhost", an intranet name — is never
+    // something a cookie may be scoped to.
+    if (_label_count(d) < 2) { return 1; }
+
+    let is i64 as dn = _slen(d);
+    // Walk the table, which is space-separated.
+    let is i64 as i with mut = 0;
+    while (_PSL2[i] != 0) {
+        let is i64 as start = i;
+        while (_PSL2[i] != 0 && _PSL2[i] != 32) { i = i + 1; }
+        let is i64 as len = i - start;
+        if (len == dn) {
+            let is i64 as k with mut = 0;
+            let is i64 as same with mut = 1;
+            while (k < len) {
+                if (_lower(d[k]) != _PSL2[start + k]) { same = 0; break; }
+                k = k + 1;
+            }
+            if (same == 1) { return 1; }
+        }
+        if (_PSL2[i] != 0) { i = i + 1; }
+    }
+    return 0;
+}
+
+// RFC 6265 §5.1.3. `host` matches `dom` when they are equal, or when host
+// ends in "." + dom and host is not an IP literal.
+fn domain_matches(dom as *u8, host as *u8) as i64 {
+    if (_ieq(dom, host) == 1) { return 1; }
+    let is i64 as dn = _slen(dom);
+    let is i64 as hn = _slen(host);
+    if (dn == 0) { return 0; }
+    if (hn <= dn) { return 0; }
+    if (host[hn - dn - 1] != 46) { return 0; }     // the dot boundary
+    let is i64 as i with mut = 0;
+    while (i < dn) {
+        if (_lower(host[hn - dn + i]) != _lower(dom[i])) { return 0; }
+        i = i + 1;
+    }
+    // An IP address never domain-matches anything but itself, which the
+    // equality above already handled. Digits and dots only is close enough to
+    // recognise one.
+    let is i64 as k with mut = 0;
+    let is i64 as ipish with mut = 1;
+    while (host[k] != 0) {
+        if (host[k] != 46) {
+            if (host[k] < 48 || host[k] > 57) { ipish = 0; break; }
+        }
+        k = k + 1;
+    }
+    if (ipish == 1) { return 0; }
+    return 1;
+}
+
+// RFC 6265 §5.1.4. A prefix, but only at a "/" boundary: "/foo" covers
+// "/foo", "/foo/" and "/foo/bar", and never "/foobar".
+fn path_matches(cpath as *u8, rpath as *u8) as i64 {
+    if (_eq(cpath, rpath) == 1) { return 1; }
+    let is i64 as cn = _slen(cpath);
+    let is i64 as rn = _slen(rpath);
+    if (cn == 0) { return 0; }
+    if (rn < cn) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < cn) {
+        if (cpath[i] != rpath[i]) { return 0; }
+        i = i + 1;
+    }
+    if (cpath[cn - 1] == 47) { return 1; }      // cookie path ended in '/'
+    if (rpath[cn] == 47) { return 1; }
+    return 0;
+}
+
+// RFC 6265 §5.1.4: the default path of a request is its directory.
+fn default_path(rpath as *u8, out as *u8, max as i64) as i64 {
+    if (rpath[0] != 47) { return _copy(out, max, "/", 1); }
+    let is i64 as n = _slen(rpath);
+    let is i64 as last with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (rpath[i] == 47) { last = i; }
+        i = i + 1;
+    }
+    if (last == 0) { return _copy(out, max, "/", 1); }
+    return _copy(out, max, rpath, last);
+}
+
+// --- Parsing ------------------------------------------------------------
+
+fn _skip_ws(s as *u8, i as i64) as i64 {
+    let is i64 as k with mut = i;
+    while (s[k] == 32 || s[k] == 9) { k = k + 1; }
+    return k;
+}
+
+// One Set-Cookie value into `c`, in the context of the request that got it.
+//
+// `now` is the moment used for Max-Age; `host` and `path` are the request's.
+// Returns 0, or a sentinel. The cookie is NOT stored — jar_set does that.
+fn cookie_parse(v as *u8, host as *u8, rpath as *u8, now as i64,
+                c as *Cookie) as i64 {
+    c.name[0] = cast(u8, 0);
+    c.value[0] = cast(u8, 0);
+    c.domain[0] = cast(u8, 0);
+    c.path[0] = cast(u8, 0);
+    c.expires = 0;
+    c.created = now;
+    c.secure = 0;
+    c.http_only = 0;
+    c.same_site = SAME_SITE_LAX;
+    c.host_only = 1;
+    c.used = 1;
+
+    let is i64 as i with mut = _skip_ws(v, 0);
+    let is i64 as eq with mut = 0 - 1;
+    let is i64 as semi with mut = 0 - 1;
+    let is i64 as k with mut = i;
+    while (v[k] != 0) {
+        if (v[k] == 61 && eq < 0) { eq = k; }
+        if (v[k] == 59) { semi = k; break; }
+        k = k + 1;
+    }
+    let is i64 as pair_end with mut = k;
+    if (eq < 0) { return COOKIE_ERR_PARSE; }
+    if (eq > pair_end) { return COOKIE_ERR_PARSE; }
+
+    // A name must not be empty. A value may be.
+    let is i64 as ne with mut = eq;
+    while (ne > i && (v[ne - 1] == 32 || v[ne - 1] == 9)) { ne = ne - 1; }
+    if (ne <= i) { return COOKIE_ERR_PARSE; }
+    _copy(cast(*u8, &c.name), MAX_NAME, cast(*u8, cast(i64, v) + i), ne - i);
+
+    let is i64 as vs with mut = _skip_ws(v, eq + 1);
+    let is i64 as ve with mut = pair_end;
+    while (ve > vs && (v[ve - 1] == 32 || v[ve - 1] == 9)) { ve = ve - 1; }
+    // A quoted value keeps its quotes off, which is what every other client
+    // does even though RFC 6265 does not say to.
+    if (ve - vs >= 2 && v[vs] == 34 && v[ve - 1] == 34) {
+        vs = vs + 1;
+        ve = ve - 1;
+    }
+    _copy(cast(*u8, &c.value), MAX_VALUE, cast(*u8, cast(i64, v) + vs), ve - vs);
+
+    // --- attributes ---
+    let is i64 as have_maxage with mut = 0;
+    let is i64 as p with mut = pair_end;
+    while (v[p] == 59) {
+        p = _skip_ws(v, p + 1);
+        let is i64 as as_ = p;
+        let is i64 as aeq with mut = 0 - 1;
+        while (v[p] != 0 && v[p] != 59) {
+            if (v[p] == 61 && aeq < 0) { aeq = p; }
+            p = p + 1;
+        }
+        let is i64 as ae = p;
+
+        let is [32]u8 as attr;
+        let is i64 as an with mut = ae - as_;
+        if (aeq >= 0) { an = aeq - as_; }
+        while (an > 0 && (v[as_ + an - 1] == 32 || v[as_ + an - 1] == 9)) { an = an - 1; }
+        _copy(cast(*u8, &attr), 32, cast(*u8, cast(i64, v) + as_), an);
+
+        let is i64 as val_s with mut = ae;
+        let is i64 as val_e with mut = ae;
+        if (aeq >= 0) {
+            val_s = _skip_ws(v, aeq + 1);
+            val_e = ae;
+            while (val_e > val_s && (v[val_e - 1] == 32 || v[val_e - 1] == 9)) {
+                val_e = val_e - 1;
+            }
+        }
+
+        if (_ieq(cast(*u8, &attr), "secure") == 1) { c.secure = 1; }
+        if (_ieq(cast(*u8, &attr), "httponly") == 1) { c.http_only = 1; }
+
+        if (_ieq(cast(*u8, &attr), "path") == 1) {
+            if (val_e > val_s) {
+                if (v[val_s] == 47) {
+                    _copy(cast(*u8, &c.path), MAX_PATH,
+                          cast(*u8, cast(i64, v) + val_s), val_e - val_s);
+                }
+            }
+        }
+
+        if (_ieq(cast(*u8, &attr), "domain") == 1) {
+            let is i64 as ds with mut = val_s;
+            // A leading dot is ignored, not honoured: RFC 6265 dropped the
+            // 2109 distinction and every client treats ".a.com" as "a.com".
+            if (ds < val_e && v[ds] == 46) { ds = ds + 1; }
+            if (val_e > ds) {
+                _copy(cast(*u8, &c.domain), MAX_DOMAIN,
+                      cast(*u8, cast(i64, v) + ds), val_e - ds);
+                c.host_only = 0;
+            }
+        }
+
+        if (_ieq(cast(*u8, &attr), "max-age") == 1) {
+            // Max-Age wins over Expires whenever both are present, and a
+            // value of zero or less means delete now.
+            let is i64 as sign with mut = 1;
+            let is i64 as q with mut = val_s;
+            if (q < val_e && v[q] == 45) { sign = 0 - 1; q = q + 1; }
+            let is i64 as secs with mut = 0;
+            let is i64 as any with mut = 0;
+            while (q < val_e && v[q] >= 48 && v[q] <= 57) {
+                secs = secs * 10 + (cast(i64, v[q]) - 48);
+                any = 1;
+                q = q + 1;
+            }
+            if (any == 1) {
+                have_maxage = 1;
+                if (sign < 0) { c.expires = 1; }        // already in the past
+                else { c.expires = now + secs; }
+            }
+        }
+
+        if (_ieq(cast(*u8, &attr), "expires") == 1) {
+            if (have_maxage == 0) {
+                let is [64]u8 as d;
+                _copy(cast(*u8, &d), 64, cast(*u8, cast(i64, v) + val_s),
+                      val_e - val_s);
+                let is i64 as t = chrono.http_date_parse(cast(*u8, &d),
+                                                         _slen(cast(*u8, &d)));
+                if (t != chrono.TIME_ERR) {
+                    c.expires = t;
+                    if (c.expires == 0) { c.expires = 1; }
+                }
+            }
+        }
+
+        if (_ieq(cast(*u8, &attr), "samesite") == 1) {
+            let is [16]u8 as ss;
+            _copy(cast(*u8, &ss), 16, cast(*u8, cast(i64, v) + val_s), val_e - val_s);
+            if (_ieq(cast(*u8, &ss), "strict") == 1) { c.same_site = SAME_SITE_STRICT; }
+            if (_ieq(cast(*u8, &ss), "none") == 1) { c.same_site = SAME_SITE_NONE; }
+            if (_ieq(cast(*u8, &ss), "lax") == 1) { c.same_site = SAME_SITE_LAX; }
+        }
+    }
+
+    // --- the domain decision, which is the whole security of this file ---
+    if (c.host_only == 1) {
+        _copy(cast(*u8, &c.domain), MAX_DOMAIN, host, _slen(host));
+    } else {
+        // The host has to domain-match the Domain it asked for. Without this,
+        // any site sets a cookie for any other.
+        if (domain_matches(cast(*u8, &c.domain), host) == 0) {
+            return COOKIE_ERR_DOMAIN;
+        }
+        // ...and the Domain may not be a public suffix, or the cookie is
+        // shared by everyone registered under it.
+        if (psl_is_public_suffix(cast(*u8, &c.domain)) == 1) {
+            return COOKIE_ERR_DOMAIN;
+        }
+    }
+
+    if (c.path[0] == 0) {
+        default_path(rpath, cast(*u8, &c.path), MAX_PATH);
+    }
+    return 0;
+}
+
+// --- The jar -------------------------------------------------------------
+
+fn jar_init(j as *Jar, cap as i64) as i64 {
+    j.c = cast(*Cookie, mem.core.mmap_anon(cap * sizeof(Cookie)));
+    if (_map_ok(cast(*u8, j.c)) == 0) { j.c = cast(*Cookie, 0); return COOKIE_ERR_ALLOC; }
+    j.cap = cap;
+    j.n = 0;
+    return 0;
+}
+
+fn jar_free(j as *Jar) as void {
+    if (cast(i64, j.c) != 0) { mem.core.munmap(cast(*u8, j.c), j.cap * sizeof(Cookie)); }
+    j.c = cast(*Cookie, 0);
+    j.cap = 0;
+    j.n = 0;
+}
+
+fn jar_at(j as *Jar, i as i64) as *Cookie {
+    if (i < 0) { return cast(*Cookie, 0); }
+    if (i >= j.n) { return cast(*Cookie, 0); }
+    return cast(*Cookie, cast(i64, j.c) + i * sizeof(Cookie));
+}
+
+fn jar_count(j as *Jar) as i64 { return j.n; }
+
+fn _same_identity(a as *Cookie, b as *Cookie) as i64 {
+    if (_eq(cast(*u8, &a.name), cast(*u8, &b.name)) == 0) { return 0; }
+    if (_ieq(cast(*u8, &a.domain), cast(*u8, &b.domain)) == 0) { return 0; }
+    if (_eq(cast(*u8, &a.path), cast(*u8, &b.path)) == 0) { return 0; }
+    return 1;
+}
+
+// Store `c`, replacing a cookie with the same name, domain and path. An
+// expiry already in the past DELETES instead of storing, which is how a
+// server logs a session out.
+fn jar_store(j as *Jar, c as *Cookie, now as i64) as i64 {
+    let is i64 as gone with mut = 0;
+    if (c.expires != 0) {
+        if (c.expires <= now) { gone = 1; }
+    }
+
+    let is i64 as i with mut = 0;
+    while (i < j.n) {
+        let is *Cookie as e = jar_at(j, i);
+        if (_same_identity(e, c) == 1) {
+            if (gone == 1) {
+                // Compact rather than tombstone: the jar is small and a
+                // deleted cookie that lingers is one that can be sent.
+                let is i64 as k with mut = i;
+                while (k + 1 < j.n) {
+                    let is *Cookie as dst = jar_at(j, k);
+                    let is *Cookie as src = jar_at(j, k + 1);
+                    *dst = *src;
+                    k = k + 1;
+                }
+                j.n = j.n - 1;
+                return 0;
+            }
+            // RFC 6265 §5.3: a replacement keeps the ORIGINAL creation time,
+            // which is what keeps the Cookie header's ordering stable.
+            let is i64 as born = e.created;
+            *e = *c;
+            e.created = born;
+            return 0;
+        }
+        i = i + 1;
+    }
+
+    if (gone == 1) { return 0; }
+    if (j.n >= j.cap) { return COOKIE_ERR_SPACE; }
+    // Addressed directly rather than through jar_at, which refuses an index
+    // at or past n — and this slot is exactly at n until the count moves.
+    let is *Cookie as slot = cast(*Cookie, cast(i64, j.c) + j.n * sizeof(Cookie));
+    *slot = *c;
+    j.n = j.n + 1;
+    return 0;
+}
+
+// Take every Set-Cookie in a response.
+//
+// Returns the number stored. A cookie that fails a rule is skipped, not
+// fatal: one bad Set-Cookie must not cost the others.
+fn jar_set(j as *Jar, r as *http.Response, u as *url.Url, now as i64) as i64 {
+    let is [256]u8 as host;
+    let is [512]u8 as rpath;
+    if (url.url_host(u, cast(*u8, &host), MAX_DOMAIN) < 0) { return 0; }
+    if (url.url_path(u, cast(*u8, &rpath), MAX_PATH) < 0) {
+        rpath[0] = cast(u8, 47);
+        rpath[1] = cast(u8, 0);
+    }
+
+    let is i64 as cur with mut = 0;
+    let is [4096]u8 as v;
+    let is i64 as stored with mut = 0;
+    while (1 == 1) {
+        let is i64 as n = http.resp_header_next(r, "Set-Cookie", &cur,
+                                                cast(*u8, &v), 4096);
+        if (n < 0) { break; }
+        let is Cookie as c;
+        if (cookie_parse(cast(*u8, &v), cast(*u8, &host), cast(*u8, &rpath),
+                         now, &c) != 0) { continue; }
+        if (jar_store(j, &c, now) == 0) { stored = stored + 1; }
+    }
+    return stored;
+}
+
+// Should this cookie go to this request?
+fn cookie_applies(c as *Cookie, host as *u8, rpath as *u8, https as i64,
+                  now as i64) as i64 {
+    if (c.expires != 0) {
+        if (c.expires <= now) { return 0; }
+    }
+    if (c.host_only == 1) {
+        if (_ieq(cast(*u8, &c.domain), host) == 0) { return 0; }
+    } else {
+        if (domain_matches(cast(*u8, &c.domain), host) == 0) { return 0; }
+    }
+    if (path_matches(cast(*u8, &c.path), rpath) == 0) { return 0; }
+    // A Secure cookie over plain http is a session handed to the network.
+    if (c.secure == 1) {
+        if (https == 0) { return 0; }
+    }
+    return 1;
+}
+
+// Build the value of a Cookie header for `u`. Returns its length, 0 when
+// there is nothing to send, or a sentinel.
+//
+// RFC 6265 §5.4 orders by path length descending, then by creation time
+// ascending. Servers do rely on it.
+fn jar_header(j as *Jar, u as *url.Url, now as i64,
+              out as *u8, max as i64) as i64 {
+    let is [256]u8 as host;
+    let is [512]u8 as rpath;
+    if (url.url_host(u, cast(*u8, &host), MAX_DOMAIN) < 0) { return 0; }
+    if (url.url_path(u, cast(*u8, &rpath), MAX_PATH) < 0) {
+        rpath[0] = cast(u8, 47);
+        rpath[1] = cast(u8, 0);
+    }
+    let is i64 as https = url.url_scheme_is(u, "https");
+
+    let is i64 as w with mut = 0;
+    let is i64 as sent with mut = 0;
+    // Selection sort over the matching set: the jar is small and this avoids
+    // a second array.
+    let is i64 as round with mut = 0;
+    while (round < j.n) {
+        let is i64 as best with mut = 0 - 1;
+        let is i64 as bestlen with mut = 0 - 1;
+        let is i64 as bestborn with mut = 0;
+
+        let is i64 as i with mut = 0;
+        while (i < j.n) {
+            let is *Cookie as c = jar_at(j, i);
+            if (c.used == 2) { i = i + 1; continue; }        // already emitted
+            if (cookie_applies(c, cast(*u8, &host), cast(*u8, &rpath),
+                               https, now) == 0) { i = i + 1; continue; }
+            let is i64 as pl = _slen(cast(*u8, &c.path));
+            let is i64 as take with mut = 0;
+            if (pl > bestlen) { take = 1; }
+            if (pl == bestlen) {
+                if (c.created < bestborn) { take = 1; }
+            }
+            if (take == 1) { best = i; bestlen = pl; bestborn = c.created; }
+            i = i + 1;
+        }
+        if (best < 0) { break; }
+
+        let is *Cookie as c = jar_at(j, best);
+        c.used = 2;
+        let is i64 as nn = _slen(cast(*u8, &c.name));
+        let is i64 as vn = _slen(cast(*u8, &c.value));
+        let is i64 as need with mut = nn + 1 + vn;
+        if (sent > 0) { need = need + 2; }
+        if (w + need + 1 > max) { break; }        // truncate rather than fail
+        if (sent > 0) {
+            out[w] = cast(u8, 59); w = w + 1;     // ';'
+            out[w] = cast(u8, 32); w = w + 1;
+        }
+        let is i64 as k with mut = 0;
+        while (k < nn) { out[w] = c.name[k]; w = w + 1; k = k + 1; }
+        out[w] = cast(u8, 61); w = w + 1;         // '='
+        k = 0;
+        while (k < vn) { out[w] = c.value[k]; w = w + 1; k = k + 1; }
+        sent = sent + 1;
+        round = round + 1;
+    }
+    out[w] = cast(u8, 0);
+
+    // Clear the emitted marks for the next call.
+    let is i64 as i2 with mut = 0;
+    while (i2 < j.n) {
+        let is *Cookie as c = jar_at(j, i2);
+        if (c.used == 2) { c.used = 1; }
+        i2 = i2 + 1;
+    }
+    return w;
+}
+
+// Drop everything that has expired. A jar that never forgets grows without
+// bound and keeps sending cookies a server already retired.
+fn jar_expire(j as *Jar, now as i64) as i64 {
+    let is i64 as removed with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < j.n) {
+        let is *Cookie as c = jar_at(j, i);
+        let is i64 as dead with mut = 0;
+        if (c.expires != 0) {
+            if (c.expires <= now) { dead = 1; }
+        }
+        if (dead == 1) {
+            let is i64 as k with mut = i;
+            while (k + 1 < j.n) {
+                let is *Cookie as dst = jar_at(j, k);
+                let is *Cookie as src = jar_at(j, k + 1);
+                *dst = *src;
+                k = k + 1;
+            }
+            j.n = j.n - 1;
+            removed = removed + 1;
+        } else {
+            i = i + 1;
+        }
+    }
+    return removed;
+}
+
+fn cookie_err_name(e as i64) as *u8 {
+    if (e == 0)                  { return "OK"; }
+    if (e == COOKIE_ERR_PARSE)   { return "COOKIE_ERR_PARSE"; }
+    if (e == COOKIE_ERR_DOMAIN)  { return "COOKIE_ERR_DOMAIN"; }
+    if (e == COOKIE_ERR_SPACE)   { return "COOKIE_ERR_SPACE"; }
+    if (e == COOKIE_ERR_ALLOC)   { return "COOKIE_ERR_ALLOC"; }
+    return "COOKIE_ERR_UNKNOWN";
+}

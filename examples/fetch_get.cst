@@ -1,0 +1,92 @@
+// =======================================================
+// caustic-net/examples/fetch_get.cst
+// The whole library in one call.
+//
+//     ./build/fetch_get https://example.com/
+//
+// url → DNS → TCP → TLS → HTTP/1.1 → redirects → Content-Encoding → bytes,
+// with a cookie jar behind it. This is the surface caustic-browser is meant
+// to hold: nothing above it needs to know that any of the rest exists.
+//
+// Compare it with examples/https_get.cst, which drives the same stack by
+// hand. That one is the proof the layers compose; this one is the API.
+//
+// Touches the real internet, so tests/run.cst builds it and does not run it.
+// =======================================================
+
+use "std/io.cst" as io;
+use "std/env.cst" as env;
+use "std/time.cst" as time;
+use "../core/conn.cst" as conn;
+use "../proto/cookie.cst" as cookie;
+use "../tls/trust.cst" as trust;
+use "../tls/handshake.cst" as hs;
+use "../tls/verify.cst" as verify;
+use "../client/fetch.cst" as fetch;
+use "../client/decode.cst" as decode;
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+
+    let is *u8 as target with mut = "https://example.com/";
+    if (argc > 1) { target = env.argv(1); }
+
+    // The trust store and the cookie jar are the caller's, and both outlive
+    // any one request: a browser keeps one of each per profile, not per page.
+    let is trust.TrustStore as store;
+    let is i64 as nanchor = trust.trust_init(&store);
+    if (nanchor <= 0) {
+        io.printf("no trust anchors: %s\n", trust.trust_err_name(nanchor));
+        return 1;
+    }
+
+    let is cookie.Jar as jar;
+    if (cookie.jar_init(&jar, 256) != 0) { return 2; }
+
+    let is fetch.Fetch as f;
+    if (fetch.fetch_init(&f, &store) != 0) { return 3; }
+    fetch.fetch_set_jar(&f, &jar);
+
+    let is i64 as t0 = time.now_ms();
+    let is i64 as rc = fetch.fetch_get(&f, target, conn.deadline_in(30000));
+    let is i64 as ms = time.now_ms() - t0;
+
+    if (rc != 0) {
+        io.printf("%s: %s", target, fetch.fetch_err_name(rc));
+        if (rc == fetch.FETCH_ERR_TLS) {
+            let is i64 as e = fetch.fetch_tls_err(&f);
+            io.printf(" — %s / %s", hs.tls_err_name(e), verify.verify_err_text(e));
+        }
+        io.printf("\n");
+        fetch.fetch_free(&f);
+        cookie.jar_free(&jar);
+        trust.trust_free(&store);
+        return 4;
+    }
+
+    io.printf("%ld %s\n", fetch.fetch_status(&f), fetch.fetch_final_url(&f));
+    io.printf("  %ld bytes", fetch.fetch_body_len(&f));
+    if (fetch.fetch_encoding(&f) != decode.ENC_NONE) {
+        io.printf(", %s decoded", decode.encoding_name(fetch.fetch_encoding(&f)));
+    }
+    if (fetch.fetch_redirects(&f) > 0) {
+        io.printf(", %ld redirect(s)", fetch.fetch_redirects(&f));
+    }
+    io.printf(", %ld cookie(s), %ld ms\n", cookie.jar_count(&jar), ms);
+
+    // The first line of the body, so it is visible that these are real bytes
+    // and not still compressed.
+    let is i64 as show with mut = 0;
+    let is i64 as n = fetch.fetch_body_len(&f);
+    let is *u8 as body = fetch.fetch_body(&f);
+    while (show < n && show < 160 && body[show] != 10) { show = show + 1; }
+    io.printf("  ");
+    let is i64 as i with mut = 0;
+    while (i < show) { io.printf("%c", cast(i64, body[i])); i = i + 1; }
+    io.printf("\n");
+
+    fetch.fetch_free(&f);
+    cookie.jar_free(&jar);
+    trust.trust_free(&store);
+    return 0;
+}

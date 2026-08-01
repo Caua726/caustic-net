@@ -4,8 +4,8 @@
 socket up to `fetch()`, with no libc and no OpenSSL.**
 
 ![version](https://img.shields.io/badge/version-0.1.0-blue)
-![status](https://img.shields.io/badge/status-early%20%C2%B7%20TCP%20%C2%B7%20URL%20%C2%B7%20HTTP%2F1.1-yellow)
-![dependencies](https://img.shields.io/badge/dependencies-caustic--crypto-blue)
+![status](https://img.shields.io/badge/status-DNS%20%C2%B7%20TLS%201.3%20%C2%B7%20HTTP%2F1.1%20%C2%B7%20fetch-green)
+![dependencies](https://img.shields.io/badge/dependencies-caustic--crypto%20%C2%B7%20caustic--compact-blue)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
 The scope is everything an application needs to talk to a network: sockets, name
@@ -13,12 +13,11 @@ resolution, TLS, the HTTP family, WebSocket, and the protocols above them. The f
 the standard library's `std/net.cst` (TCP/UDP/poll); everything above it is written here
 in Caustic, over Linux syscalls and `ws2_32` on the Windows target.
 
-> **`examples/https_get` fetches a real page over TLS 1.3.** DNS, the record layer, the
-> key schedule, certificate parsing and chain verification, the handshake, and HTTP/1.1
-> are landed and green; the example differs from `examples/http_get` in one expression,
-> which was the point of the `Conn` vtable. What is left is the client layer above it —
-> redirects, `Content-Encoding`, cookies, connection reuse — and the [status
-> table](#status) is the authority on what exists.
+> **`fetch_get https://example.com/` works.** DNS, TLS 1.3, certificate verification,
+> HTTP/1.1, redirects, `Content-Encoding` and a cookie jar are landed and green, and
+> `examples/https_get` differs from `examples/http_get` in one expression — which was the
+> point of the `Conn` vtable. What is left is connection reuse and parallel fetching, and
+> the [status table](#status) is the authority on what exists.
 
 ## The keystone: `Conn`
 
@@ -60,7 +59,7 @@ worlds — and the same argument applies to Brotli, and to punycode.
 | Library | What caustic-net takes from it |
 |---|---|
 | [`caustic-crypto`](https://github.com/Caua726/caustic-crypto) | **TLS:** X25519 · P-256/P-384 · RSA · Ed25519 · AEAD · SHA-2 · HMAC/HKDF · `asn1/x509` + DER · HMAC-DRBG. **WebSocket:** `hash/sha1`. **HTTP auth:** `util/base64`, HMAC. Every primitive vector-validated against NIST CAVP, RFC and Wycheproof. |
-| [`caustic-compact`](https://github.com/Caua726/caustic-compact) | **`Content-Encoding`:** gzip · deflate · zlib · **brotli** · **zstd**. (Also bzip2, xz/LZMA, LZ4, Snappy, LZW — the HTTP set is a subset of what it ships.) |
+| [`caustic-compact`](https://github.com/Caua726/caustic-compact) | **`Content-Encoding`:** gzip · deflate · zlib · **brotli** · **zstd** — wired up in `client/decode.cst`. (Also bzip2, xz/LZMA, LZ4, Snappy, LZW — the HTTP set is a subset of what it ships.) |
 | [`caustic-unicode`](https://github.com/Caua726/caustic-unicode) | **`idna`** for internationalized hostnames (punycode), `utf` validation, and `encodings` for charset conversion on response bodies. |
 | [`Caustic`](https://github.com/Caua726/Caustic) | The language, compiler, assembler, linker — and `std/net.cst`, the TCP/UDP/poll floor this is built on. |
 
@@ -77,11 +76,12 @@ Written against it:
 core/        conn (the vtable) · errno · bytes (Bytes/Slice) · bufread (lines)
              entropy (checked CSPRNG) · chrono (epoch ↔ civil, ASN.1 + HTTP dates)
 transport/   tcp_conn (TCP→Conn) · transport (dial/dial_host/listen/accept) · resolver · epoll*
-proto/       url · http1 · dns · cookie* · http2* · websocket* · sse* · mime*
+proto/       url · http1 · dns · cookie (RFC 6265 jar) · http2* · websocket* · sse* · mime*
 tls/         transcript · keysched · record · x509 · pss · roots · trust · verify
-             extensions* · handshake* · client*
+             extensions · handshake · client
+client/      fetch (url→dns→connect→tls→http→redirect→decode→cookies) · decode
+             pool* · parallel*
 server/      router* · threaded* · reactor* · static* · middleware*
-client/      fetch (url→dns→connect→tls→http→redirect) · decode* · pool* · parallel*
 ```
 `*` = on the roadmap, not yet landed.
 
@@ -148,7 +148,9 @@ client/      fetch (url→dns→connect→tls→http→redirect) · decode* · p
 | tls | `extensions` — SNI · supported_versions · groups · key_share · signature_algorithms · ALPN | ✅ green (`tests/test_tls`, against RFC 8448's own ClientHello) |
 | tls | `handshake` — the 1-RTT client, as an explicit state machine | ✅ green (`tests/test_tls`, RFC 8448 §3 value by value + 20 hostile flights) |
 | tls | `client` — TLS as a `Conn`, one allocation, KeyUpdate handled | ✅ green (`tests/test_tls`, `examples/https_get` against the real internet) |
-| client | `fetch` — url → dns → connect → TLS → HTTP → redirects | ✅ green (`tests/test_fetch`, a real server in a second process) |
+| client | `fetch` — url → dns → connect → TLS → HTTP → redirects → decode → cookies | ✅ green (`tests/test_fetch`, a real server in a second process) |
+| client | `decode` — gzip · deflate (both framings) · brotli · zstd, with an expansion ceiling | ✅ green (`tests/test_decode`, bodies compressed by Python, 8 MiB bomb refused) |
+| proto | `cookie` — RFC 6265 parse · jar · domain/path/Secure rules | ✅ green (`tests/test_cookie`) |
 | core | `bufread` deadline (gap 03) | ✅ `br_set_deadline`; bounds the number of fills, pair with `set_recv_timeout` for a single read |
 | everything else | see the roadmap | ⏳ |
 
@@ -214,6 +216,9 @@ headers, and `url_resolve` resolves a relative reference per RFC 3986 §5.2.
 | 15 | No client certificates | a `CertificateRequest` is skipped rather than answered |
 | 16 | A SHA-384 cipher suite needs the ClientHello to fit 1 KiB | the transcript hash is fixed by the suite, which is not known until the ServerHello, so choosing SHA-384 means rehashing both Hellos. A ClientHello past the buffer declines the suite instead |
 | 17 | No connection reuse yet | every hop of a redirect chain opens a new socket, and every https hop a new handshake |
+| 18 | The public suffix list is a heuristic | `psl_is_public_suffix` refuses a single label and a table of about forty two-part suffixes. It does not know `pvt.k12.ma.us`. A cookie scoped to an unlisted public suffix is accepted. The signature is what the real one would be, so replacing it is one file |
+| 19 | Decompression is one-shot | caustic-compact has no incremental API, so a compressed page cannot be rendered while it arrives — and the expansion ceiling is enforced after the decompressor has already produced the bytes, which bounds what the caller sees rather than the peak |
+| 20 | `SameSite` is parsed and not enforced | it is stored on the cookie; nothing consults it, because enforcement needs a notion of the initiating site that this layer does not have |
 
 ### Two bugs below this library
 

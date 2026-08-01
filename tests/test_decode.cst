@@ -1,0 +1,151 @@
+// =======================================================
+// caustic-net/tests/test_decode.cst
+// Content-Encoding, and the two shapes that are attacks.
+//
+// The bodies in tests/vec_decode.cst were compressed by Python, not by
+// caustic-compact, so decoding them proves agreement with a different
+// implementation rather than with ourselves.
+//
+// The header parsing gets as much attention as the decoding, because it is
+// where the mistakes are: "GZIP" and "gzip" are the same encoding, "gzipx" is
+// not one at all, and a list of two encodings has to be refused rather than
+// half-applied — a body that is still brotli after the gzip layer came off
+// renders as noise, and nothing downstream can tell why.
+//
+// Exit 0 = all pass. Non-zero = the numbered check that failed.
+// =======================================================
+
+use "std/io.cst" as io;
+use "../core/bytes.cst" as bytes;
+use "../client/decode.cst" as decode;
+use "./vec_decode.cst" as v;
+
+fn eq(a as *u8, b as *u8, n as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn main() as i32 {
+    // ===== the ceiling constants =====================================
+    if (decode.MAX_RATIO != 200) { return 1; }
+    if (decode.MAX_ABSOLUTE != 268435456) { return 2; }
+
+    // ===== header parsing ============================================
+    if (decode.encoding_of("gzip") != decode.ENC_GZIP) { return 3; }
+    if (decode.encoding_of("GZIP") != decode.ENC_GZIP) { return 4; }
+    if (decode.encoding_of("GzIp") != decode.ENC_GZIP) { return 5; }
+    if (decode.encoding_of("x-gzip") != decode.ENC_GZIP) { return 6; }
+    if (decode.encoding_of("  gzip") != decode.ENC_GZIP) { return 7; }
+    if (decode.encoding_of("deflate") != decode.ENC_DEFLATE) { return 8; }
+    if (decode.encoding_of("br") != decode.ENC_BROTLI) { return 9; }
+    if (decode.encoding_of("zstd") != decode.ENC_ZSTD) { return 10; }
+    if (decode.encoding_of("identity") != decode.ENC_IDENTITY) { return 11; }
+    if (decode.encoding_of("") != decode.ENC_NONE) { return 12; }
+
+    // A longer token that merely starts the same way is NOT that encoding.
+    if (decode.encoding_of("gzipx") != decode.DECODE_ERR_UNKNOWN) { return 13; }
+    if (decode.encoding_of("brotli") != decode.DECODE_ERR_UNKNOWN) { return 14; }
+    if (decode.encoding_of("compress") != decode.DECODE_ERR_UNKNOWN) { return 15; }
+    // ...but a parameter after it is still that encoding.
+    if (decode.encoding_of("gzip;q=1") != decode.ENC_GZIP) { return 16; }
+
+    // A list is refused. Applying only the first layer leaves a body that is
+    // still compressed and looks like corruption to everything above.
+    if (decode.encoding_of("gzip, br") != decode.DECODE_ERR_UNKNOWN) { return 17; }
+    if (decode.encoding_of("br,gzip") != decode.DECODE_ERR_UNKNOWN) { return 18; }
+
+    // ===== decoding ==================================================
+    let is bytes.Bytes as out with mut = bytes.bytes_new(4096);
+    if (cast(i64, out.ptr) == 0) { return 19; }
+
+    let is i64 as n with mut = decode.decode_body(decode.ENC_GZIP, v.GZIP, v.GZIP_N,
+                                                  &out, 0);
+    if (n != v.PLAIN_N) {
+        io.printf("gzip gave %ld bytes, want %ld\n", n, v.PLAIN_N);
+        return 20;
+    }
+    if (eq(out.ptr, v.PLAIN, v.PLAIN_N) == 0) { return 21; }
+
+    // "deflate" arrives BOTH zlib-wrapped and raw, from different servers,
+    // under the same header name. Both have to work, and the only way to tell
+    // them apart is to look at the bytes.
+    n = decode.decode_body(decode.ENC_DEFLATE, v.ZLIB, v.ZLIB_N, &out, 0);
+    if (n != v.PLAIN_N) { io.printf("zlib-wrapped deflate: %ld\n", n); return 22; }
+    if (eq(out.ptr, v.PLAIN, v.PLAIN_N) == 0) { return 23; }
+
+    n = decode.decode_body(decode.ENC_DEFLATE, v.RAW, v.RAW_N, &out, 0);
+    if (n != v.PLAIN_N) { io.printf("raw deflate: %ld\n", n); return 24; }
+    if (eq(out.ptr, v.PLAIN, v.PLAIN_N) == 0) { return 25; }
+
+    // identity and none copy rather than decode.
+    n = decode.decode_body(decode.ENC_IDENTITY, v.PLAIN, v.PLAIN_N, &out, 0);
+    if (n != v.PLAIN_N) { return 26; }
+    if (eq(out.ptr, v.PLAIN, v.PLAIN_N) == 0) { return 27; }
+    n = decode.decode_body(decode.ENC_NONE, v.PLAIN, v.PLAIN_N, &out, 0);
+    if (n != v.PLAIN_N) { return 28; }
+
+    // An empty body is zero bytes, not an error and not a decoder call.
+    n = decode.decode_body(decode.ENC_GZIP, v.GZIP, 0, &out, 0);
+    if (n != 0) { return 29; }
+
+    // Bytes that are not the encoding they claim.
+    n = decode.decode_body(decode.ENC_GZIP, v.PLAIN, v.PLAIN_N, &out, 0);
+    if (n != decode.DECODE_ERR_FAILED) {
+        io.printf("garbage as gzip gave %ld\n", n);
+        return 30;
+    }
+
+    // ===== the two ceilings ==========================================
+    // The ratio. 8 MiB of zeros from 8175 bytes is about 1027 to 1, five
+    // times what this library will expand.
+    n = decode.decode_body(decode.ENC_GZIP, v.BOMB, v.BOMB_N, &out, 0);
+    if (n != decode.DECODE_ERR_BOMB) {
+        io.printf("the bomb decoded to %ld bytes\n", n);
+        return 31;
+    }
+    // And the caller's absolute ceiling, on a body that is otherwise fine.
+    n = decode.decode_body(decode.ENC_GZIP, v.GZIP, v.GZIP_N, &out, 100);
+    if (n != decode.DECODE_ERR_BOMB) {
+        io.printf("a %ld-byte body passed a 100-byte limit\n", n);
+        return 32;
+    }
+    // One byte under the real size is still refused; exactly the real size is
+    // not. The boundary is the point of a limit.
+    n = decode.decode_body(decode.ENC_GZIP, v.GZIP, v.GZIP_N, &out, v.PLAIN_N - 1);
+    if (n != decode.DECODE_ERR_BOMB) { return 33; }
+    n = decode.decode_body(decode.ENC_GZIP, v.GZIP, v.GZIP_N, &out, v.PLAIN_N);
+    if (n != v.PLAIN_N) { return 34; }
+
+    // The identity path has a ceiling too — a 4 GiB "identity" body is still
+    // a way to exhaust memory.
+    n = decode.decode_body(decode.ENC_IDENTITY, v.PLAIN, v.PLAIN_N, &out, 4);
+    if (n != decode.DECODE_ERR_BOMB) { return 35; }
+
+    // An encoding this library does not carry.
+    n = decode.decode_body(decode.DECODE_ERR_UNKNOWN, v.GZIP, v.GZIP_N, &out, 0);
+    if (n != decode.DECODE_ERR_UNKNOWN) { return 36; }
+
+    bytes.bytes_free(&out);
+
+    // ===== what the request announces ================================
+    // Only encodings that can actually be undone. Announcing one that cannot
+    // is how a page turns into noise for a reason nothing can report.
+    if (decode.encoding_of(decode.ACCEPT_ENCODING) != decode.DECODE_ERR_UNKNOWN) {
+        return 37;                       // it is a list, so parsing it as one value fails
+    }
+    let is i64 as i with mut = 0;
+    let is i64 as commas with mut = 1;
+    while (decode.ACCEPT_ENCODING[i] != 0) {
+        if (decode.ACCEPT_ENCODING[i] == 44) { commas = commas + 1; }
+        i = i + 1;
+    }
+    if (commas != 4) { return 38; }      // gzip, deflate, br, zstd
+
+    io.printf("decode ok: gzip, deflate both ways, %ld MiB bomb refused\n",
+              v.BOMB_PLAIN / 1048576);
+    return 0;
+}

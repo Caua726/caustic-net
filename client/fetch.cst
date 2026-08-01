@@ -48,6 +48,8 @@ use "../proto/http1.cst" as http;
 use "../transport/transport.cst" as tp;
 use "../tls/trust.cst" as trust;
 use "../tls/client.cst" as tlsc;
+use "./decode.cst" as decode;
+use "../proto/cookie.cst" as cookie;
 
 // --- Errors (the -1800 block) ------------------------------------------
 let is i64 as FETCH_ERR_SCHEME    with imut = 0 - 1800;   // not http or https
@@ -81,8 +83,15 @@ struct Fetch {
     tls_err   as i64;         // the exact reason a handshake was refused
     conn_err  as i64;         // the -errno a dial failed with
     limit     as i64;         // body ceiling; 0 means DEFAULT_LIMIT
+    encoding  as i64;         // the Content-Encoding that was undone
+    accept_encoding as i64;   // 1 to ask for compression; 0 for identity
 
     t as *trust.TrustStore;
+    // Optional. When set, cookies are stored from every response and offered
+    // to every request the jar's own rules allow. Those rules are per-origin,
+    // so the "drop Cookie when the origin changes" part of redirect policy is
+    // not a special case here — a jar simply does not match the new host.
+    jar as *cookie.Jar;
 
     final_url as [2048]u8;
     hdrbuf    as *u8;         // MAX_HEAD, mmap'd
@@ -133,6 +142,12 @@ fn fetch_init(f as *Fetch, t as *trust.TrustStore) as i64 {
     f.tls_err = 0;
     f.conn_err = 0;
     f.limit = 0;
+    f.encoding = decode.ENC_NONE;
+    // Asking is the default: a browser that does not is a browser that moves
+    // three to five times as many bytes. A caller that wants the raw body
+    // sets this to 0.
+    f.accept_encoding = 1;
+    f.jar = cast(*cookie.Jar, 0);
     f.nseen = 0;
     f.c = cast(*conn.Conn, 0);
     f.final_url[0] = cast(u8, 0);
@@ -270,6 +285,19 @@ fn _once(f as *Fetch, u as *url.Url, method as *u8, deadline as i64,
     if (rc == 0) {
         if (http.req_header(&req, "Accept", "*/*") < 0) { rc = FETCH_ERR_SPACE; }
     }
+    if (rc == 0 && f.accept_encoding == 1) {
+        if (http.req_header(&req, "Accept-Encoding",
+                            decode.ACCEPT_ENCODING) < 0) { rc = FETCH_ERR_SPACE; }
+    }
+    if (rc == 0 && cast(i64, f.jar) != 0) {
+        let is [4096]u8 as ch;
+        if (cookie.jar_header(f.jar, u, time.unix_time(),
+                              cast(*u8, &ch), 4096) > 0) {
+            if (http.req_header(&req, "Cookie", cast(*u8, &ch)) < 0) {
+                rc = FETCH_ERR_SPACE;
+            }
+        }
+    }
     if (rc == 0) {
         if (http.req_end(&req) < 0) { rc = FETCH_ERR_SPACE; }
     }
@@ -290,6 +318,12 @@ fn _once(f as *Fetch, u as *url.Url, method as *u8, deadline as i64,
     rc = http.resp_read_head(&br, &f.r, f.hdrbuf, MAX_HEAD);
     if (rc < 0) { return rc; }
     f.status = f.r.status;
+
+    // Before the body, and before any redirect is followed: a Set-Cookie on
+    // a 302 is how a session starts on most sites.
+    if (cast(i64, f.jar) != 0) {
+        cookie.jar_set(f.jar, &f.r, u, time.unix_time());
+    }
 
     let is http.BodyReader as bd;
     let is i64 as head_only with mut = 0;
@@ -313,6 +347,23 @@ fn _once(f as *Fetch, u as *url.Url, method as *u8, deadline as i64,
     if (got < 0) {
         if (got == http.HTTP_ERR_SPACE) { return FETCH_ERR_LIMIT; }
         return got;
+    }
+
+    // Content-Encoding, undone in place. A server may compress whether or not
+    // it was asked — Amazon does — so this runs regardless of what the
+    // request announced.
+    f.encoding = decode.response_encoding(&f.r);
+    if (f.encoding < 0) { return f.encoding; }
+    if (f.encoding != decode.ENC_NONE) {
+        if (f.encoding != decode.ENC_IDENTITY) {
+            let is bytes.Bytes as plain with mut = bytes.bytes_new(16384);
+            if (cast(i64, plain.ptr) == 0) { return FETCH_ERR_ALLOC; }
+            let is i64 as dn = decode.decode_body(f.encoding, f.body.ptr, f.body.len,
+                                                  &plain, lim);
+            if (dn < 0) { bytes.bytes_free(&plain); return dn; }
+            bytes.bytes_free(&f.body);
+            f.body = plain;
+        }
     }
     return 0;
 }
@@ -410,7 +461,13 @@ fn redirect_method(status as i64, method as *u8, out as *u8, max as i64) as void
     _copy_str(out, max, "GET");
 }
 
+// Hand fetch a cookie jar, or null to stop using one. The jar is the
+// caller's: a browser keeps one per profile, not one per request.
+fn fetch_set_jar(f as *Fetch, j as *cookie.Jar) as void { f.jar = j; }
+
 fn fetch_status(f as *Fetch) as i64      { return f.status; }
+// Which Content-Encoding was undone, as a decode.ENC_* value.
+fn fetch_encoding(f as *Fetch) as i64    { return f.encoding; }
 fn fetch_body(f as *Fetch) as *u8        { return f.body.ptr; }
 fn fetch_body_len(f as *Fetch) as i64    { return f.body.len; }
 fn fetch_final_url(f as *Fetch) as *u8   { return cast(*u8, &f.final_url); }

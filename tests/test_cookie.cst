@@ -1,0 +1,274 @@
+// =======================================================
+// caustic-net/tests/test_cookie.cst
+// Which cookies a request is allowed to carry.
+//
+// The parsing gets a few checks. Most of this file is about the rules that
+// decide whether a cookie goes out, because those are the ones that turn into
+// a security bug when they are subtly wrong — and every one of them is subtly
+// wrong in an obvious implementation:
+//
+//   * a Domain that is a suffix but not a boundary ("evilexample.com" against
+//     "example.com")
+//   * a Domain that widens instead of narrowing
+//   * a public suffix
+//   * a path prefix that is not a path boundary ("/foo" against "/foobar")
+//   * a Secure cookie over http
+//
+// Exit 0 = all pass. Non-zero = the numbered check that failed.
+// =======================================================
+
+use "std/io.cst" as io;
+use "../proto/cookie.cst" as ck;
+use "../proto/url.cst" as url;
+use "../core/chrono.cst" as chrono;
+
+let is i64 as NOW with imut = 1788000000;   // a fixed instant; nothing reads a clock
+
+fn eqs(a as *u8, b as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (a[i] != 0 && b[i] != 0) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    if (a[i] != b[i]) { return 0; }
+    return 1;
+}
+
+fn parse(v as *u8, host as *u8, path as *u8, c as *ck.Cookie) as i64 {
+    return ck.cookie_parse(v, host, path, NOW, c);
+}
+
+fn main() as i32 {
+    // ===== the literal buffer dimensions =============================
+    if (ck.MAX_NAME != 128) { return 1; }
+    if (ck.MAX_VALUE != 4096) { return 2; }
+    if (ck.MAX_DOMAIN != 256) { return 3; }
+    if (ck.MAX_PATH != 512) { return 4; }
+
+    let is ck.Cookie as c;
+
+    // ===== parsing ===================================================
+    if (parse("sid=abc123", "example.com", "/a/b", &c) != 0) { return 5; }
+    if (eqs(cast(*u8, &c.name), "sid") == 0) { return 6; }
+    if (eqs(cast(*u8, &c.value), "abc123") == 0) { return 7; }
+    // No Domain means host-only, and the default path is the request's
+    // DIRECTORY — "/a", not "/a/b".
+    if (c.host_only != 1) { return 8; }
+    if (eqs(cast(*u8, &c.domain), "example.com") == 0) { return 9; }
+    if (eqs(cast(*u8, &c.path), "/a") == 0) {
+        io.printf("default path is %s\n", cast(*u8, &c.path));
+        return 10;
+    }
+    if (c.expires != 0) { return 11; }        // a session cookie
+    if (c.secure != 0) { return 12; }
+
+    // Whitespace, quotes and an empty value.
+    if (parse("  a = b ", "example.com", "/", &c) != 0) { return 13; }
+    if (eqs(cast(*u8, &c.name), "a") == 0) { return 14; }
+    if (eqs(cast(*u8, &c.value), "b") == 0) { return 15; }
+    if (parse("q=\"quoted\"", "example.com", "/", &c) != 0) { return 16; }
+    if (eqs(cast(*u8, &c.value), "quoted") == 0) { return 17; }
+    if (parse("empty=", "example.com", "/", &c) != 0) { return 18; }
+    if (c.value[0] != 0) { return 19; }
+    // A name is required; a bare token is not a cookie.
+    if (parse("novalue", "example.com", "/", &c) != ck.COOKIE_ERR_PARSE) { return 20; }
+    if (parse("=novalue", "example.com", "/", &c) != ck.COOKIE_ERR_PARSE) { return 21; }
+
+    // Attributes.
+    if (parse("s=1; Secure; HttpOnly; SameSite=Strict; Path=/x",
+              "example.com", "/", &c) != 0) { return 22; }
+    if (c.secure != 1) { return 23; }
+    if (c.http_only != 1) { return 24; }
+    if (c.same_site != ck.SAME_SITE_STRICT) { return 25; }
+    if (eqs(cast(*u8, &c.path), "/x") == 0) { return 26; }
+    // Attribute names are case-insensitive; every server picks its own.
+    if (parse("s=1; SECURE; httponly", "example.com", "/", &c) != 0) { return 27; }
+    if (c.secure != 1) { return 28; }
+    if (c.http_only != 1) { return 29; }
+
+    // Max-Age, and its precedence over Expires whichever order they arrive in.
+    if (parse("s=1; Max-Age=60", "example.com", "/", &c) != 0) { return 30; }
+    if (c.expires != NOW + 60) { return 31; }
+    if (parse("s=1; Expires=Wed, 21 Oct 2099 07:28:00 GMT; Max-Age=60",
+              "example.com", "/", &c) != 0) { return 32; }
+    if (c.expires != NOW + 60) { return 33; }
+    if (parse("s=1; Max-Age=60; Expires=Wed, 21 Oct 2099 07:28:00 GMT",
+              "example.com", "/", &c) != 0) { return 34; }
+    if (c.expires != NOW + 60) { return 35; }
+    // A negative or zero Max-Age means "gone", not "never expires".
+    if (parse("s=1; Max-Age=0", "example.com", "/", &c) != 0) { return 36; }
+    if (c.expires == 0) { return 37; }
+    if (c.expires > NOW) { return 38; }
+    if (parse("s=1; Max-Age=-1", "example.com", "/", &c) != 0) { return 39; }
+    if (c.expires > NOW) { return 40; }
+
+    // Expires alone, through core/chrono.
+    if (parse("s=1; Expires=Wed, 21 Oct 2099 07:28:00 GMT",
+              "example.com", "/", &c) != 0) { return 41; }
+    if (c.expires <= NOW) { return 42; }
+
+    // ===== the Domain rules ==========================================
+    // Narrowing to a parent domain is allowed...
+    if (parse("s=1; Domain=example.com", "www.example.com", "/", &c) != 0) { return 43; }
+    if (c.host_only != 0) { return 44; }
+    if (eqs(cast(*u8, &c.domain), "example.com") == 0) { return 45; }
+    // ...a leading dot is ignored rather than honoured, per RFC 6265.
+    if (parse("s=1; Domain=.example.com", "www.example.com", "/", &c) != 0) { return 46; }
+    if (eqs(cast(*u8, &c.domain), "example.com") == 0) { return 47; }
+
+    // Widening to somebody else's domain is not.
+    if (parse("s=1; Domain=other.com", "example.com", "/", &c)
+        != ck.COOKIE_ERR_DOMAIN) { return 48; }
+    // A suffix that is not a LABEL boundary is not a match: "example.com" is
+    // a suffix of "evilexample.com" as a string and has nothing to do with it
+    // as a domain.
+    if (parse("s=1; Domain=example.com", "evilexample.com", "/", &c)
+        != ck.COOKIE_ERR_DOMAIN) { return 49; }
+    // A subdomain cannot be set from the parent either — the host has to
+    // domain-match the Domain, not the other way round.
+    if (parse("s=1; Domain=a.example.com", "example.com", "/", &c)
+        != ck.COOKIE_ERR_DOMAIN) { return 50; }
+
+    // ===== public suffixes ===========================================
+    if (ck.psl_is_public_suffix("com") != 1) { return 51; }
+    if (ck.psl_is_public_suffix("localhost") != 1) { return 52; }
+    if (ck.psl_is_public_suffix("co.uk") != 1) { return 53; }
+    if (ck.psl_is_public_suffix("CO.UK") != 1) { return 54; }
+    if (ck.psl_is_public_suffix("github.io") != 1) { return 55; }
+    if (ck.psl_is_public_suffix("example.com") != 0) { return 56; }
+    if (ck.psl_is_public_suffix("bbc.co.uk") != 0) { return 57; }
+    // ...and a cookie may not be scoped to one.
+    if (parse("s=1; Domain=com", "example.com", "/", &c)
+        != ck.COOKIE_ERR_DOMAIN) { return 58; }
+    if (parse("s=1; Domain=co.uk", "bbc.co.uk", "/", &c)
+        != ck.COOKIE_ERR_DOMAIN) { return 59; }
+
+    // ===== path matching =============================================
+    if (ck.path_matches("/", "/") != 1) { return 60; }
+    if (ck.path_matches("/", "/anything") != 1) { return 61; }
+    if (ck.path_matches("/foo", "/foo") != 1) { return 62; }
+    if (ck.path_matches("/foo", "/foo/") != 1) { return 63; }
+    if (ck.path_matches("/foo", "/foo/bar") != 1) { return 64; }
+    if (ck.path_matches("/foo/", "/foo/bar") != 1) { return 65; }
+    // The one that matters: a string prefix that is not a path boundary.
+    if (ck.path_matches("/foo", "/foobar") != 0) { return 66; }
+    if (ck.path_matches("/foo/", "/foo") != 0) { return 67; }
+    if (ck.path_matches("/bar", "/foo") != 0) { return 68; }
+
+    // ===== domain matching ===========================================
+    if (ck.domain_matches("example.com", "example.com") != 1) { return 69; }
+    if (ck.domain_matches("example.com", "a.example.com") != 1) { return 70; }
+    if (ck.domain_matches("example.com", "a.b.example.com") != 1) { return 71; }
+    if (ck.domain_matches("example.com", "evilexample.com") != 0) { return 72; }
+    if (ck.domain_matches("a.example.com", "example.com") != 0) { return 73; }
+    // An IP address matches only itself, never a suffix of itself.
+    if (ck.domain_matches("1.2.3.4", "1.2.3.4") != 1) { return 74; }
+    if (ck.domain_matches("2.3.4", "1.2.3.4") != 0) { return 75; }
+
+    // ===== the jar ===================================================
+    let is ck.Jar as j;
+    if (ck.jar_init(&j, 32) != 0) { return 76; }
+
+    let is url.Url as u = url.url_parse("http://www.example.com/a/b");
+    if (u.ok != 0) { return 77; }
+    let is url.Url as us = url.url_parse("https://www.example.com/a/b");
+    if (us.ok != 0) { return 78; }
+    let is url.Url as other = url.url_parse("http://other.com/a/b");
+    if (other.ok != 0) { return 79; }
+
+    if (parse("a=1", "www.example.com", "/a/b", &c) != 0) { return 80; }
+    if (ck.jar_store(&j, &c, NOW) != 0) { return 81; }
+    if (ck.jar_count(&j) != 1) { return 82; }
+
+    let is [1024]u8 as hdr;
+    let is i64 as n with mut = ck.jar_header(&j, &u, NOW, cast(*u8, &hdr), 1024);
+    if (n <= 0) { return 83; }
+    if (eqs(cast(*u8, &hdr), "a=1") == 0) {
+        io.printf("header is \"%s\"\n", cast(*u8, &hdr));
+        return 84;
+    }
+    // The same call twice gives the same answer — the ordering pass must not
+    // leave the jar in a state that changes the next request.
+    n = ck.jar_header(&j, &u, NOW, cast(*u8, &hdr), 1024);
+    if (eqs(cast(*u8, &hdr), "a=1") == 0) { return 85; }
+
+    // A different host gets nothing.
+    n = ck.jar_header(&j, &other, NOW, cast(*u8, &hdr), 1024);
+    if (n != 0) { return 86; }
+
+    // A Secure cookie never goes out over http.
+    if (parse("sec=1; Secure", "www.example.com", "/a/b", &c) != 0) { return 87; }
+    if (ck.jar_store(&j, &c, NOW) != 0) { return 88; }
+    n = ck.jar_header(&j, &u, NOW, cast(*u8, &hdr), 1024);
+    if (eqs(cast(*u8, &hdr), "a=1") == 0) {
+        io.printf("http header is \"%s\"\n", cast(*u8, &hdr));
+        return 89;
+    }
+    // ...and does over https.
+    n = ck.jar_header(&j, &us, NOW, cast(*u8, &hdr), 1024);
+    if (eqs(cast(*u8, &hdr), "a=1; sec=1") == 0) {
+        if (eqs(cast(*u8, &hdr), "sec=1; a=1") == 0) {
+            io.printf("https header is \"%s\"\n", cast(*u8, &hdr));
+            return 90;
+        }
+    }
+
+    // Longer paths come first. RFC 6265 §5.4, and servers rely on it.
+    if (parse("deep=1; Path=/a/b/c", "www.example.com", "/a/b", &c) != 0) { return 91; }
+    if (ck.jar_store(&j, &c, NOW) != 0) { return 92; }
+    let is url.Url as deep = url.url_parse("https://www.example.com/a/b/c/d");
+    n = ck.jar_header(&j, &deep, NOW, cast(*u8, &hdr), 1024);
+    if (hdr[0] != cast(u8, 100)) {          // 'd' of deep
+        io.printf("ordering gave \"%s\"\n", cast(*u8, &hdr));
+        return 93;
+    }
+
+    // Replacing a cookie keeps its slot rather than adding one.
+    let is i64 as before = ck.jar_count(&j);
+    if (parse("a=2", "www.example.com", "/a/b", &c) != 0) { return 94; }
+    if (ck.jar_store(&j, &c, NOW) != 0) { return 95; }
+    if (ck.jar_count(&j) != before) { return 96; }
+    n = ck.jar_header(&j, &u, NOW, cast(*u8, &hdr), 1024);
+    if (eqs(cast(*u8, &hdr), "a=2") == 0) { return 97; }
+
+    // An expiry in the past DELETES. That is how a server logs a session out,
+    // and a jar that ignores it keeps sending a dead session forever.
+    if (parse("a=3; Max-Age=0", "www.example.com", "/a/b", &c) != 0) { return 98; }
+    if (ck.jar_store(&j, &c, NOW) != 0) { return 99; }
+    if (ck.jar_count(&j) != before - 1) { return 100; }
+    n = ck.jar_header(&j, &u, NOW, cast(*u8, &hdr), 1024);
+    if (n != 0) {
+        io.printf("after delete: \"%s\"\n", cast(*u8, &hdr));
+        return 101;
+    }
+
+    // ...and one that expires later disappears once the clock passes it.
+    if (parse("t=1; Max-Age=100", "www.example.com", "/a/b", &c) != 0) { return 102; }
+    if (ck.jar_store(&j, &c, NOW) != 0) { return 103; }
+    n = ck.jar_header(&j, &u, NOW, cast(*u8, &hdr), 1024);
+    if (n == 0) { return 104; }
+    n = ck.jar_header(&j, &u, NOW + 200, cast(*u8, &hdr), 1024);
+    if (n != 0) { return 105; }
+    // jar_expire actually removes it rather than merely hiding it.
+    let is i64 as had = ck.jar_count(&j);
+    if (ck.jar_expire(&j, NOW + 200) <= 0) { return 106; }
+    if (ck.jar_count(&j) >= had) { return 107; }
+
+    // A jar that is full refuses rather than overwriting something.
+    let is ck.Jar as small;
+    if (ck.jar_init(&small, 2) != 0) { return 108; }
+    if (parse("x=1", "example.com", "/", &c) != 0) { return 109; }
+    if (ck.jar_store(&small, &c, NOW) != 0) { return 110; }
+    if (parse("y=1", "example.com", "/", &c) != 0) { return 111; }
+    if (ck.jar_store(&small, &c, NOW) != 0) { return 112; }
+    if (parse("z=1", "example.com", "/", &c) != 0) { return 113; }
+    if (ck.jar_store(&small, &c, NOW) != ck.COOKIE_ERR_SPACE) { return 114; }
+    if (ck.jar_count(&small) != 2) { return 115; }
+    ck.jar_free(&small);
+
+    ck.jar_free(&j);
+    if (ck.jar_count(&j) != 0) { return 116; }
+
+    io.printf("cookie ok: domain, path, secure and expiry rules\n");
+    return 0;
+}

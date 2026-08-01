@@ -1,0 +1,230 @@
+// =======================================================
+// caustic-net/client/decode.cst
+// Content-Encoding, undone.
+//
+// Servers compress. Amazon sends gzip whether or not it was asked; every CDN
+// sends brotli to anything that admits to understanding it. A client that
+// does not decode gets bytes that look like noise and a page that does not
+// render, which is what this library did until now.
+//
+// The work is caustic-compact's. What is here is the HTTP part: reading the
+// header, deciding what it names, and refusing the two shapes that are
+// attacks rather than pages.
+//
+// THE EXPANSION CEILING IS NOT OPTIONAL. A response of a few kilobytes that
+// inflates to ten gigabytes is a zip bomb, and every general-purpose
+// decompressor will produce all ten if asked. Nothing below this layer knows
+// what a reasonable page is, so the limit is enforced here, twice: a ratio
+// against the compressed size and an absolute ceiling from the caller.
+//
+// Two limitations, stated rather than discovered:
+//
+//   * caustic-compact's API is ONE-SHOT — stream_decompress(fmt, src, len,
+//     out) — so the whole compressed body has to arrive before any of it can
+//     be decoded. There is no incremental rendering of a compressed page in
+//     this version.
+//   * It carries its OWN Bytes type, distinct from core/bytes.cst's. They are
+//     not interchangeable and the conversion goes through raw ptr/len, which
+//     means one copy per body. Said out loud because it looks like an
+//     oversight and is not.
+// =======================================================
+
+use "caustic-compact/stream.cst" as compact;
+use "caustic-compact/core/bytes.cst" as cbytes;
+use "../core/bytes.cst" as bytes;
+use "../proto/http1.cst" as http;
+
+// --- Errors (the -1810 block) ------------------------------------------
+let is i64 as DECODE_ERR_UNKNOWN with imut = 0 - 1810;   // an encoding we do not have
+let is i64 as DECODE_ERR_BOMB    with imut = 0 - 1811;   // past the expansion ceiling
+let is i64 as DECODE_ERR_FAILED  with imut = 0 - 1812;   // the decompressor said no
+let is i64 as DECODE_ERR_ALLOC   with imut = 0 - 1813;
+
+let is i64 as ENC_NONE     with imut = 0;
+let is i64 as ENC_IDENTITY with imut = 1;
+let is i64 as ENC_GZIP     with imut = 2;
+let is i64 as ENC_DEFLATE  with imut = 3;
+let is i64 as ENC_BROTLI   with imut = 4;
+let is i64 as ENC_ZSTD     with imut = 5;
+
+// What to send. Only what caustic-compact can actually undo — announcing an
+// encoding we cannot decode is how a page turns into noise.
+let is *u8 as ACCEPT_ENCODING with imut = "gzip, deflate, br, zstd";
+
+// A compressed body may not expand past this multiple of its own size.
+//
+// The number is measured, not guessed. Real content: HTML, CSS and JavaScript
+// gzip at 3 to 8; a page that is mostly repeated table markup reaches about
+// 30. A gzip bomb — a stream of zeros — tops out at 1027, because that is the
+// most DEFLATE's 32 KiB window can do. Brotli's window is 16 MiB and it goes
+// orders of magnitude beyond.
+//
+// So 1000 would have been useless: it sits below gzip's own ceiling and above
+// nothing. 200 is six times any honest body seen and five times under a gzip
+// bomb, and it stops a brotli one outright.
+let is i64 as MAX_RATIO with imut = 200;
+// ...and never past this, whatever the ratio allows. A caller with a smaller
+// budget passes its own.
+let is i64 as MAX_ABSOLUTE with imut = 268435456;   // 256 MiB
+
+fn _lower(c as u8) as u8 {
+    if (c >= 65 && c <= 90) { return cast(u8, cast(i64, c) + 32); }
+    return c;
+}
+
+// Case-insensitive, and tolerant of the whitespace a header value carries.
+fn _token_is(v as *u8, want as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (v[i] == 32 || v[i] == 9) { i = i + 1; }
+    let is i64 as k with mut = 0;
+    while (want[k] != 0) {
+        if (_lower(v[i + k]) != want[k]) { return 0; }
+        k = k + 1;
+    }
+    let is u8 as after = v[i + k];
+    if (after == 0) { return 1; }
+    if (after == 32) { return 1; }
+    if (after == 9) { return 1; }
+    if (after == 44) { return 1; }      // ','
+    if (after == 59) { return 1; }      // ';'
+    return 0;
+}
+
+// The encoding a Content-Encoding value names.
+//
+// A LIST of encodings — "gzip, br" — is refused rather than half-applied.
+// It is legal and essentially never sent, and getting it wrong silently
+// produces a body that is still compressed.
+fn encoding_of(v as *u8) as i64 {
+    if (cast(i64, v) == 0) { return ENC_NONE; }
+    let is i64 as i with mut = 0;
+    let is i64 as commas with mut = 0;
+    while (v[i] != 0) {
+        if (v[i] == 44) { commas = commas + 1; }
+        i = i + 1;
+    }
+    if (commas > 0) { return DECODE_ERR_UNKNOWN; }
+
+    if (_token_is(v, "identity") == 1) { return ENC_IDENTITY; }
+    if (_token_is(v, "gzip") == 1) { return ENC_GZIP; }
+    if (_token_is(v, "x-gzip") == 1) { return ENC_GZIP; }
+    if (_token_is(v, "deflate") == 1) { return ENC_DEFLATE; }
+    if (_token_is(v, "br") == 1) { return ENC_BROTLI; }
+    if (_token_is(v, "zstd") == 1) { return ENC_ZSTD; }
+    if (v[0] == 0) { return ENC_NONE; }
+    return DECODE_ERR_UNKNOWN;
+}
+
+// The Content-Encoding a response declares.
+fn response_encoding(r as *http.Response) as i64 {
+    let is [128]u8 as v;
+    let is i64 as n = http.resp_header(r, "content-encoding", cast(*u8, &v), 128);
+    if (n < 0) { return ENC_NONE; }
+    if (n == 0) { return ENC_NONE; }
+    return encoding_of(cast(*u8, &v));
+}
+
+fn _compact_fmt(enc as i64) as i64 {
+    if (enc == ENC_GZIP)    { return compact.FMT_GZIP; }
+    // "deflate" on the wire is zlib-wrapped about as often as it is raw, and
+    // the two differ in whether a two-byte header is present. Sniff rather
+    // than trust the name: 0x78 with a valid check byte is zlib.
+    if (enc == ENC_DEFLATE) { return compact.FMT_ZLIB; }
+    if (enc == ENC_BROTLI)  { return compact.FMT_BROTLI; }
+    if (enc == ENC_ZSTD)    { return compact.FMT_ZSTD; }
+    return 0 - 1;
+}
+
+// Is this a zlib stream, or raw deflate? RFC 1950: CMF/FLG, where the low
+// nibble of CMF is 8 and (CMF<<8|FLG) is a multiple of 31.
+fn _looks_zlib(p as *u8, n as i64) as i64 {
+    if (n < 2) { return 0; }
+    let is i64 as cmf = cast(i64, p[0]);
+    let is i64 as flg = cast(i64, p[1]);
+    if ((cmf & 15) != 8) { return 0; }
+    if (((cmf << 8) + flg) % 31 != 0) { return 0; }
+    return 1;
+}
+
+// Decode `src` into `out` according to `enc`.
+//
+// `limit` is the caller's absolute ceiling, 0 for the default. Returns the
+// decoded length, or a sentinel. ENC_NONE and ENC_IDENTITY copy.
+fn decode_body(enc as i64, src as *u8, srclen as i64,
+               out as *bytes.Bytes, limit as i64) as i64 {
+    if (enc < 0) { return enc; }
+
+    let is i64 as cap with mut = limit;
+    if (cap <= 0) { cap = MAX_ABSOLUTE; }
+    if (cap > MAX_ABSOLUTE) { cap = MAX_ABSOLUTE; }
+
+    if (enc == ENC_NONE || enc == ENC_IDENTITY) {
+        if (srclen > cap) { return DECODE_ERR_BOMB; }
+        bytes.bytes_reset(out);
+        if (bytes.bytes_append(out, src, srclen) < 0) { return DECODE_ERR_ALLOC; }
+        return srclen;
+    }
+
+    let is i64 as fmt with mut = _compact_fmt(enc);
+    if (fmt < 0) { return DECODE_ERR_UNKNOWN; }
+    if (enc == ENC_DEFLATE) {
+        if (_looks_zlib(src, srclen) == 0) { fmt = compact.FMT_DEFLATE; }
+    }
+
+    // The ratio ceiling, computed before anything is decompressed. An empty
+    // body cannot expand to anything, so it is its own answer.
+    if (srclen <= 0) {
+        bytes.bytes_reset(out);
+        return 0;
+    }
+    let is i64 as ratio_cap with mut = srclen * MAX_RATIO;
+    if (ratio_cap < 0) { ratio_cap = cap; }       // multiplication overflowed
+    if (ratio_cap > cap) { ratio_cap = cap; }
+
+    // caustic-compact has its own Bytes, so the result lands there and is
+    // copied across. One copy per body, and the reason is in the header.
+    let is cbytes.Bytes as tmp with mut = cbytes.bytes_new(65536);
+    if (cast(i64, tmp.ptr) == 0) { return DECODE_ERR_ALLOC; }
+
+    let is i64 as n = compact.stream_decompress(fmt, src, srclen, &tmp);
+    if (n < 0) {
+        cbytes.bytes_free(&tmp);
+        return DECODE_ERR_FAILED;
+    }
+    if (tmp.len > ratio_cap) {
+        // Past the ceiling. It is already in memory — caustic-compact is
+        // one-shot and cannot be stopped part way — so this bounds what the
+        // CALLER sees and what stays allocated, not the peak. Said plainly:
+        // a real streaming decoder would stop at the limit, and that needs an
+        // incremental API upstream.
+        cbytes.bytes_free(&tmp);
+        return DECODE_ERR_BOMB;
+    }
+
+    bytes.bytes_reset(out);
+    if (bytes.bytes_append(out, tmp.ptr, tmp.len) < 0) {
+        cbytes.bytes_free(&tmp);
+        return DECODE_ERR_ALLOC;
+    }
+    let is i64 as got = tmp.len;
+    cbytes.bytes_free(&tmp);
+    return got;
+}
+
+fn encoding_name(enc as i64) as *u8 {
+    if (enc == ENC_NONE)     { return "none"; }
+    if (enc == ENC_IDENTITY) { return "identity"; }
+    if (enc == ENC_GZIP)     { return "gzip"; }
+    if (enc == ENC_DEFLATE)  { return "deflate"; }
+    if (enc == ENC_BROTLI)   { return "br"; }
+    if (enc == ENC_ZSTD)     { return "zstd"; }
+    return "?";
+}
+
+fn decode_err_name(e as i64) as *u8 {
+    if (e == DECODE_ERR_UNKNOWN) { return "DECODE_ERR_UNKNOWN"; }
+    if (e == DECODE_ERR_BOMB)    { return "DECODE_ERR_BOMB"; }
+    if (e == DECODE_ERR_FAILED)  { return "DECODE_ERR_FAILED"; }
+    if (e == DECODE_ERR_ALLOC)   { return "DECODE_ERR_ALLOC"; }
+    return "DECODE_ERR_UNKNOWN";
+}

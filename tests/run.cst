@@ -281,6 +281,8 @@ fn check_all_imports() as i32 {
     bad = bad + cast(i64, check_imports("tls/handshake.cst"));
     bad = bad + cast(i64, check_imports("tls/client.cst"));
     bad = bad + cast(i64, check_imports("client/fetch.cst"));
+    bad = bad + cast(i64, check_imports("client/decode.cst"));
+    bad = bad + cast(i64, check_imports("proto/cookie.cst"));
     bad = bad + cast(i64, check_imports("proto/url.cst"));
     bad = bad + cast(i64, check_imports("proto/http1.cst"));
     if (bad == 0) { io.write_str(1, "ok\n"); return 0; }
@@ -349,6 +351,8 @@ fn main(argc as i64, argv as *u8) as i32 {
     fail = fail + cast(i64, run_case(ccp, "test_verify",  "tests/test_verify.cst"));
     fail = fail + cast(i64, run_case(ccp, "test_tls",     "tests/test_tls.cst"));
     fail = fail + cast(i64, run_case(ccp, "test_fetch",   "tests/test_fetch.cst"));
+    fail = fail + cast(i64, run_case(ccp, "test_decode",  "tests/test_decode.cst"));
+    fail = fail + cast(i64, run_case(ccp, "test_cookie",  "tests/test_cookie.cst"));
     fail = fail + cast(i64, run_case(ccp, "test_conn",    "tests/test_conn.cst"));
     fail = fail + cast(i64, run_case(ccp, "test_bytes",   "tests/test_bytes.cst"));
     fail = fail + cast(i64, run_case(ccp, "test_bufread", "tests/test_bufread.cst"));
@@ -358,6 +362,7 @@ fn main(argc as i64, argv as *u8) as i32 {
     fail = fail + cast(i64, run_case(ccp, "http_get",     "examples/http_get.cst"));
     fail = fail + cast(i64, build_case(ccp, "dns_lookup",   "examples/dns_lookup.cst"));
     fail = fail + cast(i64, build_case(ccp, "https_get",    "examples/https_get.cst"));
+    fail = fail + cast(i64, build_case(ccp, "fetch_get",    "examples/fetch_get.cst"));
 
     if (fail == 0) { io.write_str(1, "all green\n"); return 0; }
     io.write_str(1, "FAILURES: "); io.write_int(1, fail); io.write_str(1, "\n");
