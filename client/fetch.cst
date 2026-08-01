@@ -63,7 +63,6 @@ let is i64 as FETCH_ERR_DOWNGRADE with imut = 0 - 1806;   // https redirected to
 let is i64 as FETCH_ERR_SPACE     with imut = 0 - 1807;
 let is i64 as FETCH_ERR_ALLOC     with imut = 0 - 1808;
 
-// Literal dimensions, per the note in proto/dns.cst.
 let is i64 as MAX_URL       with imut = 2048;
 let is i64 as MAX_HOST      with imut = 256;
 let is i64 as MAX_HEAD      with imut = 32768;
@@ -99,7 +98,7 @@ struct Fetch {
     reused as i64;            // 1 when the current exchange got a pooled socket
     retries as i64;           // how many times a dead pooled socket was replaced
 
-    final_url as [2048]u8;
+    final_url as [MAX_URL]u8;
     hdrbuf    as *u8;         // MAX_HEAD, mmap'd
     brbuf     as *u8;         // 16 KiB, mmap'd
     c         as *conn.Conn;
@@ -222,7 +221,7 @@ fn _seen_before(f as *Fetch, u as *u8) as i64 {
 
 // Open a socket to `u`'s host and wrap it in TLS if the scheme says so.
 fn _connect(f as *Fetch, u as *url.Url, deadline as i64) as *conn.Conn {
-    let is [256]u8 as host;
+    let is [MAX_HOST]u8 as host;
     if (url.url_host(u, cast(*u8, &host), MAX_HOST) < 0) {
         f.tls_err = FETCH_ERR_URL;
         return cast(*conn.Conn, 0);
@@ -303,7 +302,7 @@ fn _recycle(f as *Fetch, u as *url.Url, bd as *http.BodyReader) as void {
     if (cast(i64, f.c) == 0) { return; }
     if (http.conn_reusable(&f.r, bd) != 1) { return; }
 
-    let is [256]u8 as host;
+    let is [MAX_HOST]u8 as host;
     if (url.url_host(u, cast(*u8, &host), MAX_HOST) < 0) { return; }
     let is i64 as https = url.url_scheme_is(u, "https");
     let is i64 as port with mut = u.port;
@@ -451,11 +450,11 @@ fn fetch_method(f as *Fetch, method as *u8, target as *u8,
     f.conn_err = 0;
     f.retries = 0;
 
-    let is [2048]u8 as cur;
+    let is [MAX_URL]u8 as cur;
     if (_copy_str(cast(*u8, &cur), MAX_URL, target) <= 0) { return FETCH_ERR_URL; }
 
-    let is [2048]u8 as next;
-    let is [2048]u8 as loc;
+    let is [MAX_URL]u8 as next;
+    let is [MAX_URL]u8 as loc;
     let is [16]u8 as m;
     _copy_str(cast(*u8, &m), 16, method);
 

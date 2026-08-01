@@ -319,11 +319,11 @@ needs a `mulhi` the compiler does not expose.
 The Caustic toolchain (`caustic`, `caustic-mk`) must be installed; the stdlib
 resolves from the install path, so `use "std/net.cst"` just works.
 
-**Caustic v0.1.7 or newer.** Earlier toolchains miscompile every threaded
-program at `-O1` and ship an allocator whose heaps can hang the process the
-moment a thread exists — both are described under "Two bugs below this library"
-above. `client/parallel` is the module that cannot work without the fix; the
-rest of the library builds on v0.1.6, at the default optimization level only.
+**Caustic v0.1.8 or newer.** v0.1.7 fixed the two bugs described under "Two
+bugs below this library" above — every threaded program miscompiled at `-O1`,
+and an allocator whose heaps could hang the process the moment a thread exists.
+v0.1.8 is needed for a different reason: a struct field written `[MAX]u8` folded
+only in the root file before it, and every buffer here is declared that way.
 
 ```sh
 caustic-mk run test        # compile-check the library, then build and run every case

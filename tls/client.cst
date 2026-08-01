@@ -40,7 +40,6 @@ let is i64 as CLIENT_ERR_ALLOC   with imut = 0 - 1540;
 let is i64 as CLIENT_ERR_TRUNC   with imut = 0 - 1541;   // EOF without close_notify
 let is i64 as CLIENT_ERR_KEYUPD  with imut = 0 - 1542;   // KeyUpdate we could not follow
 
-// Literal dimensions, per the note in proto/dns.cst.
 let is i64 as CTX_RX    with imut = 16645;   // record.HDR_LEN + record.MAX_CIPHER
 let is i64 as CTX_PLAIN with imut = 16385;   // record.MAX_PLAIN + 1
 let is i64 as CTX_BR    with imut = 4096;
@@ -62,12 +61,12 @@ struct TlsCtx {
     rpos as i64;   rlen as i64;
 
     s_ap as [48]u8;   c_ap as [48]u8;   // kept for KeyUpdate
-    host as [256]u8;
+    host as [CTX_HOST]u8;
     alpn as [16]u8;
 
-    brbuf as [4096]u8;
-    rx    as [16645]u8;
-    plain as [16385]u8;
+    brbuf as [CTX_BR]u8;
+    rx    as [CTX_RX]u8;
+    plain as [CTX_PLAIN]u8;
 }
 
 let is i64 as _last_err with mut = 0;

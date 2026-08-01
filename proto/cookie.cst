@@ -43,17 +43,16 @@ let is i64 as SAME_SITE_NONE   with imut = 0;
 let is i64 as SAME_SITE_LAX    with imut = 1;
 let is i64 as SAME_SITE_STRICT with imut = 2;
 
-// Literal dimensions, per the note in proto/dns.cst.
 let is i64 as MAX_NAME   with imut = 128;
 let is i64 as MAX_VALUE  with imut = 4096;
 let is i64 as MAX_DOMAIN with imut = 256;
 let is i64 as MAX_PATH   with imut = 512;
 
 struct Cookie {
-    name   as [128]u8;
-    value  as [4096]u8;
-    domain as [256]u8;      // never carries a leading dot
-    path   as [512]u8;
+    name   as [MAX_NAME]u8;
+    value  as [MAX_VALUE]u8;
+    domain as [MAX_DOMAIN]u8;      // never carries a leading dot
+    path   as [MAX_PATH]u8;
     expires   as i64;       // epoch, or 0 for a session cookie
     created   as i64;       // for the ordering RFC 6265 §5.4 requires
     secure    as i64;
@@ -487,8 +486,8 @@ fn jar_store(j as *Jar, c as *Cookie, now as i64) as i64 {
 // Returns the number stored. A cookie that fails a rule is skipped, not
 // fatal: one bad Set-Cookie must not cost the others.
 fn jar_set(j as *Jar, r as *http.Response, u as *url.Url, now as i64) as i64 {
-    let is [256]u8 as host;
-    let is [512]u8 as rpath;
+    let is [MAX_DOMAIN]u8 as host;
+    let is [MAX_PATH]u8 as rpath;
     if (url.url_host(u, cast(*u8, &host), MAX_DOMAIN) < 0) { return 0; }
     if (url.url_path(u, cast(*u8, &rpath), MAX_PATH) < 0) {
         rpath[0] = cast(u8, 47);
@@ -496,7 +495,7 @@ fn jar_set(j as *Jar, r as *http.Response, u as *url.Url, now as i64) as i64 {
     }
 
     let is i64 as cur with mut = 0;
-    let is [4096]u8 as v;
+    let is [MAX_VALUE]u8 as v;
     let is i64 as stored with mut = 0;
     while (1 == 1) {
         let is i64 as n = http.resp_header_next(r, "Set-Cookie", &cur,
@@ -536,8 +535,8 @@ fn cookie_applies(c as *Cookie, host as *u8, rpath as *u8, https as i64,
 // ascending. Servers do rely on it.
 fn jar_header(j as *Jar, u as *url.Url, now as i64,
               out as *u8, max as i64) as i64 {
-    let is [256]u8 as host;
-    let is [512]u8 as rpath;
+    let is [MAX_DOMAIN]u8 as host;
+    let is [MAX_PATH]u8 as rpath;
     if (url.url_host(u, cast(*u8, &host), MAX_DOMAIN) < 0) { return 0; }
     if (url.url_path(u, cast(*u8, &rpath), MAX_PATH) < 0) {
         rpath[0] = cast(u8, 47);

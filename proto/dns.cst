@@ -50,19 +50,20 @@ let is i64 as C_IN with imut = 1;
 // --- Limits, all from RFC 1035 §2.3.4 unless noted ---------------------
 let is i64 as MAX_NAME  with imut = 255;   // wire form, including length bytes
 let is i64 as MAX_LABEL with imut = 63;
-// Presentation form plus the NUL. Every scratch buffer below is declared as
-// the LITERAL 256 rather than [MAX_TEXT]u8.
+// Presentation form plus the NUL.
 //
-// `[MAX_TEXT]u8` used to compile into an array of length ZERO — the parser
-// read the token's int_val without checking it was a number, and an
-// identifier's is 0 — so sizeof reported 0 and the writes ran off the frame.
-// Fixed in the compiler (Caustic d8ff1ef; a named `with imut` constant is now
-// folded, and anything unfoldable is an error).
+// `[MAX_TEXT]u8` used to compile into an array of length ZERO. The parser read
+// the token's int_val without checking it was a number, and an identifier's is
+// 0 — so sizeof reported 0, no stage complained, and every write ran off the
+// frame into the next variable. Every buffer in this library was spelled with a
+// literal because of it, and every one was pinned to its constant by a test so
+// the two could not drift.
 //
-// The literal stays because CI builds against the PUBLISHED release, which
-// does not carry that fix yet: switching to the named form here would be green
-// locally and silently corrupt in CI. Revisit once a release ships it.
-// tests/test_dns.cst pins the literal to the constant so they cannot drift.
+// Fixed in Caustic d8ff1ef (a named `with imut` constant is folded, and
+// anything unfoldable is an error) and 5753566 (the same for a struct field),
+// shipped in v0.1.7, which this library now requires. The names are back.
+// tests/test_dns.cst still pins the value, because the size being 256 is a
+// decision from RFC 1035 §2.3.4 rather than an implementation detail.
 let is i64 as MAX_TEXT  with imut = 256;
 let is i64 as HDR_LEN   with imut = 12;
 let is i64 as MAX_JUMPS with imut = 128;   // belt-and-braces; see _name_read
@@ -328,7 +329,7 @@ fn dns_name_read(buf as *u8, len as i64, off as i64,
 // Shares every guard in dns_name_read, including the loop guard — a record
 // whose name is a pointer cycle cannot be walked past either.
 fn dns_name_wire_len(buf as *u8, len as i64, off as i64) as i64 {
-    let is [256]u8 as scratch;
+    let is [MAX_TEXT]u8 as scratch;
     let is i64 as we with mut = 0;
     let is i64 as rc = dns_name_read(buf, len, off, cast(*u8, &scratch), MAX_TEXT, &we);
     if (rc < 0) { return rc; }
@@ -340,7 +341,7 @@ fn dns_name_wire_len(buf as *u8, len as i64, off as i64) as i64 {
 // for a query of "www.a.com" is answering the same question, and a
 // case-sensitive compare here rejects real traffic.
 fn dns_name_eq(buf as *u8, len as i64, off as i64, name as *u8) as i64 {
-    let is [256]u8 as got;
+    let is [MAX_TEXT]u8 as got;
     let is i64 as n = dns_name_read(buf, len, off, cast(*u8, &got), MAX_TEXT, cast(*i64, 0));
     if (n < 0) { return 0; }
 
@@ -540,7 +541,7 @@ fn dns_addr_of(m as *DnsMsg, qname as *u8, out as *u8, want6 as i64, ttl_out as 
     let is i64 as size with mut = 4;
     if (want6 == 1) { want = T_AAAA; size = 16; }
 
-    let is [256]u8 as target;
+    let is [MAX_TEXT]u8 as target;
     let is i64 as t with mut = 0;
     while (qname[t] != 0 && t < MAX_TEXT - 1) { target[t] = qname[t]; t = t + 1; }
     // Normalize away a trailing dot so the compare below is uniform.
@@ -554,7 +555,7 @@ fn dns_addr_of(m as *DnsMsg, qname as *u8, out as *u8, want6 as i64, ttl_out as 
         let is DnsRR as rr;
         let is i64 as cur with mut = 0;
         let is i64 as found_cname with mut = 0;
-        let is [256]u8 as cname;
+        let is [MAX_TEXT]u8 as cname;
 
         while (dns_answer_next(m, &cur, &rr) == 1) {
             if (rr.rclass != C_IN) { continue; }
