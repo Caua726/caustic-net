@@ -152,7 +152,7 @@ server/      router* · threaded* · reactor* · static* · middleware*
 | client | `decode` — gzip · deflate (both framings) · brotli · zstd, with an expansion ceiling | ✅ green (`tests/test_decode`, bodies compressed by Python, 8 MiB bomb refused) |
 | proto | `cookie` — RFC 6265 parse · jar · domain/path/Secure rules | ✅ green (`tests/test_cookie`) |
 | client | `connpool` — keep-alive reuse by origin, 6 per host, retry-once | ✅ green (`tests/test_pool`, against a server that closes the connection) |
-| client | `parallel` — thread per job, waves, WaitGroup | ✅ green at the default level (`tests/test_parallel`, 12 jobs 4 at a time); **not runnable at `-O1`** — see below |
+| client | `parallel` — thread per job, waves, WaitGroup | ✅ green at both levels (`tests/test_parallel`, 12 jobs 4 at a time) |
 | core | `bufread` deadline (gap 03) | ✅ `br_set_deadline`; bounds the number of fills, pair with `set_recv_timeout` for a single read |
 | everything else | see the roadmap | ⏳ |
 
@@ -200,6 +200,8 @@ crypto in `caustic-crypto` applies.
 
 01 and 02 are closed: `resp_header_next`/`resp_header_count` walk repeated
 headers, and `url_resolve` resolves a relative reference per RFC 3986 §5.2.
+10 is closed upstream: caustic-crypto v0.1.1 verifies ECDSA with an
+interleaved wNAF instead of two constant-time ladders — see the timings below.
 
 | | Gap | Consequence |
 |---|---|---|
@@ -209,7 +211,6 @@ headers, and `url_resolve` resolves a relative reference per RFC 3986 §5.2.
 | 07 | `br_read_line` always copies | a zero-copy view would suit large headers; `Slice` already exists |
 | 08 | Per-module `bins` heaps are never torn down | irrelevant for a long-running server, matters if embedded |
 | 09 | `examples/http_get` hard-codes port 18081 | any process on the machine can collide; `transport.listen` cannot report a kernel-assigned port |
-| 10 | **ECDSA verification is slow** | see below — it is the number that decides whether a browser on top of this is usable |
 | 11 | No revocation of any kind | no CRL, no OCSP, no stapling. A certificate stays trusted until it expires |
 | 12 | `nameConstraints` is not implemented | it is *refused*, not ignored: a certificate carrying it critical fails to parse, which is the safe direction but rejects some real CAs |
 | 13 | TLS `key_share` is X25519 only | caustic-crypto exports `p256_ecdh_base` but no `p256_ecdh_shared`, so P-256 key exchange needs work upstream. A server that insists on P-256 gets a named `TLS_ERR_HRR` rather than a mystery. Nine of nine sites tried negotiated X25519 |
@@ -222,28 +223,33 @@ headers, and `url_resolve` resolves a relative reference per RFC 3986 §5.2.
 | 21 | `parallel` and `connpool` are not tested TOGETHER | each is tested on its own. Combining them needs a concurrent server, and the one in `tests/test_parallel` is a single thread — a test whose result depends on which of two single-threaded things blocked first measures nothing. The pool's mutex is the argument that it is safe to share; it is not a test |
 | 22 | A jar is not safe to share between threads | `client/parallel` gives each job its own `Fetch`, and attaches no jar. A caller that passes one has said it is theirs to synchronise |
 
-### Two bugs below this library
+### Two bugs below this library, and how they read now
 
 Both were found by the first test here that needed two things running at once,
-and both are outside this repository. They are recorded because anything built
-on caustic-net will meet them.
+and both were outside this repository. **Both are fixed in Caustic v0.1.7**,
+which is why that is the minimum version. They stay written down because
+anything built on an older toolchain will meet them, and because the second one
+was diagnosed wrong from here for months.
 
-**`std/mem/bins.cst`: `bins_new` returns a heap whose lock word is
-uninitialised.** It is a local in that function and never written, so the
-struct arrives carrying whatever was on the stack. Nothing notices while the
-program is single-threaded, because the allocator's lock is a no-op until
-`std/thread`'s `spawn` turns it on — and then the first allocation through
-such a heap finds a non-zero lock, futex-waits, and never wakes. The process
-hangs with no error and no crash.
+**`std/mem/bins.cst`: `bins_new` returned a heap whose lock word was never
+written.** A local in that function, set on no path, so the struct arrived
+carrying whatever was on the stack. Nothing notices while the program is
+single-threaded, because the allocator's lock is a no-op until `std/thread`'s
+`spawn` turns it on — and then the first allocation through such a heap finds a
+non-zero lock, futex-waits, and never wakes. The process hangs with no error and
+no crash.
 
 `core/conn.cst` and `core/bytes.cst` used to do exactly `_bins = bins_new(...)`
-and both hung. They now let `bins_alloc` build the heap itself, which is the
-one construction that ends up consistent, because its lazy path restores the
-lock word it was holding. `transport.init()` forces both heaps up while the
-program is still single-threaded.
+and both hung. They still let `bins_alloc` build the heap itself, because that
+is also the only construction without a check-then-set race between two threads
+opening their first connection at once, and `transport.init()` still forces both
+heaps up while the program is single-threaded. Neither is a workaround for the
+lock bug; both are right on their own terms.
 
-**The optimizing backend miscompiles a local label inside inline `asm`.**
-Eleven lines reproduce it:
+**The `-O1` miscompile was the INLINER, not the assembler.** This README used to
+say the assembler resolved a local label to the wrong address. It did resolve it
+to the wrong address — to the first of two definitions — and it was doing what
+it was told. Eleven lines reproduce the whole thing:
 
 ```cst
 fn pick(x as i64) as i64 with naked {
@@ -252,17 +258,27 @@ fn pick(x as i64) as i64 with naked {
 fn main() as i32 { io.printf("%ld %ld\n", pick(1), pick(0)); return 0; }
 ```
 
-`111 222` at the default level; a segfault at `-O1`. The emitted `.s` is
-correct in both — the assembler resolves `.Lzero_case` to the wrong address,
-and the `je` ends up with a displacement pointing into another function
-entirely. `std/thread.cst`'s `_clone_thread` is exactly this shape, so **every
-threaded program crashes at `-O1`**.
+`111 222` at the default level; a segfault at `-O1`, where `main` opens with
+`test %rdi,%rdi` against its own `argc`, jumps into `_start`, and returns 111
+from `main`. `pick` is gone from the symbol table: it was **inlined**.
 
-Two consequences here. `tests/test_fetch`, `tests/test_pool` and
-`tests/test_parallel` run their server halves as a second PROCESS rather than
-a thread — which is closer to reality anyway. And `tests/test_parallel` is
-built but NOT RUN under `-O1`, with the reason printed on every run rather
-than quietly skipped.
+The gate that let it through reads as the opposite of what it does. The inliner
+refuses a callee with `alloc_stack_size != 0` — "no frame whose offsets could
+clash with the caller's" — and an ordinary function with a parameter
+materializes a stack slot, so it is refused. A `with naked` function has no
+prologue at all, so it passes with any number of arguments. The pass written for
+small leaf helpers had made asm trampolines its most eligible candidates, and
+`std/thread`'s `_clone_thread` is five arguments, one `asm`, no frame.
+
+Duplicating an asm body breaks it twice over: a label inside the text is defined
+twice in the `.s`, and the `ret` that was meant to return from the callee returns
+from the caller instead. Fixed by refusing both `is_naked` and a body containing
+`asm`; the assembler now also refuses a label defined twice, so the next producer
+of a bad `.s` hears about it at assembly rather than at runtime.
+
+One consequence survives here, and it is an improvement: `tests/test_fetch`,
+`tests/test_pool` and `tests/test_parallel` run their server halves as a second
+PROCESS rather than a thread, which is closer to what a client actually faces.
 
 ### How long a certificate chain takes
 
@@ -270,30 +286,44 @@ Measured by `tests/test_verify` on every run, so the number in the table below
 is whatever this machine last saw rather than something written once and left
 to rot. On an ordinary desktop, `-O1`, per chain of two links plus an anchor:
 
-| chain | time |
-|---|---|
-| RSA-2048, SHA-256 | ~1.7 ms |
-| ECDSA P-256, SHA-256 | ~31 ms |
-| ietf.org (P-256 leaf and intermediate, P-384 root) | ~49 ms |
+| chain | time | before caustic-crypto v0.1.1 |
+|---|---|---|
+| RSA-2048, SHA-256 | ~1.6 ms | ~1.7 ms |
+| ECDSA P-256, SHA-256 | **~11.5 ms** | ~31 ms |
+| ietf.org (P-256 leaf and intermediate, P-384 root) | **~17.6 ms** | ~49 ms |
 
-The surprise is which one is slow. ECDSA is normally the cheap option and here
-it costs **twenty times** an RSA verification, because caustic-crypto's
-`p256`/`p384` do every field inversion with a full `big_modexp` — one modular
-exponentiation per point operation, inside a Montgomery ladder over 28-bit
-limbs. RSA gets `big_modexp_public`, which is a single exponentiation and is
-already Montgomery.
+ECDSA used to cost **twenty times** an RSA verification, which is backwards —
+it is normally the cheap option. This README blamed the field arithmetic: one
+modular exponentiation per point operation. That was wrong. `_finv` is called
+**once** per verification, in the conversion back to affine.
 
-That is fine for one page and not fine for a browser: ten origins is most of a
-second spent on nothing but signatures, before a byte is rendered. The fix is
-upstream in caustic-crypto — an affine-coordinate inversion via the extended
-Euclidean algorithm instead of Fermat, and a windowed scalar multiplication —
-and it is not in this repository's scope. Recorded here so the decision to
-carry it is deliberate.
+The cost was the scalar algorithm. Verification computes `u1·G + u2·Q`, and
+caustic-crypto was doing it with two constant-time ladders — 256 fixed
+iterations each, a doubling AND an addition every time — for two scalars that
+are entirely public: they come out of the signature and the hash. About 12,300
+field multiplies to protect nothing.
+
+v0.1.1 does it with a width-5 interleaved wNAF (Shamir's trick): one doubling
+loop for both scalars, additions only on non-zero digits. About 3,700
+multiplies, and signing and ECDH keep the constant-time ladder untouched,
+because there the scalar IS a secret.
+
+ECDSA is still about seven times an RSA verification rather than twenty. The
+rest is the field, and caustic-crypto has measured that road: Montgomery in the
+EC field is 1.08×, a dedicated Solinas reduction for P-256/P-384 about 1.2× and
+it needs a radix repack. The real remaining lever there is radix 2^64, which
+needs a `mulhi` the compiler does not expose.
 
 ## Build & test
 
 The Caustic toolchain (`caustic`, `caustic-mk`) must be installed; the stdlib
 resolves from the install path, so `use "std/net.cst"` just works.
+
+**Caustic v0.1.7 or newer.** Earlier toolchains miscompile every threaded
+program at `-O1` and ship an allocator whose heaps can hang the process the
+moment a thread exists — both are described under "Two bugs below this library"
+above. `client/parallel` is the module that cannot work without the fix; the
+rest of the library builds on v0.1.6, at the default optimization level only.
 
 ```sh
 caustic-mk run test        # compile-check the library, then build and run every case

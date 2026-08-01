@@ -33,7 +33,7 @@ env_default "OPT" "-O1"
 // library's own `use` lines, and it compiles every case with only the deps
 // root on the search path — the consumer's constraint, not ours.
 
-depend "caustic-crypto" in "https://github.com/Caua726/caustic-crypto" tag "v0.1.0"
+depend "caustic-crypto" in "https://github.com/Caua726/caustic-crypto" tag "v0.1.1"
 
 // Content-Encoding. gzip, deflate, brotli and zstd are what servers actually
 // send; caustic-compact ships those and more, all vector-validated there.

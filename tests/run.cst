@@ -122,31 +122,6 @@ fn run_case(cc as *u8, name as *u8, src as *u8) as i32 {
     return 1;
 }
 
-// Build and run, EXCEPT under an optimization level, where it is only built.
-//
-// For a case that depends on std/thread. spawn is miscompiled by the
-// optimizing backend — eleven lines reproduce it, a `naked` function whose
-// inline asm jumps to its own local label assembles with the wrong
-// displacement — so every threaded program segfaults at -O1. The case still
-// COMPILES there, which is what this checks, and the skip prints the reason
-// on every run rather than quietly narrowing what the suite covers.
-fn run_case_noopt(cc as *u8, name as *u8, src as *u8) as i32 {
-    if (cast(i64, OPT) != 0) {
-        let is [512]u8 as out;
-        let is i64 as p with mut = app(cast(*u8, &out), 0, "build/");
-        p = app(cast(*u8, &out), p, name);
-        out[p] = cast(u8, 0);
-        label(name);
-        if (compile_to(cc, src, cast(*u8, &out)) != 0) {
-            io.write_str(1, "COMPILE FAIL\n");
-            return 1;
-        }
-        io.write_str(1, "built, NOT RUN (std/thread is miscompiled at -O1)\n");
-        return 0;
-    }
-    return run_case(cc, name, src);
-}
-
 // Compile only. For a case whose success criterion is a real network — an https
 // fetch, a DNS lookup — which cannot be the thing that decides CI. The binary
 // is left in build/ to be run by hand.
@@ -381,7 +356,7 @@ fn main(argc as i64, argv as *u8) as i32 {
     fail = fail + cast(i64, run_case(ccp, "test_decode",  "tests/test_decode.cst"));
     fail = fail + cast(i64, run_case(ccp, "test_cookie",  "tests/test_cookie.cst"));
     fail = fail + cast(i64, run_case(ccp, "test_pool",    "tests/test_pool.cst"));
-    fail = fail + cast(i64, run_case_noopt(ccp, "test_parallel", "tests/test_parallel.cst"));
+    fail = fail + cast(i64, run_case(ccp, "test_parallel", "tests/test_parallel.cst"));
     fail = fail + cast(i64, run_case(ccp, "test_conn",    "tests/test_conn.cst"));
     fail = fail + cast(i64, run_case(ccp, "test_bytes",   "tests/test_bytes.cst"));
     fail = fail + cast(i64, run_case(ccp, "test_bufread", "tests/test_bufread.cst"));

@@ -19,13 +19,6 @@
 // safe to share, and that combination is a gap in the README rather than a
 // claim made here.
 //
-// ⚠ THIS TEST DOES NOT RUN UNDER -O1, and tests/run.cst skips it there
-// loudly rather than quietly. std/thread's spawn is miscompiled by the
-// optimizing backend: eleven lines reproduce it — a `naked` function whose
-// inline asm jumps to its own local label assembles with the wrong
-// displacement — and every threaded program segfaults. The module under test
-// is correct; its dependency is not. See the README's known gaps.
-//
 // Exit 0 = all pass. Non-zero = the numbered check that failed.
 // =======================================================
 

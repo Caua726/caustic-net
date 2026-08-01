@@ -31,17 +31,20 @@ let is i64 as PAGE      with imut = 4096;
 
 // Zero-initialised in BSS, and built on first use by bins itself.
 //
-// NOT `_bins = bins_new(...)`. bins_new returns a Bins whose `lock` field it
-// never writes — it is an uninitialised local in that function — so the
-// struct arrives carrying whatever was on the stack. While the program is
-// single-threaded nothing notices, because the allocator's lock is a no-op
-// until std/thread's spawn turns it on. The moment a thread exists, the first
-// allocation through such a heap tries to take a lock word full of garbage,
-// finds it non-zero, and futex-waits forever for an unlock that cannot come.
+// NOT `_bins = bins_new(...)`, for the same reason as core/conn.cst: a
+// check-then-set around the constructor is not atomic, and two threads that
+// open their first Bytes at the same moment both build a heap over the same
+// struct. bins_alloc lazy-initialises a zeroed Bins under its own lock, so the
+// right amount of code here is none.
 //
-// bins_alloc's own lazy path builds the heap and then RESTORES the lock word
-// it was holding, which is the one construction that ends up consistent. So
-// the right amount of code here is none.
+// It used to be worse than a race. Until Caustic v0.1.7, bins_new returned a
+// Bins whose `lock` field it never wrote — an uninitialised local in that
+// function — so the struct arrived carrying whatever was on the stack. Nothing
+// noticed while the program was single-threaded, because the allocator's lock
+// is a no-op until std/thread's spawn turns it on; after that, the first
+// allocation through such a heap found a non-zero lock word and futex-waited
+// forever for an unlock that could not come. That is fixed upstream, and this
+// is still the construction we want.
 let is mem.Bins as _bins with mut;
 
 // Page-round a capacity destined for the page allocator, so the size passed to

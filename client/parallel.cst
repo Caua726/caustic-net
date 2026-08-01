@@ -31,12 +31,10 @@
 //   * the Conn heap, which transport.init() forces into existence before any
 //     thread can exist — see core/conn.cst.
 //
-// ⚠ std/thread's spawn is MISCOMPILED by the optimizing backend. Eleven lines
-// reproduce it (a `naked` function whose inline asm jumps to its own local
-// label assembles with the wrong displacement at -O1 and the right one at
-// -O0), and until that is fixed nothing here can run under -O1. The module is
-// correct; its dependency is not. tests/test_parallel says so out loud rather
-// than being quietly skipped.
+// Needs Caustic >= v0.1.7. Before that, std/thread's spawn was miscompiled at
+// -O1 — the inliner duplicated its `naked` asm trampoline, so the `ret` inside
+// returned from spawn and every threaded program segfaulted — and nothing here
+// could run under the optimizing backend.
 // =======================================================
 
 use "std/mem.cst" as mem;
