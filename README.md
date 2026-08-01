@@ -80,7 +80,7 @@ proto/       url · http1 · dns · cookie (RFC 6265 jar) · http2* · websocket
 tls/         transcript · keysched · record · x509 · pss · roots · trust · verify
              extensions · handshake · client
 client/      fetch (url→dns→connect→tls→http→redirect→decode→cookies) · decode
-             connpool (keep-alive reuse, retry-once) · parallel*
+             connpool (keep-alive reuse, retry-once) · parallel (thread per job)
 server/      router* · threaded* · reactor* · static* · middleware*
 ```
 `*` = on the roadmap, not yet landed.
@@ -152,6 +152,7 @@ server/      router* · threaded* · reactor* · static* · middleware*
 | client | `decode` — gzip · deflate (both framings) · brotli · zstd, with an expansion ceiling | ✅ green (`tests/test_decode`, bodies compressed by Python, 8 MiB bomb refused) |
 | proto | `cookie` — RFC 6265 parse · jar · domain/path/Secure rules | ✅ green (`tests/test_cookie`) |
 | client | `connpool` — keep-alive reuse by origin, 6 per host, retry-once | ✅ green (`tests/test_pool`, against a server that closes the connection) |
+| client | `parallel` — thread per job, waves, WaitGroup | ✅ green at the default level (`tests/test_parallel`, 12 jobs 4 at a time); **not runnable at `-O1`** — see below |
 | core | `bufread` deadline (gap 03) | ✅ `br_set_deadline`; bounds the number of fills, pair with `set_recv_timeout` for a single read |
 | everything else | see the roadmap | ⏳ |
 
@@ -218,6 +219,8 @@ headers, and `url_resolve` resolves a relative reference per RFC 3986 §5.2.
 | 18 | The public suffix list is a heuristic | `psl_is_public_suffix` refuses a single label and a table of about forty two-part suffixes. It does not know `pvt.k12.ma.us`. A cookie scoped to an unlisted public suffix is accepted. The signature is what the real one would be, so replacing it is one file |
 | 19 | Decompression is one-shot | caustic-compact has no incremental API, so a compressed page cannot be rendered while it arrives — and the expansion ceiling is enforced after the decompressor has already produced the bytes, which bounds what the caller sees rather than the peak |
 | 20 | `SameSite` is parsed and not enforced | it is stored on the cookie; nothing consults it, because enforcement needs a notion of the initiating site that this layer does not have |
+| 21 | `parallel` and `connpool` are not tested TOGETHER | each is tested on its own. Combining them needs a concurrent server, and the one in `tests/test_parallel` is a single thread — a test whose result depends on which of two single-threaded things blocked first measures nothing. The pool's mutex is the argument that it is safe to share; it is not a test |
+| 22 | A jar is not safe to share between threads | `client/parallel` gives each job its own `Fetch`, and attaches no jar. A caller that passes one has said it is theirs to synchronise |
 
 ### Two bugs below this library
 
@@ -239,11 +242,27 @@ one construction that ends up consistent, because its lazy path restores the
 lock word it was holding. `transport.init()` forces both heaps up while the
 program is still single-threaded.
 
-**The optimizing backend miscompiles `std/thread.cst`'s `spawn`.** Twelve lines
-reproduce it — spawn one thread that assigns a global, join it — working at the
-default level and segfaulting at `-O1`, with the child jumping to address 0.
-`tests/test_fetch` therefore runs its server half as a second PROCESS rather
-than a thread. `client/parallel` cannot be written until this is fixed.
+**The optimizing backend miscompiles a local label inside inline `asm`.**
+Eleven lines reproduce it:
+
+```cst
+fn pick(x as i64) as i64 with naked {
+    asm("test rdi, rdi\njz .Lzero_case\nmov rax, 111\nret\n.Lzero_case:\nmov rax, 222\nret\n");
+}
+fn main() as i32 { io.printf("%ld %ld\n", pick(1), pick(0)); return 0; }
+```
+
+`111 222` at the default level; a segfault at `-O1`. The emitted `.s` is
+correct in both — the assembler resolves `.Lzero_case` to the wrong address,
+and the `je` ends up with a displacement pointing into another function
+entirely. `std/thread.cst`'s `_clone_thread` is exactly this shape, so **every
+threaded program crashes at `-O1`**.
+
+Two consequences here. `tests/test_fetch`, `tests/test_pool` and
+`tests/test_parallel` run their server halves as a second PROCESS rather than
+a thread — which is closer to reality anyway. And `tests/test_parallel` is
+built but NOT RUN under `-O1`, with the reason printed on every run rather
+than quietly skipped.
 
 ### How long a certificate chain takes
 

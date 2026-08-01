@@ -1,0 +1,288 @@
+// =======================================================
+// caustic-net/tests/test_parallel.cst
+// Many fetches at once, against one server.
+//
+// Twelve requests through a batch of four workers — the shape a page actually
+// has, and the first thing in this repository where several threads run the
+// whole stack at once. The server is a second process; it answers each path
+// with its own body, so a body landing in the wrong Job is a failure rather
+// than a coincidence.
+//
+// NO SHARED POOL HERE, deliberately. Combining the two needs a CONCURRENT
+// server, and this one is a single thread: while it sits in a read on one
+// connection, a worker that reused a different pooled socket can send into a
+// connection the server is about to close, and the run fails at whichever job
+// took the oldest entry. That is the test's server, not the library — but a
+// test whose result depends on which of two single-threaded things blocked
+// first measures nothing, so it is left out and said out loud. Reuse and its
+// retry are covered by tests/test_pool; the pool's own mutex is what makes it
+// safe to share, and that combination is a gap in the README rather than a
+// claim made here.
+//
+// ⚠ THIS TEST DOES NOT RUN UNDER -O1, and tests/run.cst skips it there
+// loudly rather than quietly. std/thread's spawn is miscompiled by the
+// optimizing backend: eleven lines reproduce it — a `naked` function whose
+// inline asm jumps to its own local label assembles with the wrong
+// displacement — and every threaded program segfaults. The module under test
+// is correct; its dependency is not. See the README's known gaps.
+//
+// Exit 0 = all pass. Non-zero = the numbered check that failed.
+// =======================================================
+
+use "std/io.cst" as io;
+use "std/process.cst" as proc;
+use "std/env.cst" as env;
+use "std/time.cst" as time;
+use "../core/conn.cst" as conn;
+use "../core/bufread.cst" as bufread;
+use "../transport/transport.cst" as tp;
+use "../tls/trust.cst" as trust;
+use "../client/connpool.cst" as pool;
+use "../client/parallel.cst" as par;
+
+let is i64 as PORT with imut = 18096;
+let is i64 as NJOBS with imut = 12;
+
+let is tp.Listener as _l with mut;
+
+fn streq(a as *u8, b as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (a[i] != 0 && b[i] != 0) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    if (a[i] != b[i]) { return 0; }
+    return 1;
+}
+
+fn target_of(line as *u8, out as *u8, max as i64) as i64 {
+    let is i64 as i with mut = 0;
+    while (line[i] != 0 && line[i] != 32) { i = i + 1; }
+    if (line[i] == 0) { return 0 - 1; }
+    i = i + 1;
+    let is i64 as n with mut = 0;
+    while (line[i] != 0 && line[i] != 32 && n < max - 1) {
+        out[n] = line[i];
+        n = n + 1;
+        i = i + 1;
+    }
+    out[n] = cast(u8, 0);
+    return n;
+}
+
+// Every path answers with its own last character repeated, so a body that
+// lands in the wrong Job is visible rather than plausible.
+//
+// ONE request per connection, then close. There is no pool in this test, so
+// every worker opens its own socket and never sends a second request on it —
+// and a server that waits for one holds its single thread for the length of
+// the timeout while every other worker queues behind it. That turned a
+// two-millisecond run into eleven seconds.
+fn serve_one(c as *conn.Conn) as void {
+    let is [4096]u8 as sbuf;
+    let is bufread.BufReader as br;
+    bufread.br_init(&br, c, cast(*u8, &sbuf), 4096);
+    let is [1024]u8 as line;
+
+    let is i64 as served with mut = 0;
+    while (served < 1) {
+        let is i64 as n = bufread.br_read_line(&br, cast(*u8, &line), 1024);
+        if (n <= 0) { break; }
+        let is [256]u8 as path;
+        if (target_of(cast(*u8, &line), cast(*u8, &path), 256) < 0) { break; }
+        while (1 == 1) {
+            let is i64 as k = bufread.br_read_line(&br, cast(*u8, &line), 1024);
+            if (k <= 0) { break; }
+        }
+
+        // "/j7" answers with eight bytes of '7'.
+        let is i64 as pn with mut = 0;
+        while (path[pn] != 0) { pn = pn + 1; }
+        let is u8 as tag = path[pn - 1];
+        let is [64]u8 as body;
+        let is i64 as i with mut = 0;
+        while (i < 8) { body[i] = tag; i = i + 1; }
+
+        conn.conn_write_all(c, "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n", 38);
+        conn.conn_write_all(c, cast(*u8, &body), 8);
+        served = served + 1;
+    }
+    conn.conn_close(c);
+    conn.conn_free(c);
+}
+
+// ACCEPT EVERYTHING PENDING FIRST, then answer. A single-threaded server that
+// accepts one connection and answers it before accepting the next leaves the
+// rest in the listen backlog, and four clients arriving together overflow a
+// backlog that small — which surfaces on the client as a refused connect and
+// looks exactly like the library failing under concurrency. It is not; it is
+// the shape of this test's server, and draining the queue first is what makes
+// the test measure what it claims to.
+let is [32]i64 as _pending with mut;
+
+fn server_main() as i32 {
+    tp.init();
+    let is tp.ListenResult as lr with mut = tp.listen_loopback(PORT);
+    if (lr.ok < 0) { return 1; }
+    _l = lr.l;
+    let is i64 as idle with mut = 0;
+    while (idle < 150) {
+        if (tp.listener_wait(&_l, 200) <= 0) { idle = idle + 1; continue; }
+        idle = 0;
+
+        let is i64 as np with mut = 0;
+        while (np < 32) {
+            let is *conn.Conn as c = tp.accept_conn(&_l);
+            if (cast(i64, c) == 0) { break; }
+            _pending[np] = cast(i64, c);
+            np = np + 1;
+            if (tp.listener_wait(&_l, 0) <= 0) { break; }
+        }
+
+        let is i64 as k with mut = 0;
+        while (k < np) {
+            serve_one(cast(*conn.Conn, _pending[k]));
+            k = k + 1;
+        }
+    }
+    tp.listener_close(&_l);
+    return 0;
+}
+
+// Build "http://127.0.0.1:18096/j<K>".
+fn job_url(k as i64, out as *u8) as void {
+    let is *u8 as base = "http://127.0.0.1:18096/j";
+    let is i64 as n with mut = 0;
+    while (base[n] != 0) { out[n] = base[n]; n = n + 1; }
+    if (k >= 10) {
+        out[n] = cast(u8, 48 + (k / 10));
+        n = n + 1;
+    }
+    out[n] = cast(u8, 48 + (k % 10));
+    n = n + 1;
+    out[n] = cast(u8, 0);
+}
+
+fn run_checks(b as *par.Batch) as i64 {
+    let is i64 as t0 = time.now_ms();
+    let is i64 as ok = par.batch_run(b, conn.deadline_in(30000));
+    let is i64 as ms = time.now_ms() - t0;
+
+    if (ok != NJOBS) {
+        io.printf("%ld of %ld succeeded in %ld ms\n", ok, NJOBS, ms);
+        let is i64 as i with mut = 0;
+        while (i < par.batch_count(b)) {
+            if (par.job_rc(b, i) != 0) {
+                io.printf("  %s -> %ld (status %ld, done %ld)\n",
+                          par.job_url(b, i), par.job_rc(b, i),
+                          par.job_status(b, i), par.job_done(b, i));
+            }
+            i = i + 1;
+        }
+        return 40;
+    }
+
+    // Every job got ITS OWN body. Twelve threads writing into one array is
+    // exactly where a shared Fetch or a shared buffer would show up, and it
+    // would show up as job 3 holding job 7's bytes.
+    let is i64 as i with mut = 0;
+    while (i < NJOBS) {
+        if (par.job_status(b, i) != 200) { return 41; }
+        if (par.job_body_len(b, i) != 8) {
+            io.printf("job %ld body is %ld bytes\n", i, par.job_body_len(b, i));
+            return 42;
+        }
+        let is *u8 as body = par.job_body(b, i);
+        let is u8 as want = cast(u8, 48 + (i % 10));
+        let is i64 as k with mut = 0;
+        while (k < 8) {
+            if (body[k] != want) {
+                io.printf("job %ld got '%c' where '%c' was expected\n",
+                          i, cast(i64, body[k]), cast(i64, want));
+                return 43;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    io.printf("  %ld jobs in %ld ms\n", NJOBS, ms);
+    return 0;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    if (argc > 1) {
+        if (streq(env.argv(1), "--server") == 1) { return server_main(); }
+    }
+    tp.init();
+
+    if (par.MAX_URL != 2048) { return 1; }
+    if (par.MAX_WORKERS != 16) { return 2; }
+
+    // An empty batch runs and returns nothing, rather than waiting forever on
+    // a WaitGroup nobody will decrement.
+    let is par.Batch as empty;
+    if (par.batch_init(&empty, 4, cast(*trust.TrustStore, 0),
+                       cast(*pool.Pool, 0)) != 0) { return 3; }
+    if (par.batch_run(&empty, 0) != 0) { return 4; }
+    par.batch_free(&empty);
+
+    // ...and one past its capacity is refused rather than written past.
+    let is par.Batch as small;
+    if (par.batch_init(&small, 2, cast(*trust.TrustStore, 0),
+                       cast(*pool.Pool, 0)) != 0) { return 5; }
+    if (par.batch_add(&small, "http://127.0.0.1:1/a") != 0) { return 6; }
+    if (par.batch_add(&small, "http://127.0.0.1:1/b") != 1) { return 7; }
+    if (par.batch_add(&small, "http://127.0.0.1:1/c") != par.PAR_ERR_SPACE) { return 8; }
+    if (par.batch_count(&small) != 2) { return 9; }
+    par.batch_free(&small);
+
+    // ===== against a real server ====================================
+    let is [1024]u8 as self;
+    if (io.get_self_path(cast(*u8, &self), 1024) <= 0) { return 10; }
+    let is [3]i64 as sav;
+    sav[0] = cast(i64, cast(*u8, &self));
+    sav[1] = cast(i64, "--server");
+    sav[2] = 0;
+    let is i64 as spid = proc.spawnp(cast(*u8, &self), cast(*u8, &sav));
+    if (spid <= 0) { return 11; }
+
+    let is i64 as tries with mut = 0;
+    while (tries < 200) {
+        let is *conn.Conn as probe = tp.dial("127.0.0.1", PORT);
+        if (cast(i64, probe) != 0) { conn.conn_free(probe); break; }
+        time.sleep_ms(10);
+        tries = tries + 1;
+    }
+    if (tries >= 200) { return 12; }
+
+    let is pool.Pool as p;
+    if (pool.pool_init(&p, 32) != 0) { return 13; }
+
+    let is par.Batch as b;
+    if (par.batch_init(&b, 32, cast(*trust.TrustStore, 0), cast(*pool.Pool, 0)) != 0) { return 14; }
+    // Four at a time, so the wave logic runs three times rather than once.
+    b.workers = 4;
+
+    let is [64]u8 as u;
+    let is i64 as i with mut = 0;
+    while (i < NJOBS) {
+        job_url(i, cast(*u8, &u));
+        if (par.batch_add(&b, cast(*u8, &u)) != i) { return 15; }
+        i = i + 1;
+    }
+
+    let is i64 as bad = run_checks(&b);
+
+    par.batch_free(&b);
+    pool.pool_free(&p);
+    proc.wait_pid(spid);
+
+    if (bad != 0) {
+        io.printf("check %ld failed\n", bad);
+        return cast(i32, bad);
+    }
+    io.printf("parallel ok: %ld jobs, 4 at a time, each with its own body\n",
+              NJOBS);
+    return 0;
+}

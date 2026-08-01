@@ -1,0 +1,275 @@
+// =======================================================
+// caustic-net/client/parallel.cst
+// Fetch many things at once.
+//
+// A page is a document and then thirty subresources — images, stylesheets,
+// scripts. Fetching them one after another is not slow because of bandwidth;
+// it is slow because each one costs a round trip before the first byte, and
+// thirty round trips in series is a second of nothing happening.
+//
+// Thread per connection, over std/thread. Not a reactor: the plan said so and
+// the measurement agreed. The expensive thing in this stack is bigint — a
+// chain verification is 1.7 ms of RSA or 31 ms of ECDSA, all of it CPU — and
+// in a single-threaded reactor one handshake blocks every other connection
+// for that whole time. Threads spend it on different cores.
+//
+// spawn takes a function pointer and ONE integer, which is the same
+// no-closure shape as the Conn vtable, so each worker gets a pointer to its
+// own Job and reads everything from there.
+//
+// WHAT THE THREADS SHARE, and why each is safe:
+//
+//   * the connection pool — client/connpool.cst holds a mutex over its table.
+//   * the cookie jar — NOT locked, and so it is not shared: each job carries
+//     its own Fetch, and a jar is only attached when the caller passes one,
+//     in which case the caller has said it is theirs to synchronise. Written
+//     down rather than assumed.
+//   * the AEAD tables in caustic-crypto and the brotli/zstd tables in
+//     caustic-compact are module-level and mutable. tls/record.cst already
+//     holds a mutex over every AEAD call for exactly this moment; that lock
+//     was written for a threaded client and this is the client.
+//   * the Conn heap, which transport.init() forces into existence before any
+//     thread can exist — see core/conn.cst.
+//
+// ⚠ std/thread's spawn is MISCOMPILED by the optimizing backend. Eleven lines
+// reproduce it (a `naked` function whose inline asm jumps to its own local
+// label assembles with the wrong displacement at -O1 and the right one at
+// -O0), and until that is fixed nothing here can run under -O1. The module is
+// correct; its dependency is not. tests/test_parallel says so out loud rather
+// than being quietly skipped.
+// =======================================================
+
+use "std/mem.cst" as mem;
+use "std/sync.cst" as sync;
+use "std/thread.cst" as thread;
+use "../core/conn.cst" as conn;
+use "../core/bytes.cst" as bytes;
+use "../tls/trust.cst" as trust;
+use "../proto/cookie.cst" as cookie;
+use "./fetch.cst" as fetch;
+use "./connpool.cst" as pool;
+
+let is i64 as PAR_ERR_ALLOC with imut = 0 - 1830;
+let is i64 as PAR_ERR_SPACE with imut = 0 - 1831;
+let is i64 as PAR_ERR_SPAWN with imut = 0 - 1832;
+
+// Literal dimensions, per the note in proto/dns.cst.
+let is i64 as MAX_URL  with imut = 2048;
+// More threads than this against one page is antisocial rather than fast:
+// the pool caps at six per host anyway, and the rest would queue.
+let is i64 as MAX_WORKERS with imut = 16;
+
+// One request, and the room for its answer. The Fetch inside is the worker's
+// alone — nothing about fetch is thread-safe, and making it so would mean a
+// lock around a whole HTTP exchange, which is the opposite of the point.
+struct Job {
+    url as [2048]u8;
+    f   as fetch.Fetch;
+
+    rc     as i64;         // 0 once done, or the sentinel it failed with
+    status as i64;
+    done   as i64;
+
+    t   as *trust.TrustStore;
+    pl  as *pool.Pool;
+    wg  as *sync.WaitGroup;
+    deadline as i64;
+    started as i64;
+}
+
+struct Batch {
+    j   as *Job;
+    th  as *thread.Thread;
+    cap as i64;
+    n   as i64;
+    t   as *trust.TrustStore;
+    pl  as *pool.Pool;
+    wg  as sync.WaitGroup;
+    workers as i64;
+}
+
+fn _map_ok(p as *u8) as i64 {
+    let is i64 as v = cast(i64, p);
+    if (v == 0) { return 0; }
+    if (v == 0 - 1) { return 0; }
+    return 1;
+}
+
+fn _copy(dst as *u8, max as i64, src as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (i < max - 1 && src[i] != 0) { dst[i] = src[i]; i = i + 1; }
+    dst[i] = cast(u8, 0);
+    return i;
+}
+
+fn batch_at(b as *Batch, i as i64) as *Job {
+    if (i < 0) { return cast(*Job, 0); }
+    if (i >= b.n) { return cast(*Job, 0); }
+    return cast(*Job, cast(i64, b.j) + i * sizeof(Job));
+}
+
+// `t` and `pl` may be null; both are shared across every job in the batch,
+// which is the point of a pool.
+fn batch_init(b as *Batch, cap as i64, t as *trust.TrustStore,
+              pl as *pool.Pool) as i64 {
+    b.j = cast(*Job, mem.core.mmap_anon(cap * sizeof(Job)));
+    if (_map_ok(cast(*u8, b.j)) == 0) { b.j = cast(*Job, 0); return PAR_ERR_ALLOC; }
+    b.th = cast(*thread.Thread, mem.core.mmap_anon(cap * sizeof(thread.Thread)));
+    if (_map_ok(cast(*u8, b.th)) == 0) {
+        mem.core.munmap(cast(*u8, b.j), cap * sizeof(Job));
+        b.j = cast(*Job, 0);
+        b.th = cast(*thread.Thread, 0);
+        return PAR_ERR_ALLOC;
+    }
+    // The WaitGroup, explicitly, for the same reason the pool zeroes its
+    // mutex: a Batch is the caller's struct, so the counter starts as
+    // whatever was on the stack. A garbage count makes wg_wait return before
+    // the work is done, and the caller reads results that are not there yet.
+    b.wg.count = cast(u32, 0);
+    b.cap = cap;
+    b.n = 0;
+    b.t = t;
+    b.pl = pl;
+    b.workers = MAX_WORKERS;
+    return 0;
+}
+
+fn batch_free(b as *Batch) as void {
+    if (cast(i64, b.j) != 0) {
+        let is i64 as i with mut = 0;
+        while (i < b.n) {
+            fetch.fetch_free(&batch_at(b, i).f);
+            i = i + 1;
+        }
+        mem.core.munmap(cast(*u8, b.j), b.cap * sizeof(Job));
+    }
+    if (cast(i64, b.th) != 0) {
+        mem.core.munmap(cast(*u8, b.th), b.cap * sizeof(thread.Thread));
+    }
+    b.j = cast(*Job, 0);
+    b.th = cast(*thread.Thread, 0);
+    b.cap = 0;
+    b.n = 0;
+}
+
+fn batch_add(b as *Batch, url as *u8) as i64 {
+    if (cast(i64, b.j) == 0) { return PAR_ERR_ALLOC; }
+    if (b.n >= b.cap) { return PAR_ERR_SPACE; }
+    let is *Job as j = cast(*Job, cast(i64, b.j) + b.n * sizeof(Job));
+    _copy(cast(*u8, &j.url), MAX_URL, url);
+    j.rc = 0;
+    j.status = 0;
+    j.done = 0;
+    j.started = 0;
+    j.t = b.t;
+    j.pl = b.pl;
+    j.wg = &b.wg;
+    b.n = b.n + 1;
+    return b.n - 1;
+}
+
+// The worker. `arg` is a *Job, which is the only thing spawn can carry.
+fn _worker(arg as i64) as i64 {
+    let is *Job as j = cast(*Job, arg);
+
+    // The Fetch is built HERE, inside the thread that will use it, so no two
+    // threads ever touch one.
+    if (fetch.fetch_init(&j.f, j.t) != 0) {
+        j.rc = PAR_ERR_ALLOC;
+        j.done = 1;
+        sync.wg_done(j.wg);
+        return 0;
+    }
+    if (cast(i64, j.pl) != 0) { fetch.fetch_set_pool(&j.f, j.pl); }
+
+    j.rc = fetch.fetch_get(&j.f, cast(*u8, &j.url), j.deadline);
+    j.status = fetch.fetch_status(&j.f);
+    j.done = 1;
+    // Last, and after everything else is written: the waiter may look at this
+    // Job the instant the count reaches zero.
+    sync.wg_done(j.wg);
+    return 0;
+}
+
+// Run every job, at most `b.workers` at a time, and wait.
+//
+// Returns the number that succeeded. A single failure is not the batch's
+// failure — a page with one broken image is still a page — so each job keeps
+// its own rc and the caller decides.
+fn batch_run(b as *Batch, deadline as i64) as i64 {
+    if (b.n == 0) { return 0; }
+
+    let is i64 as next with mut = 0;
+    while (next < b.n) {
+        let is i64 as wave with mut = b.n - next;
+        if (wave > b.workers) { wave = b.workers; }
+
+        // The WaitGroup counts THIS wave. Adding before any thread starts is
+        // what keeps wg_wait from returning on a count that has not been
+        // raised yet.
+        sync.wg_add(&b.wg, wave);
+
+        let is i64 as k with mut = 0;
+        let is i64 as live with mut = 0;
+        while (k < wave) {
+            let is *Job as j = cast(*Job, cast(i64, b.j) + (next + k) * sizeof(Job));
+            j.deadline = deadline;
+            let is *thread.Thread as th =
+                cast(*thread.Thread, cast(i64, b.th) + (next + k) * sizeof(thread.Thread));
+            if (thread.spawn(th, fn_ptr(_worker), cast(i64, j)) == 0) {
+                j.started = 1;
+                live = live + 1;
+            } else {
+                // A thread that never started still has to release its count,
+                // or the wait below never ends.
+                j.rc = PAR_ERR_SPAWN;
+                j.done = 1;
+                j.started = 0;
+                sync.wg_done(&b.wg);
+            }
+            k = k + 1;
+        }
+
+        sync.wg_wait(&b.wg);
+
+        // Join every thread that started. wg_wait says the work is finished;
+        // join is what releases the stack, and skipping it leaks 2 MiB a
+        // thread.
+        k = 0;
+        while (k < wave) {
+            let is *Job as j = cast(*Job, cast(i64, b.j) + (next + k) * sizeof(Job));
+            if (j.started == 1) {
+                let is *thread.Thread as th =
+                    cast(*thread.Thread, cast(i64, b.th) + (next + k) * sizeof(thread.Thread));
+                thread.join(th);
+            }
+            k = k + 1;
+        }
+        next = next + wave;
+    }
+
+    let is i64 as ok with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < b.n) {
+        if (batch_at(b, i).rc == 0) { ok = ok + 1; }
+        i = i + 1;
+    }
+    return ok;
+}
+
+fn batch_count(b as *Batch) as i64 { return b.n; }
+fn job_rc(b as *Batch, i as i64) as i64 { return batch_at(b, i).rc; }
+fn job_status(b as *Batch, i as i64) as i64 { return batch_at(b, i).status; }
+fn job_done(b as *Batch, i as i64) as i64 { return batch_at(b, i).done; }
+fn job_url(b as *Batch, i as i64) as *u8 { return cast(*u8, &batch_at(b, i).url); }
+fn job_body(b as *Batch, i as i64) as *u8 { return fetch.fetch_body(&batch_at(b, i).f); }
+fn job_body_len(b as *Batch, i as i64) as i64 {
+    return fetch.fetch_body_len(&batch_at(b, i).f);
+}
+
+fn par_err_name(e as i64) as *u8 {
+    if (e == PAR_ERR_ALLOC) { return "PAR_ERR_ALLOC"; }
+    if (e == PAR_ERR_SPACE) { return "PAR_ERR_SPACE"; }
+    if (e == PAR_ERR_SPAWN) { return "PAR_ERR_SPAWN"; }
+    return "PAR_ERR_UNKNOWN";
+}

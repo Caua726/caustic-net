@@ -111,6 +111,11 @@ fn _at(p as *Pool, i as i64) as *Entry {
 fn pool_init(p as *Pool, cap as i64) as i64 {
     p.e = cast(*Entry, mem.core.mmap_anon(cap * sizeof(Entry)));
     if (_map_ok(cast(*u8, p.e)) == 0) { p.e = cast(*Entry, 0); return POOL_ERR_ALLOC; }
+    // The mutex, explicitly. A Pool is a struct the CALLER declares, so its
+    // lock word arrives holding whatever was on the stack — and a lock that
+    // starts non-zero is one that is already held by nobody. Nothing else
+    // zeroes it, and the failure is a hang rather than an error.
+    p.lk.state = cast(u32, 0);
     p.cap = cap;
     p.n = 0;
     p.max_per_host = MAX_PER_HOST;

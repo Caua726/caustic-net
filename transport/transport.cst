@@ -24,6 +24,10 @@ fn init() as i32 {
     // init().
     conn.conn_heap_warm();
     bytes.bytes_heap_warm();
+    // The shared resolver, for the same reason: built here, while the program
+    // is still single-threaded, rather than by whichever thread happens to
+    // dial first.
+    resolver();
     return net.init();
 }
 
@@ -41,6 +45,13 @@ fn dial(ip_str as *u8, port as i64) as *conn.Conn {
 // what `dial_host` uses when the caller has not brought their own.
 let is res.Resolver as _res with mut;
 
+// Built once, and by preference before any thread exists — transport.init()
+// does it. The check-then-init here is not atomic, and two threads calling
+// dial_host for the first time at the same moment would both walk
+// resolv.conf into the same struct while the other read it. That is the same
+// shape as the allocator race documented in core/conn.cst, and it presented
+// the same way: a handful of connections out of a dozen failing for no
+// reason, reproducibly, only under threads.
 fn resolver() as *res.Resolver {
     if (_res.ready == 0) { res.resolver_init(&_res); }
     return &_res;
