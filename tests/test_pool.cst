@@ -1,0 +1,296 @@
+// =======================================================
+// caustic-net/tests/test_pool.cst
+// Reuse the socket, and survive the server that took it away.
+//
+// Two halves. The first is the pool on its own — origin keying, the per-host
+// limit, the idle window — with fake connections, because none of those rules
+// need a network to be wrong.
+//
+// The second is the case the whole retry path exists for: a server that
+// answers, keeps the connection, and then closes it while it is idle. That
+// happens constantly in reality and there is no notification; the client
+// finds out by writing into a socket that is already gone. A client without
+// the retry fails intermittently and blames the network.
+//
+// The server half runs as a second PROCESS, for the reason tests/test_fetch
+// gives: std/thread's spawn segfaults under the optimizing backend.
+//
+// Exit 0 = all pass. Non-zero = the numbered check that failed.
+// =======================================================
+
+use "std/io.cst" as io;
+use "std/process.cst" as proc;
+use "std/env.cst" as env;
+use "std/time.cst" as time;
+use "../core/conn.cst" as conn;
+use "../core/bufread.cst" as bufread;
+use "../transport/transport.cst" as tp;
+use "../tls/trust.cst" as trust;
+use "../client/connpool.cst" as pool;
+use "../client/fetch.cst" as fetch;
+
+let is i64 as PORT with imut = 18097;
+let is *u8 as BODY with imut = "pooled";
+let is i64 as BODY_N with imut = 6;
+
+let is tp.Listener as _l with mut;
+
+fn streq(a as *u8, b as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (a[i] != 0 && b[i] != 0) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    if (a[i] != b[i]) { return 0; }
+    return 1;
+}
+
+// --- fake connections, for the rules that need no network ---------------
+//
+// A Conn whose state is a number this file sets. The pool only ever asks a
+// connection whether it is open, so that is all one needs to be.
+//
+// The ctx is a REAL eight-byte allocation from cn_alloc holding an index,
+// not an index stuffed into the pointer field. conn_free frees whatever ctx
+// holds, so a fake index would be handed to the allocator as an address.
+let is [64]i64 as _fake_state with mut;
+let is i64 as _fake_n with mut = 0;
+let is i64 as _fake_closed with mut = 0;
+
+fn _idx(ctx as *u8) as i64 { return *cast(*i64, ctx); }
+
+fn fake_read(ctx as *u8, buf as *u8, len as i64) as i64 { return 0; }
+fn fake_write(ctx as *u8, buf as *u8, len as i64) as i64 { return len; }
+fn fake_close(ctx as *u8) as i64 {
+    _fake_closed = _fake_closed + 1;
+    _fake_state[_idx(ctx)] = conn.CONN_CLOSED;
+    return 0;
+}
+fn fake_state(ctx as *u8) as i64 { return _fake_state[_idx(ctx)]; }
+
+fn fake_conn() as *conn.Conn {
+    let is *conn.Conn as c = conn.conn_new();
+    if (cast(i64, c) == 0) { return c; }
+    let is *u8 as ctx = conn.cn_alloc(8);
+    if (cast(i64, ctx) == 0) { return cast(*conn.Conn, 0); }
+    *cast(*i64, ctx) = _fake_n;
+    _fake_state[_fake_n] = conn.CONN_OPEN;
+    _fake_n = _fake_n + 1;
+    c.ctx = ctx;
+    c.read = fn_ptr(fake_read);
+    c.write = fn_ptr(fake_write);
+    c.close = fn_ptr(fake_close);
+    c.state = fn_ptr(fake_state);
+    return c;
+}
+
+fn fake_index(c as *conn.Conn) as i64 { return _idx(c.ctx); }
+
+// --- the server half ----------------------------------------------------
+//
+// Answers with keep-alive, then CLOSES the connection after the first
+// exchange on it. From the client's side that is a socket that was fine and
+// then was not, which is exactly what a real server does at its idle timeout
+// — only sooner, so the test does not have to wait.
+fn serve_one(c as *conn.Conn) as void {
+    let is [4096]u8 as sbuf;
+    let is bufread.BufReader as br;
+    bufread.br_init(&br, c, cast(*u8, &sbuf), 4096);
+    let is [1024]u8 as line;
+
+    let is i64 as served with mut = 0;
+    while (served < 1) {
+        let is i64 as n = bufread.br_read_line(&br, cast(*u8, &line), 1024);
+        if (n <= 0) { break; }
+        while (1 == 1) {
+            let is i64 as k = bufread.br_read_line(&br, cast(*u8, &line), 1024);
+            if (k <= 0) { break; }
+        }
+        conn.conn_write_all(c, "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\npooled", 44);
+        served = served + 1;
+    }
+    conn.conn_close(c);
+    conn.conn_free(c);
+}
+
+fn server_main() as i32 {
+    tp.init();
+    let is tp.ListenResult as lr with mut = tp.listen_loopback(PORT);
+    if (lr.ok < 0) { return 1; }
+    _l = lr.l;
+    let is i64 as idle with mut = 0;
+    while (idle < 100) {
+        if (tp.listener_wait(&_l, 200) <= 0) { idle = idle + 1; continue; }
+        idle = 0;
+        let is *conn.Conn as c = tp.accept_conn(&_l);
+        if (cast(i64, c) == 0) { continue; }
+        serve_one(c);
+    }
+    tp.listener_close(&_l);
+    return 0;
+}
+
+fn run_checks(f as *fetch.Fetch, p as *pool.Pool) as i64 {
+    // The first request has nothing to reuse.
+    let is i64 as rc with mut = fetch.fetch_get(f, "http://127.0.0.1:18097/",
+                                                conn.deadline_in(10000));
+    if (rc != 0) {
+        io.printf("first: %s\n", fetch.fetch_err_name(rc));
+        return 40;
+    }
+    if (fetch.fetch_status(f) != 200) { return 41; }
+    if (fetch.fetch_body_len(f) != BODY_N) { return 42; }
+    if (pool.pool_hits(p) != 0) { return 43; }
+    if (pool.pool_misses(p) != 1) { return 44; }
+    // The response was keep-alive with a Content-Length, so it went back.
+    if (pool.pool_idle(p) != 1) {
+        io.printf("nothing was pooled after the first request\n");
+        return 45;
+    }
+
+    // The server has since closed it. The second request takes it from the
+    // pool, discovers it is dead, and has to recover rather than fail.
+    time.sleep_ms(120);
+    rc = fetch.fetch_get(f, "http://127.0.0.1:18097/", conn.deadline_in(10000));
+    if (rc != 0) {
+        io.printf("second: %s (retries %ld)\n", fetch.fetch_err_name(rc),
+                  fetch.fetch_retries(f));
+        return 46;
+    }
+    if (fetch.fetch_status(f) != 200) { return 47; }
+    if (fetch.fetch_body_len(f) != BODY_N) { return 48; }
+    // It DID come out of the pool — otherwise the retry was never exercised.
+    if (pool.pool_hits(p) < 1) {
+        io.printf("the second request never reused anything\n");
+        return 49;
+    }
+
+    // A third, to show it keeps working rather than degrading.
+    rc = fetch.fetch_get(f, "http://127.0.0.1:18097/", conn.deadline_in(10000));
+    if (rc != 0) { return 50; }
+    if (fetch.fetch_status(f) != 200) { return 51; }
+    return 0;
+}
+
+fn main(argc as i64, argv as *u8) as i32 {
+    env.init(argc, argv);
+    if (argc > 1) {
+        if (streq(env.argv(1), "--server") == 1) { return server_main(); }
+    }
+    tp.init();
+
+    // ===== the literal buffer dimensions ============================
+    if (pool.MAX_HOST != 256) { return 1; }
+    if (pool.MAX_PER_HOST != 6) { return 2; }
+
+    // ===== origin keying =============================================
+    let is pool.Pool as p;
+    if (pool.pool_init(&p, 16) != 0) { return 3; }
+    if (pool.pool_idle(&p) != 0) { return 4; }
+
+    // Nothing in it yet.
+    if (cast(i64, pool.pool_get(&p, "a.example", 80, 0)) != 0) { return 5; }
+
+    if (pool.pool_put(&p, fake_conn(), "a.example", 80, 0) != 1) { return 6; }
+    if (pool.pool_idle(&p) != 1) { return 7; }
+
+    // All three parts of the origin have to match. A connection to :80 is not
+    // a connection to :443, and a plaintext one is not a TLS one even on the
+    // same port — that second case is the one that would hand a cleartext
+    // socket to an https request.
+    if (cast(i64, pool.pool_get(&p, "b.example", 80, 0)) != 0) { return 8; }
+    if (cast(i64, pool.pool_get(&p, "a.example", 443, 0)) != 0) { return 9; }
+    if (cast(i64, pool.pool_get(&p, "a.example", 80, 1)) != 0) { return 10; }
+    // Host matching is case-insensitive, as DNS is.
+    let is *conn.Conn as got = pool.pool_get(&p, "A.Example", 80, 0);
+    if (cast(i64, got) == 0) { return 11; }
+    // ...and taking it OUT means the pool no longer holds it.
+    if (pool.pool_idle(&p) != 0) { return 12; }
+    if (cast(i64, pool.pool_get(&p, "a.example", 80, 0)) != 0) { return 13; }
+    conn.conn_free(got);
+
+    // ===== the per-host limit ========================================
+    let is i64 as i with mut = 0;
+    while (i < pool.MAX_PER_HOST) {
+        if (pool.pool_put(&p, fake_conn(), "c.example", 80, 0) != 1) { return 14; }
+        i = i + 1;
+    }
+    if (pool.pool_idle(&p) != pool.MAX_PER_HOST) { return 15; }
+    // One more for the same host is closed rather than kept — and closed, not
+    // leaked, which is what the close counter is for.
+    let is i64 as closed_before with mut = _fake_closed;
+    if (pool.pool_put(&p, fake_conn(), "c.example", 80, 0) != 0) { return 16; }
+    if (_fake_closed != closed_before + 1) { return 17; }
+    if (pool.pool_idle(&p) != pool.MAX_PER_HOST) { return 18; }
+    // A DIFFERENT host still fits: the limit is per origin, not global.
+    if (pool.pool_put(&p, fake_conn(), "d.example", 80, 0) != 1) { return 19; }
+    if (pool.pool_idle(&p) != pool.MAX_PER_HOST + 1) { return 20; }
+
+    // ===== a connection that is not open =============================
+    // Handing back something already closed keeps nothing.
+    let is *conn.Conn as dead = fake_conn();
+    _fake_state[fake_index(dead)] = conn.CONN_CLOSED;
+    if (pool.pool_put(&p, dead, "e.example", 80, 0) != 0) { return 21; }
+    // ...and one that dies WHILE idle is never handed out.
+    let is *conn.Conn as later = fake_conn();
+    if (pool.pool_put(&p, later, "f.example", 80, 0) != 1) { return 22; }
+    _fake_state[fake_index(later)] = conn.CONN_EOF;
+    if (cast(i64, pool.pool_get(&p, "f.example", 80, 0)) != 0) { return 23; }
+
+    // ===== the idle window ===========================================
+    if (pool.pool_put(&p, fake_conn(), "g.example", 80, 0) != 1) { return 24; }
+    let is i64 as held = pool.pool_idle(&p);
+    if (held <= 0) { return 25; }
+    // Nothing is old yet.
+    if (pool.pool_reap(&p, time.now_ms()) != 0) { return 26; }
+    // Far enough into the future, everything is.
+    if (pool.pool_reap(&p, time.now_ms() + pool.IDLE_MS + 1) != held) { return 27; }
+    if (pool.pool_idle(&p) != 0) { return 28; }
+
+    // Freeing a pool closes what it still holds rather than leaking it.
+    if (pool.pool_put(&p, fake_conn(), "h.example", 80, 0) != 1) { return 29; }
+    closed_before = _fake_closed;
+    pool.pool_free(&p);
+    if (_fake_closed != closed_before + 1) { return 30; }
+    if (pool.pool_idle(&p) != 0) { return 31; }
+
+    // ===== against a server that closes the connection ===============
+    let is [1024]u8 as self;
+    if (io.get_self_path(cast(*u8, &self), 1024) <= 0) { return 32; }
+    let is [3]i64 as sav;
+    sav[0] = cast(i64, cast(*u8, &self));
+    sav[1] = cast(i64, "--server");
+    sav[2] = 0;
+    let is i64 as spid = proc.spawnp(cast(*u8, &self), cast(*u8, &sav));
+    if (spid <= 0) { return 33; }
+
+    let is i64 as tries with mut = 0;
+    while (tries < 200) {
+        let is *conn.Conn as probe = tp.dial("127.0.0.1", PORT);
+        if (cast(i64, probe) != 0) { conn.conn_free(probe); break; }
+        time.sleep_ms(10);
+        tries = tries + 1;
+    }
+    if (tries >= 200) { return 34; }
+
+    let is pool.Pool as live;
+    if (pool.pool_init(&live, 16) != 0) { return 35; }
+    let is fetch.Fetch as f;
+    if (fetch.fetch_init(&f, cast(*trust.TrustStore, 0)) != 0) { return 36; }
+    fetch.fetch_set_pool(&f, &live);
+
+    let is i64 as bad = run_checks(&f, &live);
+
+    let is i64 as retries = fetch.fetch_retries(&f);
+    let is i64 as hits = pool.pool_hits(&live);
+    fetch.fetch_free(&f);
+    pool.pool_free(&live);
+    proc.wait_pid(spid);
+
+    if (bad != 0) {
+        io.printf("check %ld failed\n", bad);
+        return cast(i32, bad);
+    }
+    io.printf("pool ok: %ld reuse(s), %ld dead socket(s) replaced\n", hits, retries);
+    return 0;
+}

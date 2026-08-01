@@ -50,6 +50,7 @@ use "../tls/trust.cst" as trust;
 use "../tls/client.cst" as tlsc;
 use "./decode.cst" as decode;
 use "../proto/cookie.cst" as cookie;
+use "./connpool.cst" as pool;
 
 // --- Errors (the -1800 block) ------------------------------------------
 let is i64 as FETCH_ERR_SCHEME    with imut = 0 - 1800;   // not http or https
@@ -92,6 +93,11 @@ struct Fetch {
     // so the "drop Cookie when the origin changes" part of redirect policy is
     // not a special case here — a jar simply does not match the new host.
     jar as *cookie.Jar;
+    // Optional. With one, a connection is asked for before a socket is
+    // opened and handed back when the response allows it.
+    pl  as *pool.Pool;
+    reused as i64;            // 1 when the current exchange got a pooled socket
+    retries as i64;           // how many times a dead pooled socket was replaced
 
     final_url as [2048]u8;
     hdrbuf    as *u8;         // MAX_HEAD, mmap'd
@@ -148,6 +154,9 @@ fn fetch_init(f as *Fetch, t as *trust.TrustStore) as i64 {
     // sets this to 0.
     f.accept_encoding = 1;
     f.jar = cast(*cookie.Jar, 0);
+    f.pl = cast(*pool.Pool, 0);
+    f.reused = 0;
+    f.retries = 0;
     f.nseen = 0;
     f.c = cast(*conn.Conn, 0);
     f.final_url[0] = cast(u8, 0);
@@ -224,6 +233,15 @@ fn _connect(f as *Fetch, u as *url.Url, deadline as i64) as *conn.Conn {
         if (https == 1) { port = 443; } else { port = 80; }
     }
 
+    f.reused = 0;
+    if (cast(i64, f.pl) != 0) {
+        let is *conn.Conn as kept = pool.pool_get(f.pl, cast(*u8, &host), port, https);
+        if (cast(i64, kept) != 0) {
+            f.reused = 1;
+            return kept;
+        }
+    }
+
     let is *conn.Conn as raw = tp.dial_host(cast(*u8, &host), port);
     if (cast(i64, raw) == 0) {
         // A socket that never opened is a CONNECT failure, not a TLS one.
@@ -260,6 +278,46 @@ fn _connect(f as *Fetch, u as *url.Url, deadline as i64) as *conn.Conn {
 fn fetch_conn_err(f as *Fetch) as i64 { return f.conn_err; }
 fn fetch_tls_err(f as *Fetch) as i64 { return f.tls_err; }
 
+// Is this the kind of failure a closed idle connection produces?
+//
+// A broken pipe, a reset, or a response head that ended before it started —
+// all of them mean the request did not land. A malformed response, a body
+// past the limit or a TLS refusal are answers, and repeating the request
+// would only get the same one.
+fn _retryable(rc as i64) as i64 {
+    if (rc == 0 - errno.EPIPE) { return 1; }
+    if (rc == 0 - errno.ECONNRESET) { return 1; }
+    if (rc == bufread.BR_EOF) { return 1; }
+    if (rc == http.HTTP_ERR_STATUS) { return 1; }   // nothing came back at all
+    return 0;
+}
+
+// Hand the current connection back to the pool if the response allows it.
+//
+// proto/http1.cst's conn_reusable is what decides: a response that said
+// Connection: close, or whose body was framed by the connection ending, or
+// that was HTTP/1.0, leaves nothing to reuse. Getting this wrong is not a
+// leak — it is the next request on that socket reading the tail of this one.
+fn _recycle(f as *Fetch, u as *url.Url, bd as *http.BodyReader) as void {
+    if (cast(i64, f.pl) == 0) { return; }
+    if (cast(i64, f.c) == 0) { return; }
+    if (http.conn_reusable(&f.r, bd) != 1) { return; }
+
+    let is [256]u8 as host;
+    if (url.url_host(u, cast(*u8, &host), MAX_HOST) < 0) { return; }
+    let is i64 as https = url.url_scheme_is(u, "https");
+    let is i64 as port with mut = u.port;
+    if (port <= 0) {
+        if (https == 1) { port = 443; } else { port = 80; }
+    }
+    if (pool.pool_put(f.pl, f.c, cast(*u8, &host), port, https) == 1) {
+        // The pool owns it now; f.c must not be freed underneath it.
+        f.c = cast(*conn.Conn, 0);
+    } else {
+        f.c = cast(*conn.Conn, 0);      // pool_put closed it
+    }
+}
+
 // One request/response exchange. `redir` is filled with the Location value
 // when the answer is a redirect, and left empty otherwise.
 fn _once(f as *Fetch, u as *url.Url, method as *u8, deadline as i64,
@@ -278,7 +336,9 @@ fn _once(f as *Fetch, u as *url.Url, method as *u8, deadline as i64,
     let is bytes.Bytes as req with mut = bytes.bytes_new(1024);
     if (cast(i64, req.ptr) == 0) { return FETCH_ERR_ALLOC; }
     let is i64 as rc with mut = 0;
-    if (http.req_for_url(&req, method, u, 0) < 0) { rc = FETCH_ERR_SPACE; }
+    let is i64 as keepalive with mut = 0;
+    if (cast(i64, f.pl) != 0) { keepalive = 1; }
+    if (http.req_for_url(&req, method, u, keepalive) < 0) { rc = FETCH_ERR_SPACE; }
     if (rc == 0) {
         if (http.req_header(&req, "User-Agent", "caustic-net/0.1") < 0) { rc = FETCH_ERR_SPACE; }
     }
@@ -332,10 +392,11 @@ fn _once(f as *Fetch, u as *url.Url, method as *u8, deadline as i64,
 
     if (http.resp_is_redirect(&f.r) == 1) {
         if (http.resp_location(&f.r, redir, redirmax) > 0) {
-            // Drain rather than close: the socket stays reusable, which is
-            // what client/pool.cst will want, and a redirect body is a few
-            // hundred bytes of "moved here" that nobody reads.
+            // Drain rather than close: a redirect body is a few hundred bytes
+            // of "moved here" that nobody reads, and draining it is what
+            // leaves the socket in a state the pool can take back.
             http.body_drain(&bd);
+            _recycle(f, u, &bd);
             return 1;
         }
     }
@@ -348,6 +409,8 @@ fn _once(f as *Fetch, u as *url.Url, method as *u8, deadline as i64,
         if (got == http.HTTP_ERR_SPACE) { return FETCH_ERR_LIMIT; }
         return got;
     }
+
+    _recycle(f, u, &bd);
 
     // Content-Encoding, undone in place. A server may compress whether or not
     // it was asked — Amazon does — so this runs regardless of what the
@@ -386,6 +449,7 @@ fn fetch_method(f as *Fetch, method as *u8, target as *u8,
     f.status = 0;
     f.tls_err = 0;
     f.conn_err = 0;
+    f.retries = 0;
 
     let is [2048]u8 as cur;
     if (_copy_str(cast(*u8, &cur), MAX_URL, target) <= 0) { return FETCH_ERR_URL; }
@@ -404,8 +468,31 @@ fn fetch_method(f as *Fetch, method as *u8, target as *u8,
         if (_seen_before(f, cast(*u8, &cur)) == 1) { return FETCH_ERR_REDIRECTS; }
         _copy_str(cast(*u8, &f.final_url), MAX_URL, cast(*u8, &cur));
 
-        let is i64 as rc = _once(f, &f.u, cast(*u8, &m), deadline,
-                                 cast(*u8, &loc), MAX_URL);
+        let is i64 as rc with mut = _once(f, &f.u, cast(*u8, &m), deadline,
+                                          cast(*u8, &loc), MAX_URL);
+
+        // RETRY ONCE, and only when the socket came out of the pool.
+        //
+        // A server may close an idle connection whenever it likes and does
+        // not have to say so, so a recycled socket dying on the first write
+        // is ordinary rather than an error. Without this, reusing connections
+        // makes a client fail intermittently for no reason a user can see.
+        //
+        // Only on a REUSED connection, and only for a failure that means the
+        // request never landed. A fresh connection failing is a real failure,
+        // and retrying a request that was actually delivered would send it
+        // twice — which for anything but GET is a second order placed.
+        if (rc < 0 && f.reused == 1) {
+            if (_retryable(rc) == 1) {
+                if (cast(i64, f.c) != 0) {
+                    conn.conn_free(f.c);
+                    f.c = cast(*conn.Conn, 0);
+                }
+                f.retries = f.retries + 1;
+                rc = _once(f, &f.u, cast(*u8, &m), deadline,
+                           cast(*u8, &loc), MAX_URL);
+            }
+        }
         if (rc < 0) { return rc; }
         if (rc == 0) { return 0; }
 
@@ -464,6 +551,16 @@ fn redirect_method(status as i64, method as *u8, out as *u8, max as i64) as void
 // Hand fetch a cookie jar, or null to stop using one. The jar is the
 // caller's: a browser keeps one per profile, not one per request.
 fn fetch_set_jar(f as *Fetch, j as *cookie.Jar) as void { f.jar = j; }
+
+// Hand fetch a connection pool, or null. Also the caller's, and shared: the
+// point of a pool is that thirty subresources from one host reuse the same
+// few sockets.
+fn fetch_set_pool(f as *Fetch, p as *pool.Pool) as void { f.pl = p; }
+
+// How many times a pooled socket turned out to be dead and was replaced.
+// Nonzero is normal; growing without bound means the idle window is too long
+// for this server.
+fn fetch_retries(f as *Fetch) as i64 { return f.retries; }
 
 fn fetch_status(f as *Fetch) as i64      { return f.status; }
 // Which Content-Encoding was undone, as a decode.ENC_* value.

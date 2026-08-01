@@ -60,6 +60,7 @@ target "test_tls"   { src "tests/test_tls.cst"     out "build/test_tls" }
 target "test_fetch" { src "tests/test_fetch.cst"   out "build/test_fetch" }
 target "test_decode" { src "tests/test_decode.cst"  out "build/test_decode" }
 target "test_cookie" { src "tests/test_cookie.cst"  out "build/test_cookie" }
+target "test_pool"  { src "tests/test_pool.cst"    out "build/test_pool" }
 target "test_conn"  { src "tests/test_conn.cst"    out "build/test_conn" }
 target "test_bytes" { src "tests/test_bytes.cst"   out "build/test_bytes" }
 target "test_bufread" { src "tests/test_bufread.cst" out "build/test_bufread" }

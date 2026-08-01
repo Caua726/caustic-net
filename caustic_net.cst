@@ -42,3 +42,4 @@ use "./tls/client.cst" as tls;
 use "./proto/cookie.cst" as cookie;
 use "./client/fetch.cst" as fetch;
 use "./client/decode.cst" as decode;
+use "./client/connpool.cst" as connpool;

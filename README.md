@@ -80,7 +80,7 @@ proto/       url · http1 · dns · cookie (RFC 6265 jar) · http2* · websocket
 tls/         transcript · keysched · record · x509 · pss · roots · trust · verify
              extensions · handshake · client
 client/      fetch (url→dns→connect→tls→http→redirect→decode→cookies) · decode
-             pool* · parallel*
+             connpool (keep-alive reuse, retry-once) · parallel*
 server/      router* · threaded* · reactor* · static* · middleware*
 ```
 `*` = on the roadmap, not yet landed.
@@ -151,6 +151,7 @@ server/      router* · threaded* · reactor* · static* · middleware*
 | client | `fetch` — url → dns → connect → TLS → HTTP → redirects → decode → cookies | ✅ green (`tests/test_fetch`, a real server in a second process) |
 | client | `decode` — gzip · deflate (both framings) · brotli · zstd, with an expansion ceiling | ✅ green (`tests/test_decode`, bodies compressed by Python, 8 MiB bomb refused) |
 | proto | `cookie` — RFC 6265 parse · jar · domain/path/Secure rules | ✅ green (`tests/test_cookie`) |
+| client | `connpool` — keep-alive reuse by origin, 6 per host, retry-once | ✅ green (`tests/test_pool`, against a server that closes the connection) |
 | core | `bufread` deadline (gap 03) | ✅ `br_set_deadline`; bounds the number of fills, pair with `set_recv_timeout` for a single read |
 | everything else | see the roadmap | ⏳ |
 
@@ -202,7 +203,6 @@ headers, and `url_resolve` resolves a relative reference per RFC 3986 §5.2.
 | | Gap | Consequence |
 |---|---|---|
 | 03 | A read deadline bounds fills, not one read | `br_set_deadline` stops a reader between fills; a single blocking read is bounded only by `set_recv_timeout`, which takes whole seconds. Both are needed and `client/fetch` sets both |
-| 04 | No connection pool | `conn_reusable()` answers correctly, nothing reuses |
 | 05 | Response-side parsing only | the server needs the request-shaped equivalent |
 | 06 | No chunked *request* encoder | POST works only with `Content-Length` |
 | 07 | `br_read_line` always copies | a zero-copy view would suit large headers; `Slice` already exists |
@@ -215,7 +215,6 @@ headers, and `url_resolve` resolves a relative reference per RFC 3986 §5.2.
 | 14 | No session resumption | `NewSessionTicket` is read and discarded. Every connection is a full handshake |
 | 15 | No client certificates | a `CertificateRequest` is skipped rather than answered |
 | 16 | A SHA-384 cipher suite needs the ClientHello to fit 1 KiB | the transcript hash is fixed by the suite, which is not known until the ServerHello, so choosing SHA-384 means rehashing both Hellos. A ClientHello past the buffer declines the suite instead |
-| 17 | No connection reuse yet | every hop of a redirect chain opens a new socket, and every https hop a new handshake |
 | 18 | The public suffix list is a heuristic | `psl_is_public_suffix` refuses a single label and a table of about forty two-part suffixes. It does not know `pvt.k12.ma.us`. A cookie scoped to an unlisted public suffix is accepted. The signature is what the real one would be, so replacing it is one file |
 | 19 | Decompression is one-shot | caustic-compact has no incremental API, so a compressed page cannot be rendered while it arrives — and the expansion ceiling is enforced after the decompressor has already produced the bytes, which bounds what the caller sees rather than the peak |
 | 20 | `SameSite` is parsed and not enforced | it is stored on the cookie; nothing consults it, because enforcement needs a notion of the initiating site that this layer does not have |

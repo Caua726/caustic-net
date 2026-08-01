@@ -1,0 +1,311 @@
+// =======================================================
+// caustic-net/client/connpool.cst
+// Keep the socket. Keep the handshake.
+//
+// A page is one document and thirty subresources from the same few hosts. A
+// client that opens a connection per request pays a TCP handshake for each,
+// and over https a TLS handshake too — which this library measures at 25 to
+// 200 ms. Thirty of those is most of a page's load time spent on nothing.
+//
+// Keyed by ORIGIN — host, port, and whether it is TLS — because that is what
+// a connection actually is. Two of the three matching is not a match: a
+// connection to example.com:443 cannot serve a request for example.com:80,
+// and a plaintext one cannot serve an https request even on the same port.
+//
+// SIX PER HOST, which is what browsers settled on. The limit is not about
+// memory; it is about not being the reason a server falls over, and about
+// head-of-line blocking on HTTP/1.1 being worse than the parallelism is
+// worth beyond that point.
+//
+// RETRY ONCE, and this is the part that is easy to leave out. A server may
+// close an idle connection at any moment, and it does not have to tell
+// anyone. A recycled socket that dies on the first write is NORMAL — it is
+// not an error to report, it is a connection to replace. Without the retry,
+// a client that reuses connections is a client that intermittently fails for
+// no reason the user can see. client/fetch.cst does the retry; what this file
+// provides is the `reused` flag that makes it safe to, because retrying a
+// request that was actually delivered would send it twice.
+//
+// The mutex is here because client/parallel.cst will have several threads
+// asking for connections at once, and a pool is exactly the shared thing they
+// contend on.
+//
+// Named connpool.cst rather than pool.cst because the compiler keys modules by
+// BASENAME, and the standard library already has a mem/pool.cst. Two files of
+// the same name resolve to whichever was seen first, with an error pointing
+// deep inside somebody else's module. The README warns about exactly this for
+// `core/`; it applies to every name.
+// =======================================================
+
+use "std/mem.cst" as mem;
+use "std/sync.cst" as sync;
+use "std/time.cst" as time;
+use "../core/conn.cst" as conn;
+
+let is i64 as POOL_ERR_ALLOC with imut = 0 - 1820;
+let is i64 as POOL_ERR_SPACE with imut = 0 - 1821;
+
+// Literal dimensions, per the note in proto/dns.cst.
+let is i64 as MAX_HOST with imut = 256;
+// What browsers use, and for the same reason.
+let is i64 as MAX_PER_HOST with imut = 6;
+// An idle connection older than this is closed rather than offered. Servers
+// commonly drop theirs at 5 to 75 seconds, and handing out one that is
+// already gone is how the retry path gets exercised for no reason.
+let is i64 as IDLE_MS with imut = 20000;
+
+struct Entry {
+    c    as *conn.Conn;
+    host as [256]u8;
+    port as i64;
+    tls  as i64;
+    idle_since as i64;      // now_ms when it was handed back
+    live as i64;            // 1 when this slot holds a connection
+}
+
+struct Pool {
+    e   as *Entry;
+    cap as i64;
+    n   as i64;             // slots in use, live or not
+    lk  as sync.Mutex;
+    max_per_host as i64;
+    idle_ms as i64;
+    // Counters, so a caller can see whether reuse is actually happening
+    // rather than assume it.
+    hits   as i64;
+    misses as i64;
+    reaped as i64;
+}
+
+fn _map_ok(p as *u8) as i64 {
+    let is i64 as v = cast(i64, p);
+    if (v == 0) { return 0; }
+    if (v == 0 - 1) { return 0; }
+    return 1;
+}
+
+fn _ieq(a as *u8, b as *u8) as i64 {
+    let is i64 as i with mut = 0;
+    while (a[i] != 0 && b[i] != 0) {
+        let is u8 as x with mut = a[i];
+        let is u8 as y with mut = b[i];
+        if (x >= 65 && x <= 90) { x = cast(u8, cast(i64, x) + 32); }
+        if (y >= 65 && y <= 90) { y = cast(u8, cast(i64, y) + 32); }
+        if (x != y) { return 0; }
+        i = i + 1;
+    }
+    if (a[i] != b[i]) { return 0; }
+    return 1;
+}
+
+fn _copy(dst as *u8, max as i64, src as *u8) as void {
+    let is i64 as i with mut = 0;
+    while (i < max - 1 && src[i] != 0) { dst[i] = src[i]; i = i + 1; }
+    dst[i] = cast(u8, 0);
+}
+
+fn _at(p as *Pool, i as i64) as *Entry {
+    return cast(*Entry, cast(i64, p.e) + i * sizeof(Entry));
+}
+
+fn pool_init(p as *Pool, cap as i64) as i64 {
+    p.e = cast(*Entry, mem.core.mmap_anon(cap * sizeof(Entry)));
+    if (_map_ok(cast(*u8, p.e)) == 0) { p.e = cast(*Entry, 0); return POOL_ERR_ALLOC; }
+    p.cap = cap;
+    p.n = 0;
+    p.max_per_host = MAX_PER_HOST;
+    p.idle_ms = IDLE_MS;
+    p.hits = 0;
+    p.misses = 0;
+    p.reaped = 0;
+    let is i64 as i with mut = 0;
+    while (i < cap) {
+        let is *Entry as e = _at(p, i);
+        e.live = 0;
+        e.c = cast(*conn.Conn, 0);
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Close and free everything. A pool that is dropped without this leaks a file
+// descriptor per idle connection, which is the kind of leak that only shows
+// up under load.
+fn pool_free(p as *Pool) as void {
+    if (cast(i64, p.e) == 0) { return; }
+    sync.mutex_lock(&p.lk);
+    let is i64 as i with mut = 0;
+    while (i < p.cap) {
+        let is *Entry as e = _at(p, i);
+        if (e.live == 1) {
+            if (cast(i64, e.c) != 0) { conn.conn_free(e.c); }
+            e.live = 0;
+            e.c = cast(*conn.Conn, 0);
+        }
+        i = i + 1;
+    }
+    sync.mutex_unlock(&p.lk);
+    mem.core.munmap(cast(*u8, p.e), p.cap * sizeof(Entry));
+    p.e = cast(*Entry, 0);
+    p.cap = 0;
+    p.n = 0;
+}
+
+fn _drop(p as *Pool, e as *Entry) as void {
+    if (cast(i64, e.c) != 0) { conn.conn_free(e.c); }
+    e.c = cast(*conn.Conn, 0);
+    e.live = 0;
+}
+
+// Close everything idle for longer than the pool's window. Called from
+// pool_get anyway; exposed so a long-lived program can do it on a timer.
+fn pool_reap(p as *Pool, now as i64) as i64 {
+    if (cast(i64, p.e) == 0) { return 0; }
+    sync.mutex_lock(&p.lk);
+    let is i64 as gone with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < p.cap) {
+        let is *Entry as e = _at(p, i);
+        if (e.live == 1) {
+            if (now - e.idle_since > p.idle_ms) {
+                _drop(p, e);
+                gone = gone + 1;
+            }
+        }
+        i = i + 1;
+    }
+    p.reaped = p.reaped + gone;
+    sync.mutex_unlock(&p.lk);
+    return gone;
+}
+
+// An idle connection to this origin, or null.
+//
+// The caller OWNS what comes back: it is out of the pool, not lent from it.
+// Handing it back is pool_put, and dropping it on the floor is conn_free —
+// both are correct, which is what makes the retry path simple.
+fn pool_get(p as *Pool, host as *u8, port as i64, tls as i64) as *conn.Conn {
+    if (cast(i64, p.e) == 0) { return cast(*conn.Conn, 0); }
+    let is i64 as now = time.now_ms();
+
+    sync.mutex_lock(&p.lk);
+    let is i64 as i with mut = 0;
+    while (i < p.cap) {
+        let is *Entry as e = _at(p, i);
+        if (e.live == 1) {
+            // Expired first, whether or not it matches: a stale entry for
+            // this origin would otherwise be handed out before a fresh one
+            // further along.
+            if (now - e.idle_since > p.idle_ms) {
+                _drop(p, e);
+                p.reaped = p.reaped + 1;
+            } else {
+                let is i64 as hit with mut = 0;
+                if (e.port == port) {
+                    if (e.tls == tls) {
+                        if (_ieq(cast(*u8, &e.host), host) == 1) { hit = 1; }
+                    }
+                }
+                if (hit == 1) {
+                    // A connection the peer has already closed is worse than
+                    // no connection: the request goes out and vanishes.
+                    if (conn.conn_state(e.c) != conn.CONN_OPEN) {
+                        _drop(p, e);
+                        p.reaped = p.reaped + 1;
+                    } else {
+                        let is *conn.Conn as c = e.c;
+                        e.c = cast(*conn.Conn, 0);
+                        e.live = 0;
+                        p.hits = p.hits + 1;
+                        sync.mutex_unlock(&p.lk);
+                        return c;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    p.misses = p.misses + 1;
+    sync.mutex_unlock(&p.lk);
+    return cast(*conn.Conn, 0);
+}
+
+// Give a connection back. Returns 1 when it was kept, 0 when it was closed
+// instead — which is not a failure: a full pool, a dead connection or a host
+// already at its limit are all ordinary.
+//
+// The caller must have finished reading the response body, and must NOT hand
+// back a connection whose response said Connection: close or whose body was
+// framed by the connection ending. proto/http1.cst's conn_reusable answers
+// exactly that question; this file cannot, because it does not see responses.
+fn pool_put(p as *Pool, c as *conn.Conn, host as *u8, port as i64,
+            tls as i64) as i64 {
+    if (cast(i64, c) == 0) { return 0; }
+    if (cast(i64, p.e) == 0) { conn.conn_free(c); return 0; }
+    if (conn.conn_state(c) != conn.CONN_OPEN) { conn.conn_free(c); return 0; }
+
+    let is i64 as now = time.now_ms();
+    sync.mutex_lock(&p.lk);
+
+    // How many this origin already has, and a free slot on the way past.
+    let is i64 as same with mut = 0;
+    let is i64 as slot with mut = 0 - 1;
+    let is i64 as i with mut = 0;
+    while (i < p.cap) {
+        let is *Entry as e = _at(p, i);
+        if (e.live == 0) {
+            if (slot < 0) { slot = i; }
+        } else {
+            if (now - e.idle_since > p.idle_ms) {
+                _drop(p, e);
+                p.reaped = p.reaped + 1;
+                if (slot < 0) { slot = i; }
+            } else {
+                if (e.port == port) {
+                    if (e.tls == tls) {
+                        if (_ieq(cast(*u8, &e.host), host) == 1) { same = same + 1; }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    if (same >= p.max_per_host) { sync.mutex_unlock(&p.lk); conn.conn_free(c); return 0; }
+    if (slot < 0) { sync.mutex_unlock(&p.lk); conn.conn_free(c); return 0; }
+
+    let is *Entry as e = _at(p, slot);
+    e.c = c;
+    _copy(cast(*u8, &e.host), MAX_HOST, host);
+    e.port = port;
+    e.tls = tls;
+    e.idle_since = now;
+    e.live = 1;
+    if (slot >= p.n) { p.n = slot + 1; }
+    sync.mutex_unlock(&p.lk);
+    return 1;
+}
+
+// How many connections are currently held.
+fn pool_idle(p as *Pool) as i64 {
+    if (cast(i64, p.e) == 0) { return 0; }
+    sync.mutex_lock(&p.lk);
+    let is i64 as n with mut = 0;
+    let is i64 as i with mut = 0;
+    while (i < p.cap) {
+        if (_at(p, i).live == 1) { n = n + 1; }
+        i = i + 1;
+    }
+    sync.mutex_unlock(&p.lk);
+    return n;
+}
+
+fn pool_hits(p as *Pool) as i64   { return p.hits; }
+fn pool_misses(p as *Pool) as i64 { return p.misses; }
+fn pool_reaped(p as *Pool) as i64 { return p.reaped; }
+
+fn pool_err_name(e as i64) as *u8 {
+    if (e == POOL_ERR_ALLOC) { return "POOL_ERR_ALLOC"; }
+    if (e == POOL_ERR_SPACE) { return "POOL_ERR_SPACE"; }
+    return "POOL_ERR_UNKNOWN";
+}
