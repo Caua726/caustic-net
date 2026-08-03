@@ -152,7 +152,7 @@ server/      router* · threaded* · reactor* · static* · middleware*
 | client | `decode` — gzip · deflate (both framings) · brotli · zstd, with an expansion ceiling | ✅ green (`tests/test_decode`, bodies compressed by Python, 8 MiB bomb refused) |
 | proto | `cookie` — RFC 6265 parse · jar · domain/path/Secure rules | ✅ green (`tests/test_cookie`) |
 | client | `connpool` — keep-alive reuse by origin, 6 per host, retry-once | ✅ green (`tests/test_pool`, against a server that closes the connection) |
-| client | `parallel` — thread per job, waves, WaitGroup | ✅ green at both levels (`tests/test_parallel`, 12 jobs 4 at a time) |
+| client | `parallel` — thread per job, waves, WaitGroup | ✅ green at both levels (`tests/test_parallel`, 12 jobs 4 at a time; `tests/test_par_pool`, the same over one shared pool against a concurrent server) |
 | core | `bufread` deadline (gap 03) | ✅ `br_set_deadline`; bounds the number of fills, pair with `set_recv_timeout` for a single read |
 | everything else | see the roadmap | ⏳ |
 
@@ -202,6 +202,9 @@ crypto in `caustic-crypto` applies.
 headers, and `url_resolve` resolves a relative reference per RFC 3986 §5.2.
 10 is closed upstream: caustic-crypto v0.1.1 verifies ECDSA with an
 interleaved wNAF instead of two constant-time ladders — see the timings below.
+21 is closed: `tests/test_par_pool` runs twelve jobs through four workers over
+one shared pool, against a thread-per-connection keep-alive server. It needed
+threads at `-O1`, which is why it waited.
 
 | | Gap | Consequence |
 |---|---|---|
@@ -220,7 +223,6 @@ interleaved wNAF instead of two constant-time ladders — see the timings below.
 | 18 | The public suffix list is a heuristic | `psl_is_public_suffix` refuses a single label and a table of about forty two-part suffixes. It does not know `pvt.k12.ma.us`. A cookie scoped to an unlisted public suffix is accepted. The signature is what the real one would be, so replacing it is one file |
 | 19 | Decompression is one-shot | caustic-compact has no incremental API, so a compressed page cannot be rendered while it arrives — and the expansion ceiling is enforced after the decompressor has already produced the bytes, which bounds what the caller sees rather than the peak |
 | 20 | `SameSite` is parsed and not enforced | it is stored on the cookie; nothing consults it, because enforcement needs a notion of the initiating site that this layer does not have |
-| 21 | `parallel` and `connpool` are not tested TOGETHER | each is tested on its own. Combining them needs a concurrent server, and the one in `tests/test_parallel` is a single thread — a test whose result depends on which of two single-threaded things blocked first measures nothing. The pool's mutex is the argument that it is safe to share; it is not a test |
 | 22 | A jar is not safe to share between threads | `client/parallel` gives each job its own `Fetch`, and attaches no jar. A caller that passes one has said it is theirs to synchronise |
 
 ### Two bugs below this library, and how they read now

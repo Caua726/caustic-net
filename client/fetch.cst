@@ -97,6 +97,9 @@ struct Fetch {
     pl  as *pool.Pool;
     reused as i64;            // 1 when the current exchange got a pooled socket
     retries as i64;           // how many times a dead pooled socket was replaced
+    // One-shot: the next connection skips the pool and dials fresh. Set by the
+    // retry, cleared the moment it is honoured. See _connect.
+    nopool  as i64;
 
     final_url as [MAX_URL]u8;
     hdrbuf    as *u8;         // MAX_HEAD, mmap'd
@@ -156,6 +159,7 @@ fn fetch_init(f as *Fetch, t as *trust.TrustStore) as i64 {
     f.pl = cast(*pool.Pool, 0);
     f.reused = 0;
     f.retries = 0;
+    f.nopool = 0;
     f.nseen = 0;
     f.c = cast(*conn.Conn, 0);
     f.final_url[0] = cast(u8, 0);
@@ -233,7 +237,19 @@ fn _connect(f as *Fetch, u as *url.Url, deadline as i64) as *conn.Conn {
     }
 
     f.reused = 0;
-    if (cast(i64, f.pl) != 0) {
+    // The retry sets nopool, and it is consumed HERE rather than at the call
+    // site, so a redirect hop after it can use the pool again.
+    //
+    // Without it, "retry once" did not mean what its comment said. A server
+    // that closes several idle connections at once — a restart, a keep-alive
+    // sweep — leaves several corpses in the pool, and the retry called back
+    // into this function and drew ANOTHER one. tests/test_par_pool caught it:
+    // four workers, four dead sockets, and a job that failed with BR_EOF after
+    // spending its one retry on a second dead socket. A retry has to be on a
+    // connection the server has not had the chance to close.
+    let is i64 as skip = f.nopool;
+    f.nopool = 0;
+    if (cast(i64, f.pl) != 0 && skip == 0) {
         let is *conn.Conn as kept = pool.pool_get(f.pl, cast(*u8, &host), port, https);
         if (cast(i64, kept) != 0) {
             f.reused = 1;
@@ -488,6 +504,11 @@ fn fetch_method(f as *Fetch, method as *u8, target as *u8,
                     f.c = cast(*conn.Conn, 0);
                 }
                 f.retries = f.retries + 1;
+                // On a FRESH socket. The pool may hold more of the same
+                // corpses — one server closing its idle connections produces
+                // several at once — and spending the single retry on another
+                // one is how a reused connection becomes a visible failure.
+                f.nopool = 1;
                 rc = _once(f, &f.u, cast(*u8, &m), deadline,
                            cast(*u8, &loc), MAX_URL);
             }

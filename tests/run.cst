@@ -357,6 +357,7 @@ fn main(argc as i64, argv as *u8) as i32 {
     fail = fail + cast(i64, run_case(ccp, "test_cookie",  "tests/test_cookie.cst"));
     fail = fail + cast(i64, run_case(ccp, "test_pool",    "tests/test_pool.cst"));
     fail = fail + cast(i64, run_case(ccp, "test_parallel", "tests/test_parallel.cst"));
+    fail = fail + cast(i64, run_case(ccp, "test_par_pool", "tests/test_par_pool.cst"));
     fail = fail + cast(i64, run_case(ccp, "test_conn",    "tests/test_conn.cst"));
     fail = fail + cast(i64, run_case(ccp, "test_bytes",   "tests/test_bytes.cst"));
     fail = fail + cast(i64, run_case(ccp, "test_bufread", "tests/test_bufread.cst"));
