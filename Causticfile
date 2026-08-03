@@ -5,7 +5,8 @@ author "Cauã Alvarenga Neves"
 // caustic-net — build and test surface.
 //
 //   caustic-mk run test        the library compile-check, then every case
-//   caustic-mk run test-opt    the same, through the optimizing backend
+//   caustic-mk run test-opt    the same, through an optimizing backend
+//                              (OPT=-O1 by default; OPT=-O2 also green)
 //   caustic-mk build tcp_echo  the example, to run by hand
 //   caustic-mk run clean       build artifacts
 //

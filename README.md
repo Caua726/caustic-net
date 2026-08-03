@@ -152,7 +152,7 @@ server/      router* · threaded* · reactor* · static* · middleware*
 | client | `decode` — gzip · deflate (both framings) · brotli · zstd, with an expansion ceiling | ✅ green (`tests/test_decode`, bodies compressed by Python, 8 MiB bomb refused) |
 | proto | `cookie` — RFC 6265 parse · jar · domain/path/Secure rules | ✅ green (`tests/test_cookie`) |
 | client | `connpool` — keep-alive reuse by origin, 6 per host, retry-once | ✅ green (`tests/test_pool`, against a server that closes the connection) |
-| client | `parallel` — thread per job, waves, WaitGroup | ✅ green at both levels (`tests/test_parallel`, 12 jobs 4 at a time; `tests/test_par_pool`, the same over one shared pool against a concurrent server) |
+| client | `parallel` — thread per job, waves, WaitGroup | ✅ green at every level (`tests/test_parallel`, 12 jobs 4 at a time; `tests/test_par_pool`, the same over one shared pool against a concurrent server) |
 | core | `bufread` deadline (gap 03) | ✅ `br_set_deadline`; bounds the number of fills, pair with `set_recv_timeout` for a single read |
 | everything else | see the roadmap | ⏳ |
 
@@ -329,7 +329,8 @@ only in the root file before it, and every buffer here is declared that way.
 
 ```sh
 caustic-mk run test        # compile-check the library, then build and run every case
-caustic-mk run test-opt    # the same, through the optimizing backend
+caustic-mk run test-opt    # the same, at -O1
+OPT=-O2 caustic-mk run test-opt   # ...and at -O2
 caustic-mk build http_get  # the end-to-end example, to run by hand
 ```
 

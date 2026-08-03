@@ -36,8 +36,16 @@ jobs:
       - name: Test
         run: caustic-mk run test
 
-      # The optimizing backend is a second code generator, not a flag: it has
-      # regressed the same source before. The Causticfile offers it, so CI has
-      # to be the thing that keeps the offer true.
-      - name: Test (optimizing backend)
-        run: caustic-mk run test-opt
+      # The optimizing backends are a second and third code generator, not
+      # flags: they have regressed the same source before. The Causticfile
+      # offers them, so CI has to be the thing that keeps the offer true.
+      #
+      # -O2 is here because it was never run over this suite until it was, and
+      # a level nobody runs is how the -O1 thread miscompile survived: the
+      # inliner is an -O1-only pass and every test passed at the level the
+      # suite happened to use.
+      - name: Test (-O1)
+        run: OPT=-O1 caustic-mk run test-opt
+
+      - name: Test (-O2)
+        run: OPT=-O2 caustic-mk run test-opt
