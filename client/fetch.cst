@@ -81,6 +81,9 @@ let is i64 as DEFAULT_LIMIT with imut = 33554432;   // 32 MiB
 // Fetches on different threads may share a jar, and the decompressors keep their tables at
 // module level. A request spends almost none of its time in either.
 let is sync.Mutex as _jar_lock with mut;
+// What every request says it is. A program with a name of its own sets it before the first one.
+let is *u8 as _user_agent with mut = "caustic-net/0.1";
+fn fetch_set_user_agent(s as *u8) as void { _user_agent = s; }
 let is sync.Mutex as _decode_lock with mut;
 
 struct Fetch {
@@ -376,7 +379,7 @@ fn _once(f as *Fetch, u as *url.Url, method as *u8, deadline as i64,
     if (cast(i64, f.pl) != 0) { keepalive = 1; }
     if (http.req_for_url(&req, method, u, keepalive) < 0) { rc = FETCH_ERR_SPACE; }
     if (rc == 0) {
-        if (http.req_header(&req, "User-Agent", "caustic-net/0.1") < 0) { rc = FETCH_ERR_SPACE; }
+        if (http.req_header(&req, "User-Agent", _user_agent) < 0) { rc = FETCH_ERR_SPACE; }
     }
     if (rc == 0) {
         if (http.req_header(&req, "Accept", "*/*") < 0) { rc = FETCH_ERR_SPACE; }
@@ -625,6 +628,10 @@ fn redirect_method(status as i64, method as *u8, out as *u8, max as i64) as void
     if (status == 307 || status == 308) { _copy_str(out, max, method); return; }
     _copy_str(out, max, "GET");
 }
+
+// For whoever else decompresses, on any thread, with the same module-level tables.
+fn fetch_decode_lock() as void { sync.mutex_lock(&_decode_lock); }
+fn fetch_decode_unlock() as void { sync.mutex_unlock(&_decode_lock); }
 
 // Hand fetch a cookie jar, or null to stop using one. The jar is the
 // caller's: a browser keeps one per profile, not one per request.
