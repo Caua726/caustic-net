@@ -54,6 +54,7 @@ use "../tls/trust.cst" as trust;
 use "../tls/client.cst" as tlsc;
 use "./decode.cst" as decode;
 use "../proto/cookie.cst" as cookie;
+use "std/sync.cst" as sync;
 use "./connpool.cst" as pool;
 
 // --- Errors (the -1800 block) ------------------------------------------
@@ -76,6 +77,11 @@ let is i64 as MAX_REDIRECTS with imut = 20;
 let is i64 as SEEN_SLOTS    with imut = 24;
 
 let is i64 as DEFAULT_LIMIT with imut = 33554432;   // 32 MiB
+
+// Fetches on different threads may share a jar, and the decompressors keep their tables at
+// module level. A request spends almost none of its time in either.
+let is sync.Mutex as _jar_lock with mut;
+let is sync.Mutex as _decode_lock with mut;
 
 struct Fetch {
     r    as http.Response;
@@ -381,8 +387,11 @@ fn _once(f as *Fetch, u as *url.Url, method as *u8, deadline as i64,
     }
     if (rc == 0 && cast(i64, f.jar) != 0) {
         let is [4096]u8 as ch;
-        if (cookie.jar_header(f.jar, u, time.unix_time(),
-                              cast(*u8, &ch), 4096) > 0) {
+        sync.mutex_lock(&_jar_lock);
+        let is i64 as cookies = cookie.jar_header(f.jar, u, time.unix_time(),
+                                                  cast(*u8, &ch), 4096);
+        sync.mutex_unlock(&_jar_lock);
+        if (cookies > 0) {
             if (http.req_header(&req, "Cookie", cast(*u8, &ch)) < 0) {
                 rc = FETCH_ERR_SPACE;
             }
@@ -425,7 +434,9 @@ fn _once(f as *Fetch, u as *url.Url, method as *u8, deadline as i64,
     // Before the body, and before any redirect is followed: a Set-Cookie on
     // a 302 is how a session starts on most sites.
     if (cast(i64, f.jar) != 0) {
+        sync.mutex_lock(&_jar_lock);
         cookie.jar_set(f.jar, &f.r, u, time.unix_time());
+        sync.mutex_unlock(&_jar_lock);
     }
 
     let is http.BodyReader as bd;
@@ -464,8 +475,10 @@ fn _once(f as *Fetch, u as *url.Url, method as *u8, deadline as i64,
         if (f.encoding != decode.ENC_IDENTITY) {
             let is bytes.Bytes as plain with mut = bytes.bytes_new(16384);
             if (cast(i64, plain.ptr) == 0) { return FETCH_ERR_ALLOC; }
+            sync.mutex_lock(&_decode_lock);
             let is i64 as dn = decode.decode_body(f.encoding, f.body.ptr, f.body.len,
                                                   &plain, lim);
+            sync.mutex_unlock(&_decode_lock);
             if (dn < 0) { bytes.bytes_free(&plain); return dn; }
             bytes.bytes_free(&f.body);
             f.body = plain;
