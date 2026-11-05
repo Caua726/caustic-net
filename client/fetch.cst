@@ -33,6 +33,10 @@
 //   * A downgrade from https to http is refused outright. A redirect is not
 //     a reason to stop encrypting, and following one silently would undo the
 //     work of everything below.
+//   * A request's own body goes with the method: a 303 that makes a POST a GET
+//     leaves it behind, and a 307 that keeps the POST sends it again. Origin and
+//     Referer go only with a body too, so they say nothing to the next site once
+//     it is gone.
 //   * The body is DRAINED between hops rather than the connection dropped,
 //     so the socket stays reusable once client/pool.cst exists.
 // =======================================================
@@ -100,6 +104,12 @@ struct Fetch {
     // One-shot: the next connection skips the pool and dials fresh. Set by the
     // retry, cleared the moment it is honoured. See _connect.
     nopool  as i64;
+    // What fetch_post sends, the caller's until it returns. Null when no body goes.
+    req_body    as *u8;
+    req_body_n  as i64;
+    req_type    as *u8;
+    req_origin  as *u8;       // null for none
+    req_referer as *u8;       // null for none
 
     final_url as [MAX_URL]u8;
     hdrbuf    as *u8;         // MAX_HEAD, mmap'd
@@ -159,6 +169,8 @@ fn fetch_init(f as *Fetch, t as *trust.TrustStore) as i64 {
     f.pl = cast(*pool.Pool, 0);
     f.reused = 0;
     f.retries = 0;
+    f.req_body = cast(*u8, 0);
+    f.req_body_n = 0;
     f.nopool = 0;
     f.nseen = 0;
     f.c = cast(*conn.Conn, 0);
@@ -299,7 +311,10 @@ fn fetch_tls_err(f as *Fetch) as i64 { return f.tls_err; }
 // all of them mean the request did not land. A malformed response, a body
 // past the limit or a TLS refusal are answers, and repeating the request
 // would only get the same one.
-fn _retryable(rc as i64) as i64 {
+fn _retryable(f as *Fetch, rc as i64) as i64 {
+    // A response that never came says nothing of whether the request landed, and a
+    // body may be a second order placed. Only a write that failed is sure it did not.
+    if (cast(i64, f.req_body) != 0) { return cast(i64, rc == 0 - errno.EPIPE); }
     if (rc == 0 - errno.EPIPE) { return 1; }
     if (rc == 0 - errno.ECONNRESET) { return 1; }
     if (rc == bufread.BR_EOF) { return 1; }
@@ -373,8 +388,21 @@ fn _once(f as *Fetch, u as *url.Url, method as *u8, deadline as i64,
             }
         }
     }
+    if (rc == 0 && cast(i64, f.req_body) != 0) {
+        if (http.req_header(&req, "Content-Type", f.req_type) < 0) { rc = FETCH_ERR_SPACE; }
+        if (rc == 0 && http.req_header_int(&req, "Content-Length", f.req_body_n) < 0) { rc = FETCH_ERR_SPACE; }
+        if (rc == 0 && cast(i64, f.req_origin) != 0) {
+            if (http.req_header(&req, "Origin", f.req_origin) < 0) { rc = FETCH_ERR_SPACE; }
+        }
+        if (rc == 0 && cast(i64, f.req_referer) != 0) {
+            if (http.req_header(&req, "Referer", f.req_referer) < 0) { rc = FETCH_ERR_SPACE; }
+        }
+    }
     if (rc == 0) {
         if (http.req_end(&req) < 0) { rc = FETCH_ERR_SPACE; }
+    }
+    if (rc == 0 && cast(i64, f.req_body) != 0 && f.req_body_n > 0) {
+        if (bytes.bytes_append(&req, f.req_body, f.req_body_n) < 0) { rc = FETCH_ERR_SPACE; }
     }
     if (rc != 0) { bytes.bytes_free(&req); return rc; }
 
@@ -456,6 +484,22 @@ fn fetch_get(f as *Fetch, target as *u8, deadline as i64) as i64 {
     return fetch_method(f, "GET", target, deadline);
 }
 
+// POST `body` to `target`, following redirects, into f.body. ctype is its Content-Type;
+// origin and referer are the headers of those names, or null. Nothing is kept past the
+// return, so none of these has to outlive the call.
+fn fetch_post(f as *Fetch, target as *u8, ctype as *u8, body as *u8, n as i64,
+              origin as *u8, referer as *u8, deadline as i64) as i64 {
+    f.req_body = body;
+    if (cast(i64, body) == 0) { f.req_body = ""; }
+    f.req_body_n = n;
+    f.req_type = ctype;
+    f.req_origin = origin;
+    f.req_referer = referer;
+    let is i64 as rc = fetch_method(f, "POST", target, deadline);
+    f.req_body = cast(*u8, 0);
+    return rc;
+}
+
 fn fetch_method(f as *Fetch, method as *u8, target as *u8,
                 deadline as i64) as i64 {
     if (f.inited != 1) { return FETCH_ERR_ALLOC; }
@@ -498,7 +542,7 @@ fn fetch_method(f as *Fetch, method as *u8, target as *u8,
         // and retrying a request that was actually delivered would send it
         // twice — which for anything but GET is a second order placed.
         if (rc < 0 && f.reused == 1) {
-            if (_retryable(rc) == 1) {
+            if (_retryable(f, rc) == 1) {
                 if (cast(i64, f.c) != 0) {
                     conn.conn_free(f.c);
                     f.c = cast(*conn.Conn, 0);
@@ -532,6 +576,7 @@ fn fetch_method(f as *Fetch, method as *u8, target as *u8,
         let is [16]u8 as nm;
         redirect_method(f.status, cast(*u8, &m), cast(*u8, &nm), 16);
         _copy_str(cast(*u8, &m), 16, cast(*u8, &nm));
+        if (_streq(cast(*u8, &m), "POST") == 0) { f.req_body = cast(*u8, 0); }
 
         _copy_str(cast(*u8, &cur), MAX_URL, cast(*u8, &next));
     }

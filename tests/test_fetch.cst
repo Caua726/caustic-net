@@ -118,10 +118,55 @@ fn serve_one(c as *conn.Conn) as void {
     let is i64 as i with mut = 0;
     while (i < 16) { _last_method[i] = meth[i]; i = i + 1; }
 
-    // drain the rest of the head
+    // drain the rest of the head, keeping what a request with a body says of it
+    let is i64 as body_n with mut = 0;
+    let is i64 as has_type with mut = 0;
+    let is i64 as has_origin with mut = 0;
     while (1 == 1) {
         let is i64 as k = bufread.br_read_line(&br, cast(*u8, &line), 1024);
         if (k <= 0) { break; }
+        if (starts(cast(*u8, &line), "Content-Length: ") == 1) {
+            let is i64 as q with mut = 16;
+            while (line[q] >= 48 && line[q] <= 57) {
+                body_n = body_n * 10 + (cast(i64, line[q]) - 48);
+                q = q + 1;
+            }
+        }
+        if (starts(cast(*u8, &line), "Content-Type: text/x") == 1) { has_type = 1; }
+        if (starts(cast(*u8, &line), "Origin: http://o") == 1) { has_origin = 1; }
+    }
+    // What a request with a body reached: its method, whether its headers came, the body.
+    let is [64]u8 as got;
+    let is i64 as got_n with mut = 0;
+    while (got_n < body_n && got_n < 64) {
+        let is i64 as rd = bufread.br_read(&br, &got[got_n], body_n - got_n);
+        if (rd <= 0) { break; }
+        got_n = got_n + rd;
+    }
+    if (streq(cast(*u8, &path), "/post") == 1) {
+        let is bytes.Bytes as b with mut = bytes.bytes_new(128);
+        bytes.bytes_append_str(&b, cast(*u8, &meth));
+        bytes.bytes_push(&b, cast(u8, 48 + has_type));
+        bytes.bytes_push(&b, cast(u8, 48 + has_origin));
+        bytes.bytes_append(&b, cast(*u8, &got), got_n);
+        send_str(c, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
+        conn.conn_write_all(c, b.ptr, b.len);
+        bytes.bytes_free(&b);
+        conn.conn_close(c);
+        conn.conn_free(c);
+        return;
+    }
+    if (streq(cast(*u8, &path), "/post303") == 1) {
+        send_str(c, "HTTP/1.1 303 See Other\r\nLocation: /post\r\nContent-Length: 0\r\n\r\n");
+        conn.conn_close(c);
+        conn.conn_free(c);
+        return;
+    }
+    if (streq(cast(*u8, &path), "/post307") == 1) {
+        send_str(c, "HTTP/1.1 307 Temporary Redirect\r\nLocation: /post\r\nContent-Length: 0\r\n\r\n");
+        conn.conn_close(c);
+        conn.conn_free(c);
+        return;
     }
 
     if (streq(cast(*u8, &path), "/a") == 1) {
@@ -220,9 +265,19 @@ fn server_main() as i32 {
 }
 
 // The server-dependent half. Returns 0, or the numbered check that failed.
-fn run_checks(f as *fetch.Fetch) as i64 {
-    let is i64 as rc with mut = 0;
+fn body_is(f as *fetch.Fetch, want as *u8) as i64 {
+    let is i64 as n with mut = 0;
+    while (want[n] != 0) { n = n + 1; }
+    if (fetch.fetch_body_len(f) != n) { return 0; }
+    let is i64 as i with mut = 0;
+    while (i < n) {
+        if (fetch.fetch_body(f)[i] != want[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
 
+fn run_checks(f as *fetch.Fetch) as i64 {
     // A two-hop chain: /a -302-> /b -301(relative)-> /c.
     let is i64 as rc with mut = fetch.fetch_get(f, "http://127.0.0.1:18099/a",
                                                 conn.deadline_in(10000));
@@ -300,6 +355,24 @@ fn run_checks(f as *fetch.Fetch) as i64 {
         return 42;
     }
     f.limit = 0;
+
+    // A body: it arrives with its headers, a 307 sends it again, and a 303 leaves it behind.
+    rc = fetch.fetch_post(f, "http://127.0.0.1:18099/post", "text/x", "a=1", 3, "http://o", cast(*u8, 0), conn.deadline_in(10000));
+    if (rc != 0) {
+        io.printf("post: %s\n", fetch.fetch_err_name(rc));
+        return 46;
+    }
+    if (body_is(f, "POST11a=1") == 0) { return 47; }
+    rc = fetch.fetch_post(f, "http://127.0.0.1:18099/post307", "text/x", "a=1", 3, "http://o", cast(*u8, 0), conn.deadline_in(10000));
+    if (rc != 0) { return 48; }
+    if (body_is(f, "POST11a=1") == 0) { return 49; }
+    rc = fetch.fetch_post(f, "http://127.0.0.1:18099/post303", "text/x", "a=1", 3, "http://o", cast(*u8, 0), conn.deadline_in(10000));
+    if (rc != 0) { return 50; }
+    if (body_is(f, "GET00") == 0) { return 51; }
+    // After a body, the next request has none of it.
+    rc = fetch.fetch_get(f, "http://127.0.0.1:18099/post", conn.deadline_in(10000));
+    if (rc != 0) { return 52; }
+    if (body_is(f, "GET00") == 0) { return 53; }
 
     // A URL that is not http or https, and one that does not parse.
     if (fetch.fetch_get(f, "ftp://127.0.0.1/x", 0) != fetch.FETCH_ERR_SCHEME) { return 43; }
