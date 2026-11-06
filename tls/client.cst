@@ -261,6 +261,15 @@ fn _tls_state(ctx as *u8) as i64 {
 // tls_last_err() says why.
 fn tls_client(inner as *conn.Conn, host as *u8,
               t as *trust.TrustStore) as *conn.Conn {
+    return _tls_client(inner, host, t, 0);
+}
+// Offering HTTP/2 as well. tls_alpn says what the server took.
+fn tls_client_h2(inner as *conn.Conn, host as *u8,
+                 t as *trust.TrustStore) as *conn.Conn {
+    return _tls_client(inner, host, t, 1);
+}
+fn _tls_client(inner as *conn.Conn, host as *u8,
+               t as *trust.TrustStore, offer_h2 as i64) as *conn.Conn {
     _last_err = 0;
     if (cast(i64, inner) == 0) { _last_err = CLIENT_ERR_ALLOC; return cast(*conn.Conn, 0); }
 
@@ -304,6 +313,7 @@ fn tls_client(inner as *conn.Conn, host as *u8,
 
     let is handshake.Handshake as h;
     let is i64 as rc with mut = handshake.hs_init(&h, &x.rl, cast(*u8, &x.host), t);
+    h.offer_h2 = offer_h2;
     if (rc == 0) { rc = handshake.hs_run(&h); }
     if (rc < 0) {
         _last_err = rc;

@@ -156,6 +156,7 @@ struct Handshake {
     certs  as *x509.Cert;   ncert as i64;
     verr   as i64;                       // the exact answer from verify_chain
     alpn   as [16]u8;
+    offer_h2 as i64;
 }
 
 fn _slen(s as *u8) as i64 {
@@ -201,6 +202,7 @@ fn hs_init(h as *Handshake, rl as *record.RecordLayer, host as *u8,
     h.ncert = 0;
     h.verr = 0;
     h.alpn[0] = cast(u8, 0);
+    h.offer_h2 = 0;
 
     let is i64 as i with mut = 0;
     while (i < 255 && host[i] != 0) { h.host[i] = host[i]; i = i + 1; }
@@ -377,7 +379,9 @@ fn _build_hello(h as *Handshake, b as *bytes.Bytes) as i64 {
     if (ext.ext_supported_groups(b) < 0) { return TLS_ERR_SPACE; }
     if (ext.ext_signature_algorithms(b) < 0) { return TLS_ERR_SPACE; }
     if (ext.ext_key_share_client(b, cast(*u8, &h.pub)) < 0) { return TLS_ERR_SPACE; }
-    if (ext.ext_alpn_http11(b) < 0) { return TLS_ERR_SPACE; }
+    if (h.offer_h2 == 1) {
+        if (ext.ext_alpn_h2(b) < 0) { return TLS_ERR_SPACE; }
+    } else if (ext.ext_alpn_http11(b) < 0) { return TLS_ERR_SPACE; }
     ext.patch16(b, extat);
 
     let is i64 as body = b.len - lenat - 3;

@@ -208,6 +208,21 @@ fn ext_alpn_http11(b as *bytes.Bytes) as i64 {
     return 0;
 }
 
+// The same, for a client that can also speak HTTP/2 and would rather.
+fn ext_alpn_h2(b as *bytes.Bytes) as i64 {
+    let is i64 as at = open_ext(b, EXT_ALPN);
+    if (at < 0) { return at; }
+    let is i64 as lat = b.len;
+    if (put16(b, 0) < 0) { return EXT_ERR_SPACE; }
+    if (put8(b, 2) < 0) { return EXT_ERR_SPACE; }
+    if (bytes.bytes_append(b, "h2", 2) < 0) { return EXT_ERR_SPACE; }
+    if (put8(b, 8) < 0) { return EXT_ERR_SPACE; }
+    if (bytes.bytes_append(b, "http/1.1", 8) < 0) { return EXT_ERR_SPACE; }
+    patch16(b, lat);
+    patch16(b, at);
+    return 0;
+}
+
 // --- Reading ------------------------------------------------------------
 
 // Find extension `want` inside an extension block that starts at `p` and runs
