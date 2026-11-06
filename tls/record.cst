@@ -91,6 +91,7 @@ struct RecordLayer {
     plain as *u8;    plaincap as i64;
 
     closed as i64;   // peer sent close_notify
+    tls12  as i64;   // 1: records as TLS 1.2 has them. The suite is named by its 1.3 twin
 }
 
 // One lock over every AEAD call in this module. See the note at the top: the
@@ -189,30 +190,30 @@ fn build_aad(ctype as i64, len as i64, out as *u8) as void {
     out[4] = cast(u8, len & 255);
 }
 
-fn _seal(rl as *RecordLayer, nonce as *u8, aad as *u8,
+fn _seal(rl as *RecordLayer, nonce as *u8, aad as *u8, aadlen as i64,
          pt as *u8, plen as i64, ct as *u8, tag as *u8) as i64 {
     sync.mutex_lock(&_aead_lk);
     if (rl.suite == SUITE_CHACHA20_POLY1305) {
-        cpoly.chachapoly_seal(cast(*u8, &rl.wkey), nonce, aad, HDR_LEN, pt, plen, ct, tag);
+        cpoly.chachapoly_seal(cast(*u8, &rl.wkey), nonce, aad, aadlen, pt, plen, ct, tag);
     } else {
         let is aes.Aes as a;
         aes.aes_init(&a, cast(*u8, &rl.wkey), rl.wkeylen);
-        aesm.aes_gcm_seal(&a, nonce, NONCE_LEN, aad, HDR_LEN, pt, plen, ct, tag);
+        aesm.aes_gcm_seal(&a, nonce, NONCE_LEN, aad, aadlen, pt, plen, ct, tag);
     }
     sync.mutex_unlock(&_aead_lk);
     return 0;
 }
 
-fn _open(rl as *RecordLayer, nonce as *u8, aad as *u8,
+fn _open(rl as *RecordLayer, nonce as *u8, aad as *u8, aadlen as i64,
          ct as *u8, clen as i64, tag as *u8, pt as *u8) as i64 {
     sync.mutex_lock(&_aead_lk);
     let is i64 as ok with mut = 0;
     if (rl.suite == SUITE_CHACHA20_POLY1305) {
-        ok = cpoly.chachapoly_open(cast(*u8, &rl.rkey), nonce, aad, HDR_LEN, ct, clen, tag, pt);
+        ok = cpoly.chachapoly_open(cast(*u8, &rl.rkey), nonce, aad, aadlen, ct, clen, tag, pt);
     } else {
         let is aes.Aes as a;
         aes.aes_init(&a, cast(*u8, &rl.rkey), rl.rkeylen);
-        ok = aesm.aes_gcm_open(&a, nonce, NONCE_LEN, aad, HDR_LEN, ct, clen, tag, pt);
+        ok = aesm.aes_gcm_open(&a, nonce, NONCE_LEN, aad, aadlen, ct, clen, tag, pt);
     }
     sync.mutex_unlock(&_aead_lk);
     return ok;
@@ -220,11 +221,85 @@ fn _open(rl as *RecordLayer, nonce as *u8, aad as *u8,
 
 // --- Decrypting one record ---------------------------------------------
 
+// TLS 1.2's additional data: the sequence number, then the header with the PLAINTEXT length.
+fn _aad12(seq as i64, ctype as i64, n as i64, out as *u8) as void {
+    let is i64 as k with mut = 0;
+    while (k < 8) { out[k] = cast(u8, (seq >> ((7 - k) * 8)) & 255); k = k + 1; }
+    out[8] = cast(u8, ctype);
+    out[9] = cast(u8, (LEGACY_VERSION >> 8) & 255);
+    out[10] = cast(u8, LEGACY_VERSION & 255);
+    out[11] = cast(u8, (n >> 8) & 255);
+    out[12] = cast(u8, n & 255);
+}
+// GCM carries eight bytes of its nonce in the record, after the four fixed ones; ChaCha20
+// builds it from the sequence number as TLS 1.3 does and carries nothing.
+fn _explicit12(rl as *RecordLayer) as i64 {
+    if (rl.suite == SUITE_CHACHA20_POLY1305) { return 0; }
+    return 8;
+}
+fn _decrypt12(rl as *RecordLayer, hdr_type as i64, body as *u8, blen as i64, ctype as *i64) as i64 {
+    let is i64 as ex = _explicit12(rl);
+    if (blen < ex + TAG_LEN) { return REC_ERR_DECRYPT; }
+    let is i64 as clen = blen - ex - TAG_LEN;
+    if (clen > rl.plaincap) { return REC_ERR_SPACE; }
+    let is [16]u8 as tag;
+    let is i64 as i with mut = 0;
+    while (i < TAG_LEN) { tag[i] = body[ex + clen + i]; i = i + 1; }
+    let is [12]u8 as nonce;
+    if (ex == 0) { build_nonce(cast(*u8, &rl.riv), rl.rseq, cast(*u8, &nonce)); }
+    else {
+        i = 0;
+        while (i < 4) { nonce[i] = rl.riv[i]; i = i + 1; }
+        i = 0;
+        while (i < 8) { nonce[4 + i] = body[i]; i = i + 1; }
+    }
+    let is [13]u8 as aad;
+    _aad12(rl.rseq, hdr_type, clen, cast(*u8, &aad));
+    if (_open(rl, cast(*u8, &nonce), cast(*u8, &aad), 13, cast(*u8, cast(i64, body) + ex), clen,
+              cast(*u8, &tag), rl.plain) != 1) {
+        return REC_ERR_DECRYPT;
+    }
+    if (rl.rseq == 0x7FFFFFFFFFFFFFFF) { return REC_ERR_SEQ; }
+    rl.rseq = rl.rseq + 1;
+    *ctype = hdr_type;
+    return clen;
+}
+fn _write12(rl as *RecordLayer, ctype as i64, p as *u8, n as i64) as i64 {
+    let is i64 as ex = _explicit12(rl);
+    let is i64 as blen = ex + n + TAG_LEN;
+    if (HDR_LEN + blen > rl.rxcap) { return REC_ERR_SPACE; }
+    build_aad(ctype, blen, rl.rx);
+    let is [12]u8 as nonce;
+    if (ex == 0) { build_nonce(cast(*u8, &rl.wiv), rl.wseq, cast(*u8, &nonce)); }
+    else {
+        let is i64 as i with mut = 0;
+        while (i < 4) { nonce[i] = rl.wiv[i]; i = i + 1; }
+        // The sequence number is a fine thing to send here: it never repeats under one key.
+        i = 0;
+        while (i < 8) {
+            let is u8 as v = cast(u8, (rl.wseq >> ((7 - i) * 8)) & 255);
+            nonce[4 + i] = v;
+            rl.rx[HDR_LEN + i] = v;
+            i = i + 1;
+        }
+    }
+    let is [13]u8 as aad;
+    _aad12(rl.wseq, ctype, n, cast(*u8, &aad));
+    _seal(rl, cast(*u8, &nonce), cast(*u8, &aad), 13, p, n,
+          cast(*u8, cast(i64, rl.rx) + HDR_LEN + ex),
+          cast(*u8, cast(i64, rl.rx) + HDR_LEN + ex + n));
+    if (rl.wseq == 0x7FFFFFFFFFFFFFFF) { return REC_ERR_SEQ; }
+    rl.wseq = rl.wseq + 1;
+    if (conn.conn_write_all(rl.c, rl.rx, HDR_LEN + blen) != HDR_LEN + blen) { return REC_ERR_HEADER; }
+    return n;
+}
+
 // Split the tag off the end, decrypt, and strip the padding to find the real
 // content type. `body` is the record body as it arrived, `blen` its length.
 // Returns the plaintext length in rl.plain and writes the type to *ctype.
 fn rl_decrypt(rl as *RecordLayer, hdr_type as i64, body as *u8, blen as i64,
               ctype as *i64) as i64 {
+    if (rl.tls12 == 1) { return _decrypt12(rl, hdr_type, body, blen, ctype); }
     if (blen < TAG_LEN + 1) { return REC_ERR_DECRYPT; }
     let is i64 as clen = blen - TAG_LEN;
     if (clen > rl.plaincap) { return REC_ERR_SPACE; }
@@ -243,7 +318,7 @@ fn rl_decrypt(rl as *RecordLayer, hdr_type as i64, body as *u8, blen as i64,
     let is [5]u8 as aad;
     build_aad(hdr_type, blen, cast(*u8, &aad));
 
-    if (_open(rl, cast(*u8, &nonce), cast(*u8, &aad), body, clen,
+    if (_open(rl, cast(*u8, &nonce), cast(*u8, &aad), HDR_LEN, body, clen,
               cast(*u8, &tag), rl.plain) != 1) {
         return REC_ERR_DECRYPT;
     }
@@ -340,6 +415,8 @@ fn rl_write_record(rl as *RecordLayer, ctype as i64, p as *u8, n as i64) as i64 
         return n;
     }
 
+    if (rl.tls12 == 1) { return _write12(rl, ctype, p, n); }
+
     // plaintext = payload || real content type. No padding is added: it buys
     // traffic analysis resistance this library does not yet make claims about,
     // and an unpadded record is what the RFC's own vectors carry.
@@ -350,24 +427,24 @@ fn rl_write_record(rl as *RecordLayer, ctype as i64, p as *u8, n as i64) as i64 
     rl.plain[n] = cast(u8, ctype);
 
     let is i64 as blen = plen + TAG_LEN;
-    if (blen > rl.rxcap) { return REC_ERR_SPACE; }
+    if (HDR_LEN + blen > rl.rxcap) { return REC_ERR_SPACE; }
 
     // The header carries application_data whatever this really is, and its
     // length is the CIPHERTEXT length — which is what gets authenticated.
-    build_aad(CT_APPLICATION_DATA, blen, cast(*u8, &hdr));
+    build_aad(CT_APPLICATION_DATA, blen, rl.rx);
 
     let is [12]u8 as nonce;
     build_nonce(cast(*u8, &rl.wiv), rl.wseq, cast(*u8, &nonce));
 
-    let is [16]u8 as tag;
-    _seal(rl, cast(*u8, &nonce), cast(*u8, &hdr), rl.plain, plen, rl.rx, cast(*u8, &tag));
+    _seal(rl, cast(*u8, &nonce), rl.rx, HDR_LEN, rl.plain, plen,
+          cast(*u8, cast(i64, rl.rx) + HDR_LEN),
+          cast(*u8, cast(i64, rl.rx) + HDR_LEN + plen));
 
     if (rl.wseq == 0x7FFFFFFFFFFFFFFF) { return REC_ERR_SEQ; }
     rl.wseq = rl.wseq + 1;
 
-    if (conn.conn_write_all(rl.c, cast(*u8, &hdr), HDR_LEN) != HDR_LEN) { return REC_ERR_HEADER; }
-    if (conn.conn_write_all(rl.c, rl.rx, plen) != plen) { return REC_ERR_HEADER; }
-    if (conn.conn_write_all(rl.c, cast(*u8, &tag), TAG_LEN) != TAG_LEN) { return REC_ERR_HEADER; }
+    // Whole, in one write: as three, with TCP_NODELAY, each record is three packets.
+    if (conn.conn_write_all(rl.c, rl.rx, HDR_LEN + blen) != HDR_LEN + blen) { return REC_ERR_HEADER; }
     return n;
 }
 
@@ -392,7 +469,7 @@ fn rl_seal_record(rl as *RecordLayer, ctype as i64, p as *u8, n as i64,
     build_nonce(cast(*u8, &rl.wiv), rl.wseq, cast(*u8, &nonce));
 
     let is [16]u8 as tag;
-    _seal(rl, cast(*u8, &nonce), out, rl.plain, plen,
+    _seal(rl, cast(*u8, &nonce), out, HDR_LEN, rl.plain, plen,
           cast(*u8, cast(i64, out) + HDR_LEN), cast(*u8, &tag));
 
     i = 0;

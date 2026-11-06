@@ -43,6 +43,9 @@ let is i64 as EXT_SIG_ALGS        with imut = 13;
 let is i64 as EXT_ALPN            with imut = 16;
 let is i64 as EXT_SUPPORTED_VERS  with imut = 43;
 let is i64 as EXT_COOKIE          with imut = 44;
+let is i64 as EXT_EC_POINT_FORMATS with imut = 11;
+let is i64 as EXT_EXT_MASTER      with imut = 23;
+let is i64 as EXT_RENEG_INFO      with imut = 0xff01;
 let is i64 as EXT_KEY_SHARE       with imut = 51;
 
 // --- Named groups ------------------------------------------------------
@@ -144,26 +147,66 @@ fn ext_supported_versions_client(b as *bytes.Bytes) as i64 {
     patch16(b, at);
     return 0;
 }
-
-fn ext_supported_groups(b as *bytes.Bytes) as i64 {
-    let is i64 as at = open_ext(b, EXT_SUPPORTED_GROUPS);
+// The same, with TLS 1.2 after it.
+fn ext_supported_versions_12(b as *bytes.Bytes) as i64 {
+    let is i64 as at = open_ext(b, EXT_SUPPORTED_VERS);
     if (at < 0) { return at; }
-    if (put16(b, 2) < 0) { return EXT_ERR_SPACE; }
-    if (put16(b, GROUP_X25519) < 0) { return EXT_ERR_SPACE; }
+    if (put8(b, 4) < 0) { return EXT_ERR_SPACE; }
+    if (put16(b, TLS_1_3) < 0) { return EXT_ERR_SPACE; }
+    if (put16(b, TLS_1_2) < 0) { return EXT_ERR_SPACE; }
     patch16(b, at);
     return 0;
 }
 
-// key_share with one X25519 entry. `pub` is 32 bytes.
-fn ext_key_share_client(b as *bytes.Bytes, pub as *u8) as i64 {
+fn ext_supported_groups(b as *bytes.Bytes) as i64 {
+    let is i64 as at = open_ext(b, EXT_SUPPORTED_GROUPS);
+    if (at < 0) { return at; }
+    if (put16(b, 6) < 0) { return EXT_ERR_SPACE; }
+    if (put16(b, GROUP_X25519) < 0) { return EXT_ERR_SPACE; }
+    if (put16(b, GROUP_P256) < 0) { return EXT_ERR_SPACE; }
+    if (put16(b, GROUP_P384) < 0) { return EXT_ERR_SPACE; }
+    patch16(b, at);
+    return 0;
+}
+
+// key_share with one entry.
+fn ext_key_share_client(b as *bytes.Bytes, group as i64, pub as *u8, n as i64) as i64 {
     let is i64 as at = open_ext(b, EXT_KEY_SHARE);
     if (at < 0) { return at; }
     let is i64 as lat = b.len;
     if (put16(b, 0) < 0) { return EXT_ERR_SPACE; }
-    if (put16(b, GROUP_X25519) < 0) { return EXT_ERR_SPACE; }
-    if (put16(b, 32) < 0) { return EXT_ERR_SPACE; }
-    if (bytes.bytes_append(b, pub, 32) < 0) { return EXT_ERR_SPACE; }
+    if (put16(b, group) < 0) { return EXT_ERR_SPACE; }
+    if (put16(b, n) < 0) { return EXT_ERR_SPACE; }
+    if (bytes.bytes_append(b, pub, n) < 0) { return EXT_ERR_SPACE; }
     patch16(b, lat);
+    patch16(b, at);
+    return 0;
+}
+
+// The cookie of a HelloRetryRequest, given back as it came: its body whole.
+fn ext_cookie(b as *bytes.Bytes, p as *u8, n as i64) as i64 {
+    let is i64 as at = open_ext(b, EXT_COOKIE);
+    if (at < 0) { return at; }
+    if (bytes.bytes_append(b, p, n) < 0) { return EXT_ERR_SPACE; }
+    patch16(b, at);
+    return 0;
+}
+
+// What a TLS 1.2 server looks for: uncompressed points only, a master secret tied to the
+// whole handshake (RFC 7627), and an empty renegotiation_info (RFC 5746), which says that
+// this client will not renegotiate unsafely. It will not renegotiate at all.
+fn ext_tls12(b as *bytes.Bytes) as i64 {
+    let is i64 as at with mut = open_ext(b, EXT_EC_POINT_FORMATS);
+    if (at < 0) { return at; }
+    if (put8(b, 1) < 0) { return EXT_ERR_SPACE; }
+    if (put8(b, 0) < 0) { return EXT_ERR_SPACE; }
+    patch16(b, at);
+    at = open_ext(b, EXT_EXT_MASTER);
+    if (at < 0) { return at; }
+    patch16(b, at);
+    at = open_ext(b, EXT_RENEG_INFO);
+    if (at < 0) { return at; }
+    if (put8(b, 0) < 0) { return EXT_ERR_SPACE; }
     patch16(b, at);
     return 0;
 }

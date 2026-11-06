@@ -65,6 +65,14 @@ let is *u8 as DI_SHA512 with imut =
     "\x30\x51\x30\x0d\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x03\x05\x00\x04\x40";
 let is i64 as DI_LEN with imut = 19;
 
+// A PKCS#1 v1.5 signature over this digest.
+fn pkcs1_verify(pub as *rsa.RsaPub, hash as i64, digest as *u8, dlen as i64, sig as *u8) as i64 {
+    let is *u8 as di with mut = DI_SHA256;
+    if (hash == 384) { di = DI_SHA384; }
+    if (hash == 512) { di = DI_SHA512; }
+    return rsa.rsa_pkcs1v15_verify(pub, di, DI_LEN, digest, dlen, sig);
+}
+
 // The hash a signature algorithm uses, as 256/384/512, or 0.
 fn _sig_hash(c as *x509.Cert) as i64 {
     if (c.sig_alg == x509.SIG_RSA_SHA256)   { return 256; }

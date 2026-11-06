@@ -476,7 +476,7 @@ fn main() as i32 {
     }
 
     bytes.bytes_reset(&b);
-    if (ext.ext_key_share_client(&b, v.CLI_PUB) != 0) { return 76; }
+    if (ext.ext_key_share_client(&b, ext.GROUP_X25519, v.CLI_PUB, 32) != 0) { return 76; }
     if (ext.ext_find(exts, exn, ext.EXT_KEY_SHARE, &eo, &el) != 1) { return 77; }
     if (b.len != el + 4) { return 78; }
     if (eq(b.ptr, cast(*u8, cast(i64, exts) + eo - 4), b.len) == 0) {
@@ -487,14 +487,15 @@ fn main() as i32 {
     bytes.bytes_reset(&b);
     if (ext.ext_supported_groups(&b) != 0) { return 80; }
     if (ext.ext_find(exts, exn, ext.EXT_SUPPORTED_GROUPS, &eo, &el) != 1) { return 81; }
-    // The RFC offers four groups and this library offers one, so the bodies
-    // differ; what has to match is the shape — a two-byte list length, then
-    // two-byte group ids, with x25519 among them.
-    if (b.len != 8) { return 82; }
+    // The RFC offers four groups and this library three, so the bodies differ;
+    // what has to match is the shape — a two-byte list length, then two-byte
+    // group ids, with x25519 first: it is the one a key is sent for.
+    if (b.len != 12) { return 82; }
     if (b.ptr[4] != cast(u8, 0)) { return 83; }
-    if (b.ptr[5] != cast(u8, 2)) { return 84; }
+    if (b.ptr[5] != cast(u8, 6)) { return 84; }
     if (b.ptr[6] != cast(u8, 0)) { return 85; }
     if (b.ptr[7] != cast(u8, 0x1d)) { return 86; }
+    if (b.ptr[9] != cast(u8, 0x17) || b.ptr[11] != cast(u8, 0x18)) { return 86; }
 
     // A hostname goes in as a host_name entry, length-prefixed three deep.
     bytes.bytes_reset(&b);

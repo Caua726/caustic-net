@@ -127,7 +127,7 @@ fn _tls_read(ctx as *u8, buf as *u8, len as i64) as i64 {
             // Post-handshake messages arrive on the same stream as data.
             let is i64 as mt = cast(i64, t.rl.plain[0]);
             if (mt == handshake.HS_NEW_TICKET) { continue; }   // resumption, unused
-            if (mt == handshake.HS_KEY_UPDATE) {
+            if (mt == handshake.HS_KEY_UPDATE && t.rl.tls12 == 0) {
                 // Not optional. A peer that rekeys and is ignored keeps
                 // sending under a key we no longer have, and the connection
                 // dies several megabytes later for no visible reason.

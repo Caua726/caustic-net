@@ -1,0 +1,161 @@
+// =======================================================
+// tls/ecdh.cst — one interface to the three groups a server may ask for.
+//
+// X25519 and the two NIST curves. A key is used for one handshake and thrown
+// away, which is why the NIST scalar multiplication not being constant-time
+// (see the note in caustic-crypto) is tolerable here: there is no long-lived
+// secret to learn through its timing.
+// =======================================================
+
+use "caustic-crypto/pk/x25519.cst" as x25519;
+use "caustic-crypto/pk/p256.cst" as p256;
+use "caustic-crypto/pk/p384.cst" as p384;
+use "caustic-crypto/bigint/bigint.cst" as bi;
+use "../core/entropy.cst" as entropy;
+use "./extensions.cst" as ext;
+
+let is i64 as ECDH_ERR with imut = 0 - 1533;
+
+fn _nz(p as *u8, n as i64) as i64 {
+    let is i64 as z with mut = 0;
+    let is i64 as k with mut = 0;
+    while (k < n) { z = z | cast(i64, p[k]); k = k + 1; }
+    return z;
+}
+fn _point_out(x as *bi.Big, y as *bi.Big, flen as i64, out as *u8) as void {
+    out[0] = cast(u8, 4);
+    bi.big_to_bytes_be(x, cast(*u8, cast(i64, out) + 1), flen);
+    bi.big_to_bytes_be(y, cast(*u8, cast(i64, out) + 1 + flen), flen);
+}
+// A fresh key. The private part in priv (48 bytes of room), the public in pub (97); its length, or <0.
+fn ecdh_keygen(group as i64, priv as *u8, pub as *u8) as i64 {
+    if (group == ext.GROUP_X25519) {
+        if (entropy.entropy_fill(priv, 32) != 32) { return ECDH_ERR; }
+        x25519.x25519_base(priv, pub);
+        return 32;
+    }
+    if (group == ext.GROUP_P256) {
+        p256._ensure();
+        let is i64 as tries with mut = 0;
+        while (tries < 64) {
+            tries = tries + 1;
+            if (entropy.entropy_fill(priv, 32) != 32) { return ECDH_ERR; }
+            let is bi.Big as k = bi.big_from_bytes_be(priv, 32);
+            let is i64 as fine = cast(i64, bi.big_is_zero(&k) == 0 && bi.big_cmp(&k, &p256._N) < 0);
+            if (fine == 1) {
+                let is bi.Big as x with mut;
+                let is bi.Big as y with mut;
+                p256.p256_ecdh_base(&k, &x, &y);
+                _point_out(&x, &y, 32, pub);
+                bi.big_free(&x); bi.big_free(&y); bi.big_free(&k);
+                return 65;
+            }
+            bi.big_free(&k);
+        }
+        return ECDH_ERR;
+    }
+    if (group == ext.GROUP_P384) {
+        p384._ensure();
+        let is i64 as tries with mut = 0;
+        while (tries < 64) {
+            tries = tries + 1;
+            if (entropy.entropy_fill(priv, 48) != 48) { return ECDH_ERR; }
+            let is bi.Big as k = bi.big_from_bytes_be(priv, 48);
+            let is i64 as fine = cast(i64, bi.big_is_zero(&k) == 0 && bi.big_cmp(&k, &p384._N) < 0);
+            if (fine == 1) {
+                let is bi.Big as x with mut;
+                let is bi.Big as y with mut;
+                p384.p384_ecdh_base(&k, &x, &y);
+                _point_out(&x, &y, 48, pub);
+                bi.big_free(&x); bi.big_free(&y); bi.big_free(&k);
+                return 97;
+            }
+            bi.big_free(&k);
+        }
+        return ECDH_ERR;
+    }
+    return ECDH_ERR;
+}
+fn _shared_p256(priv as *u8, peer as *u8, n as i64, out as *u8) as i64 {
+    if (n != 65 || peer[0] != cast(u8, 4)) { return ECDH_ERR; }
+    p256._ensure();
+    let is bi.Big as x = bi.big_from_bytes_be(cast(*u8, cast(i64, peer) + 1), 32);
+    let is bi.Big as y = bi.big_from_bytes_be(cast(*u8, cast(i64, peer) + 33), 32);
+    let is i64 as rc with mut = ECDH_ERR;
+    if (bi.big_cmp(&x, &p256._P) < 0 && bi.big_cmp(&y, &p256._P) < 0) {
+        // y^2 = x^3 - 3x + b: a point off the curve would leak the key a little at a time.
+        let is bi.Big as yy = p256._fmul(&y, &y);
+        let is bi.Big as xx = p256._fmul(&x, &x);
+        let is bi.Big as xxx = p256._fmul(&xx, &x);
+        let is bi.Big as t1 = p256._fsub(&xxx, &x);
+        let is bi.Big as t2 = p256._fsub(&t1, &x);
+        let is bi.Big as t3 = p256._fsub(&t2, &x);
+        let is bi.Big as rhs = p256._fadd(&t3, &p256._B);
+        if (bi.big_cmp(&yy, &rhs) == 0) {
+            let is bi.Big as k = bi.big_from_bytes_be(priv, 32);
+            let is p256.Pt as q = p256._pt_affine(&x, &y);
+            let is p256.Pt as r = p256._scalarmult(&k, &q);
+            if (p256._is_inf(&r) == 0) {
+                let is bi.Big as sx with mut;
+                let is bi.Big as sy with mut;
+                p256._to_affine(&r, &sx, &sy);
+                bi.big_to_bytes_be(&sx, out, 32);
+                bi.big_free(&sx); bi.big_free(&sy);
+                rc = 32;
+            }
+            p256._pt_free(&q); p256._pt_free(&r); bi.big_free(&k);
+        }
+        bi.big_free(&yy); bi.big_free(&xx); bi.big_free(&xxx);
+        bi.big_free(&t1); bi.big_free(&t2); bi.big_free(&t3); bi.big_free(&rhs);
+    }
+    bi.big_free(&x); bi.big_free(&y);
+    return rc;
+}
+fn _shared_p384(priv as *u8, peer as *u8, n as i64, out as *u8) as i64 {
+    if (n != 97 || peer[0] != cast(u8, 4)) { return ECDH_ERR; }
+    p384._ensure();
+    let is bi.Big as x = bi.big_from_bytes_be(cast(*u8, cast(i64, peer) + 1), 48);
+    let is bi.Big as y = bi.big_from_bytes_be(cast(*u8, cast(i64, peer) + 49), 48);
+    let is i64 as rc with mut = ECDH_ERR;
+    if (bi.big_cmp(&x, &p384._P) < 0 && bi.big_cmp(&y, &p384._P) < 0) {
+        let is bi.Big as yy = p384._fmul(&y, &y);
+        let is bi.Big as xx = p384._fmul(&x, &x);
+        let is bi.Big as xxx = p384._fmul(&xx, &x);
+        let is bi.Big as t1 = p384._fsub(&xxx, &x);
+        let is bi.Big as t2 = p384._fsub(&t1, &x);
+        let is bi.Big as t3 = p384._fsub(&t2, &x);
+        let is bi.Big as rhs = p384._fadd(&t3, &p384._B);
+        if (bi.big_cmp(&yy, &rhs) == 0) {
+            let is bi.Big as k = bi.big_from_bytes_be(priv, 48);
+            let is p384.Pt as q = p384._pt_affine(&x, &y);
+            let is p384.Pt as r = p384._scalarmult(&k, &q);
+            if (p384._is_inf(&r) == 0) {
+                let is bi.Big as sx with mut;
+                let is bi.Big as sy with mut;
+                p384._to_affine(&r, &sx, &sy);
+                bi.big_to_bytes_be(&sx, out, 48);
+                bi.big_free(&sx); bi.big_free(&sy);
+                rc = 48;
+            }
+            p384._pt_free(&q); p384._pt_free(&r); bi.big_free(&k);
+        }
+        bi.big_free(&yy); bi.big_free(&xx); bi.big_free(&xxx);
+        bi.big_free(&t1); bi.big_free(&t2); bi.big_free(&t3); bi.big_free(&rhs);
+    }
+    bi.big_free(&x); bi.big_free(&y);
+    return rc;
+}
+// The shared secret into out (48 bytes of room), and its length, or <0.
+fn ecdh_shared(group as i64, priv as *u8, peer as *u8, n as i64, out as *u8) as i64 {
+    if (group == ext.GROUP_X25519) {
+        if (n != 32) { return ECDH_ERR; }
+        x25519.x25519(priv, peer, out);
+        // RFC 7748 §6.1: all zeros means the peer sent a low-order point and the
+        // "shared" secret is a constant. caustic-crypto does not check.
+        if (_nz(out, 32) == 0) { return ECDH_ERR; }
+        return 32;
+    }
+    if (group == ext.GROUP_P256) { return _shared_p256(priv, peer, n, out); }
+    if (group == ext.GROUP_P384) { return _shared_p384(priv, peer, n, out); }
+    return ECDH_ERR;
+}
