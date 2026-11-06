@@ -51,7 +51,7 @@ let is i64 as PAR_ERR_ALLOC with imut = 0 - 1830;
 let is i64 as PAR_ERR_SPACE with imut = 0 - 1831;
 let is i64 as PAR_ERR_SPAWN with imut = 0 - 1832;
 
-let is i64 as MAX_URL  with imut = 2048;
+let is i64 as MAX_URL  with imut = 8192;
 // More threads than this against one page is antisocial rather than fast:
 // the pool caps at six per host anyway, and the rest would queue.
 let is i64 as MAX_WORKERS with imut = 16;

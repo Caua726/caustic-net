@@ -68,7 +68,7 @@ let is i64 as FETCH_ERR_DOWNGRADE with imut = 0 - 1806;   // https redirected to
 let is i64 as FETCH_ERR_SPACE     with imut = 0 - 1807;
 let is i64 as FETCH_ERR_ALLOC     with imut = 0 - 1808;
 
-let is i64 as MAX_URL       with imut = 2048;
+let is i64 as MAX_URL       with imut = 8192;
 let is i64 as MAX_HOST      with imut = 256;
 let is i64 as MAX_HEAD      with imut = 32768;
 let is i64 as MAX_REDIRECTS with imut = 20;

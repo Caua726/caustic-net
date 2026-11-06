@@ -107,9 +107,9 @@ fn req_end(b as *bytes.Bytes) as i64 {
 // entitled to expect — Host (mandatory) and Connection — and leaves the Bytes
 // open so a caller can add more before req_end.
 fn req_for_url(b as *bytes.Bytes, method as *u8, u as *url.Url, keepalive as i64) as i64 {
-    let is [2048]u8 as target;
+    let is [8192]u8 as target;
     let is [512]u8 as host;
-    if (url.url_request_target(u, cast(*u8, &target), 2048) < 0) { return HTTP_ERR_SPACE; }
+    if (url.url_request_target(u, cast(*u8, &target), 8192) < 0) { return HTTP_ERR_SPACE; }
     if (url.url_host_header(u, cast(*u8, &host), 512) < 0) { return HTTP_ERR_SPACE; }
 
     let is i64 as rc with mut = req_begin(b, method, cast(*u8, &target));
