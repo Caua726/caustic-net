@@ -119,6 +119,8 @@ struct Fetch {
     req_type    as *u8;
     req_origin  as *u8;       // null for none
     req_referer as *u8;       // null for none
+    req_accept  as *u8;       // null for */*
+    req_extra   as *u8;       // null, or name NUL value NUL pairs, ended by an empty name
 
     final_url as [MAX_URL]u8;
     hdrbuf    as *u8;         // MAX_HEAD, mmap'd
@@ -174,6 +176,8 @@ fn fetch_init(f as *Fetch, t as *trust.TrustStore) as i64 {
     // three to five times as many bytes. A caller that wants the raw body
     // sets this to 0.
     f.accept_encoding = 1;
+    f.req_accept = cast(*u8, 0);
+    f.req_extra = cast(*u8, 0);
     f.jar = cast(*cookie.Jar, 0);
     f.pl = cast(*pool.Pool, 0);
     f.reused = 0;
@@ -382,7 +386,21 @@ fn _once(f as *Fetch, u as *url.Url, method as *u8, deadline as i64,
         if (http.req_header(&req, "User-Agent", _user_agent) < 0) { rc = FETCH_ERR_SPACE; }
     }
     if (rc == 0) {
-        if (http.req_header(&req, "Accept", "*/*") < 0) { rc = FETCH_ERR_SPACE; }
+        let is *u8 as accept with mut = "*/*";
+        if (cast(i64, f.req_accept) != 0) { accept = f.req_accept; }
+        if (http.req_header(&req, "Accept", accept) < 0) { rc = FETCH_ERR_SPACE; }
+    }
+    if (rc == 0 && cast(i64, f.req_extra) != 0) {
+        let is *u8 as at with mut = f.req_extra;
+        while (rc == 0 && at[0] != 0) {
+            let is i64 as nl with mut = 0;
+            while (at[nl] != 0) { nl = nl + 1; }
+            let is *u8 as val = cast(*u8, cast(i64, at) + nl + 1);
+            let is i64 as vl with mut = 0;
+            while (val[vl] != 0) { vl = vl + 1; }
+            if (http.req_header(&req, at, val) < 0) { rc = FETCH_ERR_SPACE; }
+            at = cast(*u8, cast(i64, val) + vl + 1);
+        }
     }
     if (rc == 0 && f.accept_encoding == 1) {
         if (http.req_header(&req, "Accept-Encoding",
